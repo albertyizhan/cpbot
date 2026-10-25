@@ -49,22 +49,41 @@
 
 ## Debian 后台运行
 
-将整个项目放到 `/root/cpbot`，创建并填好 `/root/cpbot/.env` 后，以 root 执行：
+将整个项目放到 `/opt/cpbot`，创建并填好 `/opt/cpbot/.env` 后，以 root 执行：
 
 ```bash
-cd /root/cpbot
+cd /opt/cpbot
 chmod 600 .env
-python3 -m unittest discover -s tests -v
-cp deploy/cpbot.service /etc/systemd/system/cpbot.service
-systemctl daemon-reload
-systemctl enable --now cpbot
-systemctl status cpbot --no-pager
-journalctl -u cpbot -n 50 --no-pager
+bash manage.sh install
 ```
 
-`DATABASE_PATH` 默认是工作目录下的 `data/cpbot.sqlite3`。`ENV_FILE` 可指定其他环境文件路径；已经设置的进程环境变量优先。服务以 `UMask=0077` 创建私有数据文件，数据库加锁防止同机使用同一数据库重复启动。这个独立 Token 应只由一个进程轮询，不能同时启用 Webhook。
+以后运行 `bash manage.sh` 打开数字菜单；也可以直接执行：
 
-备份时先 `systemctl stop cpbot`，复制整个 `data` 目录和 `.env` 到安全位置，然后 `systemctl start cpbot`。恢复时停服务、恢复这些文件，再启动。数据库保存全局档案、群状态、授权、密码派生值和修改记录，请限制备份访问。
+```bash
+bash manage.sh start       # 启动
+bash manage.sh stop        # 停止
+bash manage.sh restart     # 重启
+bash manage.sh status      # 查看状态
+bash manage.sh logs        # 跟踪日志，Ctrl+C 退出
+bash manage.sh backup      # 在线备份，无需停机
+```
+
+备份保存到项目的 `backups/`，每次生成独立的 `cpbot-时间-编号.tar.gz`。包含当前代码、环境文件、SQLite 一致性快照和原路径说明；数据库快照使用 SQLite backup API，包含已提交的 WAL 数据，并检查完整性。备份含密码派生值和 Token，目录和新文件使用私有权限。脚本不会自动删除历史备份。
+
+升级时，将新版完整项目上传到另一个目录，例如 `/opt/cpbot-new`，然后在旧项目执行：
+
+```bash
+cd /opt/cpbot
+bash manage.sh upgrade /opt/cpbot-new
+```
+
+升级先校验新版文件、Python 语法和模块导入，再自动备份并停止服务。只覆盖明确列出的程序和说明文件，保留现有 `.env`、数据库、备份及其他文件。原先运行的服务会重新启动；原先停止的服务保持停止。复制失败或新版进程启动失败时恢复旧代码；数据库不自动回退，避免丢失升级期间的新数据。若将来的版本改变了数据库结构，需要按该版迁移说明处理兼容性。当前安装的 systemd 服务定义保持原样；需要更新服务定义时再执行 `bash manage.sh install`。
+
+脚本报告启动成功代表 systemd 进程检查通过；请用 `bash manage.sh logs` 确认出现 `cpbot started as @...`，并在 Telegram 私聊 `/start` 检查实际可用性。
+
+`DATABASE_PATH` 默认是工作目录下的 `data/cpbot.sqlite3`。`ENV_FILE` 可指定其他环境文件路径；已经设置的进程环境变量优先。安装脚本写入当前项目目录、Python 路径和环境文件路径。额外导出的 `BOT_TOKEN`、`SUPERADMIN_ID`、`DATABASE_PATH` 不会自动写入 systemd，部署时请把它们放进对应环境文件。服务以 `UMask=0077` 创建私有数据文件，数据库加锁防止同机使用同一数据库重复启动。这个独立 Token 应只由一个进程轮询，不能同时启用 Webhook。
+
+恢复备份时先停止服务，将备份解压到另一个空目录，按 `manifest.json` 将 `config.env` 恢复到环境文件路径、将 `database.sqlite3` 恢复到数据库路径，并按需恢复 `source/` 的代码。恢复数据库前，先将旧数据库及其同名 `-wal`、`-shm` 文件逐个移动到单独的保留目录，避免旧 WAL 作用于恢复后的数据库；确认恢复文件权限后再启动服务。数据库保存全局档案、群状态、授权、密码派生值和修改记录，请限制备份访问。
 
 运行日志不输出 Token、密码或原始消息内容。群回复和私聊通知发送失败时不自动重发，避免网络结果不明时重复发消息。轮询位置写入数据库；进程如果恰在修改提交后、保存轮询位置前退出，重启后消息可能重送，但私聊编辑状态已经失效，不会自动再次提交。群消息回复在这种崩溃窗口可能重复。
 
