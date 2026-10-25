@@ -1,0 +1,16 @@
+[Unit]
+Description=Independent Telegram review bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/cpbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m cpbot
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
