@@ -214,7 +214,7 @@ class Bot:
             return self.store.track('@' + username)
         matches = self.store.by_display_name(hidden_name)
         guidance = ('请让原消息发送者在 Telegram「设置 → 隐私与安全 → 转发消息」中，'
-                    '允许转发消息链接到其账号，再重新转发；也可改用 @用户名查询。')
+                    '允许转发消息链接到其账号，再重新转发；也可在群里回复该人的消息查询，无需用户名。')
         if len(matches) > 1:
             raise ValueError('发现多个名称为「%s」的档案，无法确定是哪一人。%s' % (hidden_name, guidance))
         if matches:

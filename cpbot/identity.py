@@ -30,6 +30,11 @@ def targets(message):
         result.append(Target(message['forward_from'], None, message.get('forward_date', 0)))
     elif origin.get('type') == 'hidden_user' or message.get('forward_sender_name'):
         result.append(Target(None, None, 0, origin.get('sender_user_name') or message.get('forward_sender_name') or ''))
+    reply = message.get('reply_to_message', {})
+    # Reply author is a real Telegram identity even without a public username.
+    # Anonymous group/channel senders must not be attributed to their proxy user.
+    if not reply.get('sender_chat') and reply.get('from'):
+        result.append(Target(reply['from'], None, reply.get('date', 0)))
     for field, entities in (('text', 'entities'), ('caption', 'caption_entities')):
         text = message.get(field, '')
         for entity in message.get(entities, []):

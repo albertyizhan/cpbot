@@ -116,6 +116,48 @@ class Tests(unittest.TestCase):
         self.store.observe({'id': 50, 'username': 'target_a'}, 50, True)
         self.assertEqual(self.store.lookup(username='target_a')['user_id'], 51)
 
+    def test_no_username_forward_reply_and_text_mention(self):
+        self.grant()
+        user = {'id': 50, 'first_name': '没有用户名'}
+        fixtures = [
+            {'forward_origin': {'type': 'user', 'date': 100, 'sender_user': user}},
+            {'forward_from': user, 'forward_date': 100},
+            {'reply_to_message': {'from': user, 'date': 100, 'text': '你好'}},
+            {'entities': [{'type': 'text_mention', 'offset': 0, 'length': 2, 'user': user}]},
+            {'caption': '某人', 'caption_entities': [{'type': 'text_mention', 'offset': 0, 'length': 2, 'user': user}]},
+        ]
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                self.bot.triggers.clear()
+                self.api.calls.clear()
+                # Return Telegram member data without supplying a fake username.
+                original_call = self.api.call
+                def call(method, **params):
+                    if method == 'getChatMember':
+                        return {'status': 'member', 'user': user}
+                    return original_call(method, **params)
+                self.api.call = call
+                try:
+                    self.bot.message(message(group=True, text='查询', **fixture))
+                finally:
+                    self.api.call = original_call
+                sent = self.api.calls[-1][1]
+                self.assertIn('Telegram ID：50', sent['text'])
+                self.assertIn('用户名：未知 / 未设置', sent['text'])
+                self.assertEqual(len(sent['reply_markup']['inline_keyboard'][0]), 2)
+        self.assertIsNone(self.store.lookup(user_id=50)['username'])
+
+    def test_reply_identity_auth_dedup_and_anonymous_sender(self):
+        user = {'id': 50, 'first_name': '没有用户名'}
+        reply = {'from': user, 'date': 100}
+        self.bot.message(message(group=True, text='查询', reply_to_message=reply))
+        self.assertEqual(self.api.calls, [])
+        self.assertIsNone(self.store.lookup(user_id=50))
+        found = targets(message(reply_to_message=reply, forward_origin={'type': 'user', 'date': 100, 'sender_user': user}))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(targets(message(reply_to_message={**reply, 'sender_chat': {'id': -100}})), [])
+        self.assertEqual(targets(message(reply_to_message={'from': {'id': 99, 'is_bot': True}})), [])
+
     def test_hidden_name_unique_match_group_and_private_search(self):
         self.grant()
         p = self.store.observe({'id': 50, 'first_name': '情到深处'}, 100, True)

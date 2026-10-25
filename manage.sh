@@ -32,13 +32,17 @@ run_action() {
         status) service_required; systemctl status cpbot.service --no-pager ;;
         logs) service_required; journalctl -u cpbot.service -n 80 -f ;;
         backup) "$PYTHON" deploy/operations.py backup ;;
+        update)
+            service_required
+            "$PYTHON" deploy/operations.py update
+            ;;
         upgrade)
             service_required
             [[ -n "${2:-}" ]] || { echo '用法：bash manage.sh upgrade /opt/cpbot-new'; return 1; }
             "$PYTHON" deploy/operations.py upgrade "$2"
             ;;
         run) "$PYTHON" -m cpbot ;;
-        *) echo '用法：bash manage.sh [install|start|stop|restart|status|logs|backup|upgrade 新版目录|run]'; return 1 ;;
+        *) echo '用法：bash manage.sh [install|start|stop|restart|status|logs|backup|update|upgrade 新版目录|run]'; return 1 ;;
     esac
 }
 
@@ -46,7 +50,7 @@ if [[ $# -gt 0 ]]; then
     run_action "$@"
 else
     while true; do
-        printf '\ncpbot 管理\n1) 安装 / 更新服务并启动\n2) 启动\n3) 停止\n4) 重启\n5) 状态\n6) 日志（Ctrl+C 退出）\n7) 备份\n8) 从新版目录升级\n0) 退出\n'
+        printf '\ncpbot 管理\n1) 安装 / 更新服务并启动\n2) 启动\n3) 停止\n4) 重启\n5) 状态\n6) 日志（Ctrl+C 退出）\n7) 备份\n8) 从新版目录升级\n9) 从 Git 更新当前目录\n0) 退出\n'
         read -r -p '请选择：' choice || exit 0
         case "$choice" in
             1) run_action install ;;
@@ -57,6 +61,7 @@ else
             6) run_action logs ;;
             7) run_action backup ;;
             8) read -r -p '新版目录：' source; run_action upgrade "$source" ;;
+            9) run_action update ;;
             0) exit 0 ;;
             *) echo '请选择菜单中的数字。' ;;
         esac

@@ -100,6 +100,39 @@ def ctl(*args, **kwargs):
     return subprocess.run(['systemctl', *args, 'cpbot.service'], **kwargs)
 
 
+def update():
+    check()
+    def git(*args, **kwargs):
+        return subprocess.run(['git', '-C', str(ROOT), *args], **kwargs)
+    git('rev-parse', '--show-toplevel', check=True, stdout=subprocess.DEVNULL)
+    if git('diff', '--quiet', 'HEAD', '--').returncode:
+        raise ValueError('有尚未提交的代码修改，请先处理；未停止服务或覆盖文件。')
+    git('rev-parse', '--verify', '@{upstream}', check=True, stdout=subprocess.DEVNULL)
+    was_active = ctl('is-active', '--quiet').returncode == 0
+    archive = backup()
+    ctl('stop', check=True)
+    try:
+        git('pull', '--ff-only', check=True)
+    except (OSError, subprocess.CalledProcessError):
+        if was_active:
+            ctl('start', check=True)
+        raise ValueError('Git 拉取失败，已恢复原服务运行状态。请处理上方 Git 报错后重试；备份：%s' % archive) from None
+    try:
+        subprocess.run(['bash', '-n', str(ROOT / 'manage.sh')], check=True)
+        for path in (ROOT / 'cpbot').glob('*.py'):
+            ast.parse(path.read_text(), filename=str(path))
+        subprocess.run([sys.executable, '-c', 'import cpbot.bot, cpbot.store, cpbot.__main__'],
+                       cwd=ROOT, check=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+        if was_active:
+            ctl('start', check=True)
+            time.sleep(5)
+            ctl('is-active', '--quiet', check=True)
+    except (OSError, SyntaxError, subprocess.CalledProcessError):
+        ctl('stop', check=True)
+        raise ValueError('代码已拉取，但校验或启动失败，服务保持停止。请查看日志并按备份恢复；备份：%s' % archive) from None
+    print('Git 更新完成。' + ('原服务已重新启动，请查看日志确认 Telegram 连接。' if was_active else '原服务未运行，保持停止。'))
+
+
 def upgrade(source):
     check()
     source = Path(source).expanduser().resolve()
@@ -177,6 +210,8 @@ def main():
                 install()
             elif action == 'backup':
                 backup()
+            elif action == 'update':
+                update()
             elif action == 'upgrade' and len(sys.argv) == 3:
                 upgrade(sys.argv[2])
             else:
