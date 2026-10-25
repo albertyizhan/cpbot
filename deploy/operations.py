@@ -83,7 +83,13 @@ def install():
             raise ValueError('服务路径不能包含换行。')
         return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
     unit = (ROOT / 'deploy/cpbot.service').read_text()
-    unit = unit.replace('WorkingDirectory=/opt/cpbot', 'WorkingDirectory=' + quoted(ROOT))
+    # WorkingDirectory is a single path, not a shell-style argument list.
+    # Outer quotes become literal path characters in this directive.
+    working_directory = str(ROOT)
+    if '\n' in working_directory or '\r' in working_directory:
+        raise ValueError('服务路径不能包含换行。')
+    working_directory = working_directory.replace('\\', '\\x5c').replace('%', '%%')
+    unit = unit.replace('WorkingDirectory=/opt/cpbot', 'WorkingDirectory=' + working_directory)
     unit = unit.replace('Environment=PYTHONUNBUFFERED=1',
                         'Environment=PYTHONUNBUFFERED=1\nEnvironment=' + quoted('ENV_FILE=' + str(env)))
     unit = unit.replace('ExecStart=/usr/bin/python3 -m cpbot', 'ExecStart=' + quoted(sys.executable) + ' -m cpbot')
