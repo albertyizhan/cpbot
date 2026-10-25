@@ -30,12 +30,13 @@ class Bot:
         return self.send(uid, text, keyboard)
 
     def home(self, uid):
-        if not self.store.allowed(uid):
-            return self.panel(uid, '请输入使用密码，验证后长期有效。', [[('取消', 'cancel')]], ('unlock',))
         rows = [[('🔎 查找人员', 'search'), ('📋 浏览车评', 'list:0')], [('🕘 修改记录', 'history:0:0')]]
         if uid == self.store.owner:
             rows += [[('🔑 设置密码', 'password'), ('👥 授权管理', 'users:0')]]
         return self.panel(uid, '车评后台\n转发人员消息，或通过 ID / @用户名查找。', rows)
+
+    def require_edit(self, uid, action):
+        return self.panel(uid, '请输入编辑密码，验证后长期有效。', [[('取消', 'cancel')]], ('unlock', action))
 
     def card(self, p, chat_id=None):
         text = '\n'.join(('当前名称：' + (p['name'] or '未知'),
@@ -90,8 +91,8 @@ class Bot:
         kind = parts[0]
         if kind in ('home', 'cancel'):
             return self.home(uid)
-        if not self.store.allowed(uid):
-            return self.home(uid)
+        if kind in ('edit', 'askdelete', 'delete') and not self.store.allowed(uid):
+            return self.require_edit(uid, action)
         if kind in ('search', 'password'):
             if kind == 'password' and uid != self.store.owner:
                 raise ValueError('仅总管理者可设置密码。')
@@ -165,8 +166,6 @@ class Bot:
         session = self.sessions.get(uid)
         if msg.get('chat', {}).get('type') != 'private' or msg['chat']['id'] != uid or not session or nonce != session['nonce'] or session['until'] < time.monotonic():
             return self.api.call('answerCallbackQuery', callback_query_id=query['id'], text='菜单已过期，请发送 /start 重新打开。', show_alert=True)
-        if not self.store.allowed(uid) and action not in ('home', 'cancel'):
-            return self.api.call('answerCallbackQuery', callback_query_id=query['id'], text='请先输入密码获得授权。', show_alert=True)
         # Consume every button once before performing a mutation.
         self.sessions.pop(uid, None)
         try:
@@ -227,12 +226,10 @@ class Bot:
 
     def query(self, message):
         uid, chat = message['from']['id'], message['chat']
-        if not self.store.allowed(uid) or message.get('sender_chat'):
+        if message.get('sender_chat'):
             return
         found = [t for t in targets(message) if t[1] != self.username]
         for target in found:
-            if not self.store.allowed(uid):
-                return
             try:
                 p = self.resolve(target)
             except ValueError as error:
@@ -283,7 +280,7 @@ class Bot:
         if text.split(' ', 1)[0].split('@')[0] in ('/start', '/cancel'):
             self.sessions.pop(uid, None)
             payload = text.partition(' ')[2]
-            if self.store.allowed(uid) and payload.startswith(('edit_', 'delete_')):
+            if payload.startswith(('edit_', 'delete_')):
                 intent, _, pid = payload.partition('_')
                 if pid.isdigit():
                     return self.action(user, ('edit:' if intent == 'edit' else 'askdelete:') + pid)
@@ -294,11 +291,18 @@ class Bot:
             self.sessions.pop(uid, None)
             self.send(uid, '输入已过期，请重新操作。')
             return self.home(uid)
-        if not self.store.allowed(uid) and (not pending or pending[0] != 'unlock'):
-            return self.home(uid)
+        if pending and pending[0] == 'edit' and not self.store.allowed(uid):
+            return self.require_edit(uid, 'edit:%s' % pending[1])
         if not pending:
             self.store.observe(user, message.get('date', time.time()))
-            return self.query(message) if targets(message) else self.home(uid)
+            if targets(message):
+                return self.query(message)
+            if text.isdigit():
+                try:
+                    return self.show_person(uid, self.store.track(text)['id'])
+                except ValueError as error:
+                    return self.send(uid, str(error))
+            return self.home(uid)
         kind = pending[0]
         try:
             if kind in ('unlock', 'password'):
@@ -309,6 +313,7 @@ class Bot:
                     pass
                 if kind == 'unlock':
                     self.store.unlock(user, text)
+                    return self.action(user, pending[1])
                 else:
                     self.store.password_set(uid, text)
                 return self.home(uid)
@@ -327,8 +332,6 @@ class Bot:
                 return self.show_person(uid, pending[1])
         except ValueError as error:
             self.send(uid, str(error))
-            if not self.store.allowed(uid) and kind != 'unlock':
-                return self.home(uid)
 
     def handle(self, update):
         if 'callback_query' in update:

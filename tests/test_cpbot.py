@@ -56,12 +56,12 @@ class Tests(unittest.TestCase):
 
     def test_private_password_edit_delete_history_flow(self):
         self.bot.message(message(text='/start'))
-        self.bot.message(message(text='test-password'))
-        self.assertTrue(self.store.allowed(2))
         self.click('🔎 查找人员')
         self.bot.message(message(text='@target_a'))
-        p = self.store.lookup(username='target_a')
         self.click('编辑标签')
+        self.bot.message(message(text='test-password'))
+        self.assertTrue(self.store.allowed(2))
+        p = self.store.lookup(username='target_a')
         self.bot.message(message(text='统一备注\n已记录'))
         p = self.store.person(p['id'])
         self.assertEqual((p['note'], p['tags']), ('统一备注', '已记录'))
@@ -74,10 +74,10 @@ class Tests(unittest.TestCase):
         self.assertIn('已记录', self.api.calls[-2][1]['text'])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM history').fetchone()[0], 2)
 
-    def test_unauthorized_group_silent_and_authorized_shared_across_groups(self):
+    def test_public_group_query_and_shared_across_groups(self):
         self.bot.message(message(text='@target_a', group=True))
-        self.assertEqual(self.api.calls, [])
-        self.assertIsNone(self.store.lookup(username='target_a'))
+        self.assertIn('Telegram ID：待识别', self.api.calls[-1][1]['text'])
+        self.assertFalse(self.store.allowed(2))
         self.grant()
         self.bot.message(message(text='@target_a', group=True))
         first = self.store.lookup(username='target_a')
@@ -103,6 +103,33 @@ class Tests(unittest.TestCase):
         self.assertEqual(p['name'], '目标')
         self.bot.message(message(text='/start delete_%s' % p['id']))
         self.assertIn('确定删除', self.api.calls[-1][1]['text'])
+
+    def test_public_private_queries_and_password_only_on_edit(self):
+        self.bot.message(message(text='/start'))
+        self.click('📋 浏览车评')
+        self.bot.message(message(forward_origin={'type': 'user', 'date': 100,
+            'sender_user': {'id': 50, 'first_name': 'ya'}}))
+        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
+        self.assertFalse(self.store.allowed(2))
+        self.click('编辑标签')
+        self.assertIn('编辑密码', self.api.calls[-2][1]['text'])
+        self.bot.message(message(text='wrong'))
+        self.assertFalse(self.store.allowed(2))
+        self.assertEqual(self.store.person(1)['version'], 0)
+        self.bot.message(message(text='test-password'))
+        self.assertEqual(self.bot.sessions[2]['pending'][0], 'edit')
+        self.bot.message(message(text='备注\n标签'))
+        self.assertEqual(self.store.lookup(user_id=50)['tags'], '标签')
+        self.store.revoke(1, 2)
+        self.bot.message(message(text='/start delete_1'))
+        self.assertIn('编辑密码', self.api.calls[-1][1]['text'])
+        self.bot.message(message(text='test-password'))
+        self.assertIn('确定删除', self.api.calls[-1][1]['text'])
+        self.click('确认删除')
+        self.assertEqual(self.store.lookup(user_id=50)['tags'], '')
+        self.store.revoke(1, 2)
+        self.bot.message(message(text='50'))
+        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
 
     def test_username_recycling_never_transfers_marks(self):
         self.grant()
@@ -147,12 +174,12 @@ class Tests(unittest.TestCase):
                 self.assertEqual(len(sent['reply_markup']['inline_keyboard'][0]), 2)
         self.assertIsNone(self.store.lookup(user_id=50)['username'])
 
-    def test_reply_identity_auth_dedup_and_anonymous_sender(self):
+    def test_public_reply_identity_dedup_and_anonymous_sender(self):
         user = {'id': 50, 'first_name': '没有用户名'}
         reply = {'from': user, 'date': 100}
         self.bot.message(message(group=True, text='查询', reply_to_message=reply))
-        self.assertEqual(self.api.calls, [])
-        self.assertIsNone(self.store.lookup(user_id=50))
+        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
+        self.assertIsNotNone(self.store.lookup(user_id=50))
         found = targets(message(reply_to_message=reply, forward_origin={'type': 'user', 'date': 100, 'sender_user': user}))
         self.assertEqual(len(found), 1)
         self.assertEqual(targets(message(reply_to_message={**reply, 'sender_chat': {'id': -100}})), [])
@@ -200,7 +227,7 @@ class Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '未找到同名'):
                 self.bot.resolve(targets(message(forward_origin={'type': 'hidden_user', 'sender_user_name': name}))[0])
         self.bot.message(message(group=True, forward_origin={'type': 'hidden_user', 'sender_user_name': '情到深处'}))
-        self.assertEqual(self.api.calls, [])
+        self.assertIn('按转发名称', self.api.calls[-1][1]['text'])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM people WHERE user_id=50').fetchone()[0], 1)
 
     def test_unresolved_and_confirmed_records_keep_separate_marks(self):
