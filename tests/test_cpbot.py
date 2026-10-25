@@ -116,6 +116,51 @@ class Tests(unittest.TestCase):
         self.store.observe({'id': 50, 'username': 'target_a'}, 50, True)
         self.assertEqual(self.store.lookup(username='target_a')['user_id'], 51)
 
+    def test_hidden_name_unique_match_group_and_private_search(self):
+        self.grant()
+        p = self.store.observe({'id': 50, 'first_name': '情到深处'}, 100, True)
+        self.store.save(p['id'], 0, {'id': 2}, '已核实备注', '已有标签')
+        origin = {'type': 'hidden_user', 'sender_user_name': '情到深处'}
+        self.api.error = 403
+        self.bot.message(message(group=True, forward_origin=origin))
+        sent = self.api.calls[-1][1]
+        self.assertIn('按转发名称「情到深处」匹配', sent['text'])
+        self.assertIn('身份尚未确认', sent['text'])
+        self.assertIn('已有标签', sent['text'])
+        self.assertEqual(len(sent['reply_markup']['inline_keyboard'][0]), 2)
+        before = self.store.person(p['id'])
+        self.bot.message(message(forward_sender_name='情到深处'))
+        self.assertIn('按转发名称', self.api.calls[-1][1]['text'])
+        self.bot.action({'id': 2}, 'search')
+        self.bot.message(message(forward_origin=origin))
+        self.assertIn('按转发名称', self.api.calls[-1][1]['text'])
+        self.assertEqual(self.store.person(p['id']), before)
+
+    def test_hidden_duplicate_names_request_privacy_change_without_selecting(self):
+        self.grant()
+        for uid in (50, 51):
+            self.store.observe({'id': uid, 'first_name': '情到深处'}, 100, True)
+        before = self.store.db.total_changes
+        self.bot.message(message(forward_origin={'type': 'hidden_user', 'sender_user_name': '情到深处'}))
+        sent = self.api.calls[-1][1]
+        self.assertIn('多个名称', sent['text'])
+        self.assertIn('隐私与安全 → 转发消息', sent['text'])
+        self.assertEqual(sent['reply_markup']['inline_keyboard'], [])
+        self.assertEqual(self.store.db.total_changes, before)
+        # A visible numeric identity still wins when display names collide.
+        self.bot.message(message(forward_origin={'type': 'user', 'date': 100,
+            'sender_user': {'id': 50, 'first_name': '情到深处'}}))
+        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
+
+    def test_hidden_name_exact_match_no_fabricated_identity_and_auth(self):
+        self.store.observe({'id': 50, 'first_name': '情到深处'}, 100, True)
+        for name in ('情到', '', '情到深处 '):
+            with self.assertRaisesRegex(ValueError, '未找到同名'):
+                self.bot.resolve(targets(message(forward_origin={'type': 'hidden_user', 'sender_user_name': name}))[0])
+        self.bot.message(message(group=True, forward_origin={'type': 'hidden_user', 'sender_user_name': '情到深处'}))
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM people WHERE user_id=50').fetchone()[0], 1)
+
     def test_unresolved_and_confirmed_records_keep_separate_marks(self):
         self.grant()
         a, b = self.store.track('50'), self.store.track('@target_a')

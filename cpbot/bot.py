@@ -52,12 +52,13 @@ class Bot:
                 m['title'][:100], {1: '是', 0: '否'}.get(m['present'], '未知'), date(m['joined']), date(m['observed']))
         return text
 
-    def show_person(self, uid, pid, intent=None):
+    def show_person(self, uid, pid, intent=None, notice=''):
         p = self.store.person(pid)
+        text = (notice + '\n\n' if notice else '') + self.card(p)
         if intent == 'delete':
             return self.panel(uid, self.card(p) + '\n\n确定删除此人的全部标签？备注和身份资料保留。',
                               [[('确认删除', 'delete:%s:%s' % (pid, p['version']))], [('返回', 'person:%s' % pid)]])
-        return self.panel(uid, self.card(p), [[('编辑标签', 'edit:%s' % pid), ('删除标签', 'askdelete:%s' % pid)],
+        return self.panel(uid, text, [[('编辑标签', 'edit:%s' % pid), ('删除标签', 'askdelete:%s' % pid)],
                                               [('修改记录', 'history:%s:0' % pid)], [('返回列表', 'list:0'), ('返回首页', 'home')]])
 
     def history(self, uid, pid, page):
@@ -206,12 +207,23 @@ class Bot:
             self.store.member(p['id'], chat, present, stamp, joined)
 
     def resolve(self, target):
-        user, username, stamp = target
+        user, username, stamp, hidden_name = target
         if user:
             return self.store.observe(user, stamp, create=True)
         if username:
             return self.store.track('@' + username)
-        raise ValueError('转发来源已隐藏，无法识别用户。请使用 @用户名或可见来源的转发。')
+        matches = self.store.by_display_name(hidden_name)
+        guidance = ('请让原消息发送者在 Telegram「设置 → 隐私与安全 → 转发消息」中，'
+                    '允许转发消息链接到其账号，再重新转发；也可改用 @用户名查询。')
+        if len(matches) > 1:
+            raise ValueError('发现多个名称为「%s」的档案，无法确定是哪一人。%s' % (hidden_name, guidance))
+        if matches:
+            return matches[0]
+        raise ValueError('转发来源已隐藏，未找到同名档案。' + guidance)
+
+    def match_notice(self, target):
+        return ('按转发名称「%s」匹配：已有档案中仅一人同名，身份尚未确认，请核对后操作。' % target.hidden_name
+                if target.hidden_name else '')
 
     def query(self, message):
         uid, chat = message['from']['id'], message['chat']
@@ -229,7 +241,7 @@ class Bot:
             if p is None:
                 continue
             if chat['type'] == 'private':
-                self.show_person(uid, p['id'])
+                self.show_person(uid, p['id'], notice=self.match_notice(target))
                 continue
             now = time.monotonic()
             key = (chat['id'], p['id'])
@@ -254,7 +266,8 @@ class Bot:
                     pass
             buttons = [[{'text': label, 'url': 'https://t.me/%s?start=%s_%s' % (self.username, intent, p['id'])}
                         for label, intent in (('编辑标签', 'edit'), ('删除标签', 'delete'))]]
-            self.send(chat['id'], self.card(p, chat['id']), buttons,
+            notice = self.match_notice(target)
+            self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']), buttons,
                       reply_parameters={'message_id': message['message_id'], 'allow_sending_without_reply': True})
 
     def message(self, message, edited=False):
@@ -304,7 +317,7 @@ class Bot:
                 p = self.resolve(found[0]) if found else self.store.track(text)
                 if p is None:
                     raise ValueError('请选择人员账号。')
-                return self.show_person(uid, p['id'])
+                return self.show_person(uid, p['id'], notice=self.match_notice(found[0]) if found else '')
             if kind == 'edit':
                 lines = text.splitlines()
                 if len(lines) != 2 or any(not line.strip() for line in lines):

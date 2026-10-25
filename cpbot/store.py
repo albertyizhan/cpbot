@@ -32,6 +32,7 @@ class Store:
                 id INTEGER PRIMARY KEY,person INTEGER NOT NULL REFERENCES people(id),
                 actor INTEGER NOT NULL,actor_name TEXT NOT NULL,action TEXT NOT NULL,
                 before_value TEXT NOT NULL,after_value TEXT NOT NULL,created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS people_name ON people(name);
         ''')
 
     @contextmanager
@@ -110,6 +111,13 @@ class Store:
                 return p
             cursor = self.db.execute('INSERT INTO people(user_id,username) VALUES(?,?)', (uid, username))
             return self.person(cursor.lastrowid)
+
+    def by_display_name(self, name):
+        # Exact current-name match only. Two results suffice to detect ambiguity.
+        if not name:
+            return []
+        return [dict(row) for row in self.db.execute(
+            'SELECT * FROM people WHERE name=? ORDER BY id LIMIT 2', (name,))]
 
     def observe(self, user, stamp, create=False):
         uid = user.get('id')
