@@ -656,6 +656,19 @@ class Tests(unittest.TestCase):
         for teacher in old['tables']['teachers']:teacher.pop('username')
         validate_backup(json.dumps(old).encode(),99)
 
+    def test_teacher_space_import_examples_and_preview(self):
+        entries=self.s.parse_teachers(1,'老师甲乙\n老师乙 @space_teacher\n老师丙 @space_other 123456789\n老师丁 987654321\n英文 Name @space_name')
+        self.assertEqual(entries,[('老师甲乙',None,None),('老师乙',None,'space_teacher'),('老师丙',123456789,'space_other'),('老师丁',987654321,None),('英文 Name',None,'space_name')])
+        self.bot.action({'id':1},'teacherbatch')
+        prompt=self.api.calls[-1][1]['text']
+        self.assertIn('信息用空格分隔',prompt)
+        self.assertNotIn('|',prompt)
+        self.bot.message(message(uid=1,text='老师乙 @space_teacher\n老师丙 @space_other 123456789'))
+        preview=self.api.calls[-1][1]['text']
+        self.assertIn('等待识别 @space_teacher',preview)
+        self.assertIn('账号 ID：123456789 · @space_other',preview)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],1)
+
     def test_teacher_batch_preview_confirm_and_teacher_codes(self):
         self.bot.action({'id':1},'teacherbatch')
         self.bot.message(message(uid=1,text='老师乙\n老师丙 | 30\n老师丁 40'))

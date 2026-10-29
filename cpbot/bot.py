@@ -334,7 +334,7 @@ class Bot:
             return self.prompt(uid,'👩‍🏫 添加老师\n发送老师名称即可（1～80 字）。本人账号可在详情中另行绑定。',('teachernew',),'admin')
         if kind=='teacherbatch':
             self.teacher_imports.pop(uid, None)
-            return self.prompt(uid,'📥 批量导入老师\n每行一位，每批最多 100 位，可混用：\n老师甲\n老师乙 | @teacher_b\n老师丙 | @teacher_c | 987654321\n老师丁 | 123456789\n\n用户名和数字 ID 均可省略；仅填用户名将等待账号出现后自动绑定。已绑定老师可编辑学生标签。名称末尾是数字时，请用 | 明确分隔 ID。\n先生成列表预览，确认后才保存；重名或账号冲突不会覆盖已有资料。',('teacherbatch',),'teacherbatchcancel')
+            return self.prompt(uid,'📥 批量导入老师\n每行一位，每批最多 100 位，信息用空格分隔，可混用：\n老师甲\n老师乙 @teacher_b\n老师丙 @teacher_c 987654321\n老师丁 123456789\n\n用户名和数字 ID 均可省略；仅填用户名将等待账号出现后自动绑定。已绑定老师可编辑学生标签。用户名请带 @，最后一项纯数字按 Telegram ID 识别。\n先生成列表预览，确认后才保存；重名或账号冲突不会覆盖已有资料。',('teacherbatch',),'teacherbatchcancel')
         if kind=='teacherbatchcancel':
             self.teacher_imports.pop(uid, None)
             self.success(uid,'已取消，本批老师未导入。')
