@@ -136,6 +136,62 @@ class ReviewStore:
         except sqlite3.IntegrityError:
             raise ValueError('此账号已绑定其他老师，请先解除原绑定。') from None
 
+    def parse_teachers(self, actor, text):
+        """Parse name-only or name | ID lines; preview never writes data."""
+        self.require_admin(actor)
+        entries = []
+        for line_no, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            uid = None
+            if '|' in line or '｜' in line:
+                parts = line.replace('｜', '|').split('|')
+                if len(parts) != 2:
+                    raise ValueError('第 %s 行格式错误，请使用 老师名称 | 数字ID。' % line_no)
+                name, raw = (v.strip() for v in parts)
+                if not raw.isascii() or not raw.isdigit() or not 0 < int(raw) < 2**63:
+                    raise ValueError('第 %s 行需要有效的 Telegram 数字 ID。' % line_no)
+                uid = int(raw)
+            else:
+                parts = line.rsplit(None, 1)
+                if len(parts) == 2 and parts[1].isascii() and parts[1].isdigit():
+                    name, raw = parts
+                    uid = int(raw)
+                else:
+                    name = line
+            entries.append((name.strip(), uid))
+        self.validate_teachers(entries)
+        return entries
+
+    def validate_teachers(self, entries):
+        if not 1 <= len(entries) <= 100:
+            raise ValueError('每批请填写 1～100 位老师，每行一位。')
+        names, accounts = set(), set()
+        for index, (name, uid) in enumerate(entries, 1):
+            if not 1 <= len(name) <= 80 or '\n' in name or (uid is not None and (type(uid) is not int or not 0 < uid < 2**63)):
+                raise ValueError('第 %s 位老师名称或数字 ID 无效。' % index)
+            if name in names or self.db.execute('SELECT 1 FROM teachers WHERE name=?', (name,)).fetchone():
+                raise ValueError('第 %s 位「%s」名称重复，请修改后重新预览；不会覆盖已有老师。' % (index, name))
+            if uid is not None and (uid in accounts or self.db.execute('SELECT 1 FROM teachers WHERE user_id=?', (uid,)).fetchone()):
+                raise ValueError('第 %s 位的账号 %s 已绑定或在本批中重复。' % (index, uid))
+            names.add(name)
+            if uid is not None:
+                accounts.add(uid)
+
+    def import_teachers(self, actor, entries):
+        with self.transaction():
+            self.require_admin(actor)
+            self.validate_teachers(entries)
+            ids = []
+            for name, uid in entries:
+                tid = self.db.execute('INSERT INTO teachers(name,user_id) VALUES(?,?)', (name, uid)).lastrowid
+                ids.append(tid)
+                self.log(actor, '批量添加老师', tid)
+                for b in self.db.execute("SELECT id FROM bindings WHERE mode='thread'"):
+                    self.ensure_post(b['id'], tid)
+            return ids
+
     def rename_teacher(self, actor, tid, name):
         self.require_admin(actor)
         if not name.strip() or len(name)>80 or '\n' in name:

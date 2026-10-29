@@ -25,6 +25,7 @@ class Bot:
         self.edit_target = None
         self.notices = {}
         self.imports = {}
+        self.teacher_imports = {}
 
     def send(self, chat, text, rows=None, **extra):
         return self.api.call('sendMessage', chat_id=chat, text=text,
@@ -140,21 +141,61 @@ class Bot:
         return self.panel(uid, '\n'.join(lines), rows)
 
     def teachers(self, uid, intent='choose', search='', page=0):
-        teachers = self.store.db.execute('SELECT * FROM teachers WHERE instr(lower(name),lower(?))>0 ORDER BY id LIMIT 9 OFFSET ?',
-                                        (search, page*8)).fetchall()
+        if intent not in ('choose','teacherlink','teacherdetail','codefor'):
+            raise ValueError('无效的老师列表。')
+        if intent in ('teacherdetail','codefor'):
+            self.store.require_admin(uid)
+        search = search.strip()
+        teachers = self.store.db.execute('''SELECT t.*,p.username FROM teachers t
+            LEFT JOIN people p ON p.user_id=t.user_id
+            WHERE (? NOT LIKE '@%' AND instr(lower(t.name),lower(?))>0)
+               OR (t.user_id IS NOT NULL AND p.username=? COLLATE NOCASE)
+            ORDER BY t.id LIMIT 9 OFFSET ?''',
+            (search,search,search.lstrip('@'),max(0,page)*8)).fetchall()
         rows = [[('%s · #%s' % (t['name'], t['id']), '%s:%s' % (intent, t['id']))] for t in teachers[:8]]
+        rows.append([('搜索老师','teachersearch:'+intent)])
+        if search:
+            rows.append([('查看全部老师','teacherall:'+intent)])
         # Search state is retained in a short-lived session, not callback text.
         if len(teachers)>8:
             rows.append([('下一页', 'teacherspage:%s:%s' % (intent, page+1))])
         if page:
             rows.append([('上一页', 'teacherspage:%s:%s' % (intent, page-1))])
-        return self.panel(uid, '👩‍🏫 选择老师 · 第 %s 页' % (page+1) + ('\n点击下方老师继续。' if teachers else '\n📭 没有匹配的老师，可返回后换个关键词。'), rows + [[('返回主菜单','home')]], ('teacherlist',intent,search))
+        return self.panel(uid, '👩‍🏫 选择老师 · 第 %s 页' % (page+1) + ('\n搜索：'+search if search else '') + ('\n点击下方老师继续，也可直接发送姓名或 @用户名搜索。' if teachers else '\n📭 没有匹配的老师，请换个姓名或用户名。用户名需老师绑定本人账号并私聊机器人后才能识别。'), rows + [[('返回草稿','write')] if intent=='choose' else [('返回主菜单','home')]], ('teacherlist',intent,search))
+
+    def teacher_batch_preview(self, uid, page=0):
+        self.store.require_admin(uid)
+        batch = self.teacher_imports.get(uid)
+        if not batch or batch['until'] < time.monotonic():
+            raise ValueError('预览已过期，请重新进入批量导入并发送名单。')
+        entries = batch['entries']
+        pages = (len(entries) + 14) // 15
+        if not 0 <= page < pages:
+            raise ValueError('预览页码无效。')
+        bound = sum(account is not None for _, account in entries)
+        lines = ['📋 老师导入预览 · 尚未保存',
+                 '共 %s 位 · 绑定账号 %s 位 · 未绑定 %s 位' % (len(entries), bound, len(entries)-bound),
+                 '第 %s/%s 页 · 确认将导入整批名单，预览 10 分钟内有效。' % (page+1, pages)]
+        for index, (name, account) in enumerate(entries[page*15:(page+1)*15], page*15+1):
+            lines.append('%s. %s\n   %s' % (index, name, '账号 ID：%s' % account if account else '未绑定本人账号'))
+        rows = []
+        navigation = []
+        if page:
+            navigation.append(('上一页', 'teacherbatchpage:%s' % (page-1)))
+        if page+1 < pages:
+            navigation.append(('下一页', 'teacherbatchpage:%s' % (page+1)))
+        if navigation:
+            rows.append(navigation)
+        rows += [[('确认导入全部 %s 位' % len(entries), 'teacherbatchconfirm')],
+                 [('重新填写', 'teacherbatch'), ('取消导入', 'teacherbatchcancel')]]
+        return self.panel(uid, '\n'.join(lines), rows)
 
     def admin_panel(self, uid):
         self.store.require_admin(uid)
         counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers), (SELECT count(*) FROM bindings WHERE mode='thread' AND active=1), (SELECT count(*) FROM reviews WHERE status='pending' AND expires>?)", (time.time(),)).fetchone()
         return self.panel(uid, '⚙️ 管理后台\n👩‍🏫 老师 %s 位 · 📣 可用专帖频道 %s 个\n🕓 待审核 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), [
             [('👩‍🏫 老师列表', 'teachersadmin'), ('➕ 添加老师', 'teachernew')],
+            [('📥 批量导入老师', 'teacherbatch')],
             [('🔑 留名管理', 'codesadmin'), ('🕓 待审核', 'queue:0')],
             [('📣 频道 / 群绑定', 'bindings'), ('👑 superadmin 名单', 'admins')],
             [('📤 发布任务', 'jobs:0'), ('🛠 车评处理', 'reviewmanage')],
@@ -165,6 +206,7 @@ class Bot:
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
         admin_kinds = {'admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','codesadmin','codefor','admins','adminadd','adminremove',
+                       'teacherbatch','teacherbatchpage','teacherbatchconfirm','teacherbatchcancel',
                        'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
                        'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','removeadmin','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
         if kind in admin_kinds:
@@ -173,6 +215,7 @@ class Bot:
             raise ValueError('尚无可用的老师专帖绑定，业务暂不可用。')
         if kind in ('home','cancel'):
             self.imports.pop(uid, None)
+            self.teacher_imports.pop(uid, None)
             return self.home(uid)
         if kind == 'admin':
             return self.admin_panel(uid)
@@ -218,7 +261,15 @@ class Bot:
             rid,status=self.store.submit(user,token)
             return self.panel(uid,'📝 车评 #%s\n%s' % (rid,('✅ 核验通过。⏸ 发布已暂停，恢复后自动发布。' if self.paused() else '✅ 核验通过，正在限速排队发布。发布后可在「我的车评」查看链接。') if status=='accepted' else '🕓 留名未通过，已进入人工审核；审核区保留 72 小时。请等待管理员处理，不必重复提交。'),[[('返回主菜单','home')]])
         if kind=='findteacher':
-            return self.prompt(uid,'输入老师名称，或发送“全部”浏览。',('findteacher',))
+            return self.prompt(uid,'输入老师姓名关键词或 @用户名，或发送“全部”浏览。',('findteacher',))
+        if kind in ('teachersearch','teacherall'):
+            intent=parts[1]
+            if intent not in ('choose','teacherlink','teacherdetail','codefor'):
+                raise ValueError('无效的老师列表。')
+            if intent in ('teacherdetail','codefor'):
+                self.store.require_admin(uid)
+            if kind=='teacherall':return self.teachers(uid,intent)
+            return self.prompt(uid,'🔎 搜索老师\n发送姓名关键词或 Telegram 用户名（可带 @）。\n用户名需老师绑定本人账号并私聊机器人后才能识别。',('teachersearch',intent),'teacherall:'+intent)
         if kind=='teacherspage':
             old=getattr(self,'previous_pending',None)
             return self.teachers(uid,parts[1],old[2] if old and old[0]=='teacherlist' else '',int(parts[2]))
@@ -261,6 +312,23 @@ class Bot:
             return self.panel(uid,'操作人：%s（%s）\n时间：%s\n修改前：%s\n修改后：%s'%(row['actor_name'],row['actor'],date(row['created']),row['before_value'],row['after_value']),[[('返回主菜单','home')]])
         if kind=='teachernew':
             return self.prompt(uid,'👩‍🏫 添加老师\n发送老师名称即可（1～80 字）。本人账号可在详情中另行绑定。',('teachernew',),'admin')
+        if kind=='teacherbatch':
+            self.teacher_imports.pop(uid, None)
+            return self.prompt(uid,'📥 批量导入老师\n每行一位，每批最多 100 位，可混用：\n老师甲\n老师乙 | 123456789\n老师丙 987654321\n\n不带 ID 不绑定本人账号；带 ID 可让老师自行添加留名。名称末尾是数字时，请用 | 明确分隔 ID。\n先生成列表预览，确认后才保存；重名或账号冲突不会覆盖已有资料。',('teacherbatch',),'teacherbatchcancel')
+        if kind=='teacherbatchcancel':
+            self.teacher_imports.pop(uid, None)
+            self.success(uid,'已取消，本批老师未导入。')
+            return self.admin_panel(uid)
+        if kind=='teacherbatchpage':
+            return self.teacher_batch_preview(uid,int(parts[1]))
+        if kind=='teacherbatchconfirm':
+            batch=self.teacher_imports.get(uid)
+            if not batch or batch['until'] < time.monotonic():
+                raise ValueError('预览已过期，请重新进入批量导入并发送名单。')
+            ids=self.store.import_teachers(uid,batch['entries'])
+            self.teacher_imports.pop(uid,None)
+            self.success(uid,'已导入 %s 位老师。主帖已加入限速队列；绑定账号的老师可发送 /start 添加留名。'%len(ids))
+            return self.admin_panel(uid)
         if kind in ('teacherdetail','teacheredit'):
             t=self.store.teacher(int(parts[1]))
             identity='✅ 已绑定本人账号：%s' % t['user_id'] if t['user_id'] else 'ℹ️ 未绑定本人账号，由 superadmin 添加留名。'
@@ -481,10 +549,13 @@ class Bot:
                 if uid and not edited and not user.get('is_bot'):self.query(msg)
             return
         if chat['type']!='private' or not uid or edited:return
+        if self.store.db.execute('SELECT 1 FROM teachers WHERE user_id=?',(uid,)).fetchone():
+            self.store.observe(user,msg.get('date',time.time()),create=True)
         pending = None
         try:
             if text.split(' ',1)[0].split('@')[0] in ('/start','/cancel'):
                 self.imports.pop(uid, None)
+                self.teacher_imports.pop(uid, None)
                 self.sessions.pop(uid,None);payload=text.partition(' ')[2]
                 if payload.startswith('review_') and payload[7:].isdigit():return self.action(user,'choose:'+payload[7:])
                 if payload.startswith(('edit_','delete_')) and payload.partition('_')[2].isdigit():
@@ -512,6 +583,9 @@ class Bot:
                 self.success(uid, '%s已保存，可继续填写其他字段。' % pending[1])
                 return self.draft_panel(uid)
             if kind=='findteacher':return self.teachers(uid,'teacherlink','' if text=='全部' else text)
+            if kind in ('teachersearch','teacherlist'):
+                if not text:raise ValueError('请发送老师姓名或用户名。')
+                return self.teachers(uid,pending[1],text)
             if kind=='search':
                 found=targets(msg);p=self.resolve(found[0]) if found else self.store.track(text)
                 return self.show_person(uid,p['id'],notice=self.match_notice(found[0]) if found else '')
@@ -520,6 +594,10 @@ class Bot:
                 self.success(uid, '已为 %s 添加 %s 个留名，未使用前持续有效。' % (self.store.teacher(pending[1])['name'],len([v for v in text.splitlines() if v.strip()])))
                 return self.action(user,'codes:%s'%pending[1])
             self.store.require_admin(uid)
+            if kind=='teacherbatch':
+                entries=self.store.parse_teachers(uid,text)
+                self.teacher_imports[uid]={'entries':entries,'until':time.monotonic()+600}
+                return self.teacher_batch_preview(uid)
             if kind=='importfile':
                 document=msg.get('document')
                 if not document:

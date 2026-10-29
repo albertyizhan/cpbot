@@ -387,6 +387,106 @@ class Tests(unittest.TestCase):
         self.click('确认覆盖并恢复',uid=1)
         self.assertTrue(self.s.ready());self.assertIn('过期',self.api.calls[-1][1]['text'])
 
+    def test_teacher_search_name_username_and_draft_return(self):
+        self.bot.message(message(uid=10,text='/start') | {'from':{'id':10,'username':'Teacher_A'}})
+        self.bot.action({'id':2},'field:老师')
+        self.click('搜索老师')
+        self.bot.message(message(text='@teacher_a'))
+        self.assertIn('老师甲',self.api.calls[-1][1]['text']+str(self.api.calls[-1][1]['reply_markup']))
+        self.click('老师甲 · #1')
+        self.assertEqual(self.s.draft(2)[0]['老师'],self.tid)
+        self.assertIn('车评草稿',self.api.calls[-2][1]['text'])
+        self.bot.action({'id':2},'field:老师')
+        self.bot.message(message(text='teacher_A'))
+        self.assertIn('老师甲',str(self.api.calls[-1]))
+        self.bot.message(message(text='不存在'))
+        self.assertIn('没有匹配',self.api.calls[-1][1]['text'])
+        self.click('查看全部老师')
+        self.assertIn('老师甲',str(self.api.calls[-2]))
+        self.bot.message(message(text='老师'))
+        self.assertIn('老师甲',str(self.api.calls[-1]))
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'teachersearch:codefor')
+        self.bot.message(message(uid=10,text='/start') | {'from':{'id':10,'username':'New_Name'}})
+        self.bot.message(message(text='@teacher_a'))
+        self.assertIn('没有匹配',self.api.calls[-1][1]['text'])
+        self.bot.message(message(text='@new_name'))
+        self.assertIn('老师甲',str(self.api.calls[-1]))
+
+    def test_teacher_name_search_pagination_keeps_filter(self):
+        self.s.import_teachers(1,[('筛选老师%s'%n,None) for n in range(10)])
+        self.bot.action({'id':2},'field:老师')
+        self.bot.message(message(text='筛选'))
+        self.click('下一页')
+        panel=self.api.calls[-2][1]
+        self.assertIn('搜索：筛选',panel['text'])
+        self.assertIn('筛选老师9',str(panel['reply_markup']))
+        self.assertNotIn('老师甲',str(panel['reply_markup']))
+        self.click('返回草稿')
+        self.assertIn('车评草稿',self.api.calls[-2][1]['text'])
+
+    def test_teacher_batch_preview_confirm_and_teacher_codes(self):
+        self.bot.action({'id':1},'teacherbatch')
+        self.bot.message(message(uid=1,text='老师乙\n老师丙 | 30\n老师丁 40'))
+        panel=self.api.calls[-1][1]
+        self.assertIn('尚未保存',panel['text'])
+        self.assertIn('绑定账号 2 位',panel['text'])
+        self.assertIn('账号 ID：30',panel['text'])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],1)
+        confirm=self.click('确认导入全部 3 位',uid=1)
+        self.assertIn('已导入 3 位',self.api.calls[-2][1]['text'])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],4)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM posts').fetchone()[0],4)
+        self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='post'").fetchone()[0],4)
+        self.bot.home(30)
+        self.assertIn('添加留名',str(self.api.calls[-1]))
+        tid=self.s.db.execute('SELECT id FROM teachers WHERE user_id=30').fetchone()[0]
+        self.s.add_codes(30,tid,['新留名'])
+        self.click('',uid=1,data=confirm)
+        self.assertTrue(self.api.calls[-1][1]['show_alert'])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],4)
+
+    def test_teacher_batch_validation_cancel_expiry_and_concurrent_conflict(self):
+        for text in ('', '老师甲', '重复\n重复', '乙 | 10', '乙 | 20\n丙 | 20',
+                     '乙 | abc', '乙 | -1', '乙 | 0', '乙 | '+str(2**63),
+                     '乙 | 20 | 30', '长'*81, '\n'.join('老师%s'%n for n in range(101))):
+            with self.assertRaises(ValueError):self.s.parse_teachers(1,text)
+        with self.assertRaises(ValueError):self.s.parse_teachers(2,'乙')
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'teacherbatch')
+        self.bot.action({'id':1},'teacherbatch')
+        self.bot.message(message(uid=1,text='老师乙 | abc'))
+        self.assertIn('数字 ID',self.api.calls[-1][1]['text'])
+        self.bot.message(message(uid=1,text='老师乙\n老师丙 | 30'))
+        self.s.save_teacher(1,'其他老师',30)
+        self.click('确认导入全部 2 位',uid=1)
+        self.assertTrue(self.api.calls[-1][1]['show_alert'])
+        self.assertIsNone(self.s.db.execute("SELECT 1 FROM teachers WHERE name='老师乙'").fetchone())
+        self.click('取消导入',uid=1)
+        self.assertFalse(self.bot.teacher_imports)
+        self.bot.action({'id':1},'teacherbatch')
+        self.bot.message(message(uid=1,text='老师乙'))
+        self.bot.teacher_imports[1]['until']=0
+        self.click('确认导入全部 1 位',uid=1)
+        self.assertIn('过期',self.api.calls[-1][1]['text'])
+        self.assertIsNone(self.s.db.execute("SELECT 1 FROM teachers WHERE name='老师乙'").fetchone())
+        entries=[('老师乙',None),('老师戊',50)]
+        self.s.db.execute("CREATE TRIGGER fail_batch BEFORE INSERT ON teachers WHEN NEW.name='老师戊' BEGIN SELECT RAISE(ABORT,'test'); END")
+        before=self.s.db.execute('SELECT count(*) FROM jobs').fetchone()[0]
+        with self.assertRaises(sqlite3.IntegrityError):self.s.import_teachers(1,entries)
+        self.assertIsNone(self.s.db.execute("SELECT 1 FROM teachers WHERE name='老师乙'").fetchone())
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM jobs').fetchone()[0],before)
+
+    def test_teacher_batch_large_preview_pagination_and_revocation(self):
+        self.bot.action({'id':1},'teacherbatch')
+        self.bot.message(message(uid=1,text='\n'.join('批量老师%s'%n for n in range(100))))
+        self.assertIn('第 1/7 页',self.api.calls[-1][1]['text'])
+        for _ in range(6):self.click('下一页',uid=1)
+        self.assertIn('100. 批量老师99',self.api.calls[-2][1]['text'])
+        self.click('上一页',uid=1)
+        self.s.set_admin(1,3);self.s.set_admin(3,1,False)
+        self.click('确认导入全部 100 位',uid=1)
+        self.assertTrue(self.api.calls[-1][1]['show_alert'])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],1)
+
     def test_teacher_name_and_optional_identity_are_separate(self):
         self.bot.action({'id':1},'teachernew')
         self.bot.message(message(uid=1,text='只填名称'))
