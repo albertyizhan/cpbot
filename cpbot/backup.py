@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .reviews import FIELDS, SCORES, MODES
+from .reviews import FIELDS, SCORES, MODES, review_date
 
 MAX_BACKUP_BYTES = 15 * 1024 * 1024
 TABLES = ('admins', 'people', 'teachers', 'codes', 'drafts', 'reviews', 'bindings',
@@ -106,8 +106,7 @@ def check_relations(db):
             require(isinstance(d, dict) and all(str(d.get(f, '')).strip() for f in FIELDS), '车评字段缺失。')
             require(type(d['老师']) is int and d['老师'] == r['teacher'], '老师关联不一致。')
             require(all(type(d[k]) is int and 1 <= d[k] <= 10 for k in SCORES), '评分无效。')
-            from datetime import datetime
-            datetime.strptime(d['时间'], '%Y-%m-%d %H:%M')
+            review_date(d['时间'], legacy=True)
             require(isinstance(d['过程'], str) and len(d['过程']) <= 1600 and isinstance(d['人照'], str) and len(d['人照']) <= 200 and isinstance(d['留名'], str) and len(d['留名']) <= 80, '车评文字无效。')
             require(isinstance(identity, dict) and identity.get('id') == r['author'] and ('username' not in identity or isinstance(identity['username'], str)), '作者身份无效。')
         except (ValueError, TypeError, KeyError):

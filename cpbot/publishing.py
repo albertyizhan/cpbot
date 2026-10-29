@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 from .api import APIError
-from .reviews import FIELDS, TZ
+from .reviews import FIELDS, TZ, review_date
 
 
 def render_review(store, row):
@@ -13,7 +13,9 @@ def render_review(store, row):
     result = []
     for key in FIELDS:
         value = data.get(key, '')
-        if key == '老师':
+        if key == '时间' and value:
+            value = review_date(value, legacy=True)
+        elif key == '老师':
             value = store.teacher(row['teacher'])['name']
         elif key == '留名':
             value = '人工审核通过' if row['manual'] else ('已核验' if row['anonymous'] else value)
@@ -34,6 +36,12 @@ class Publisher:
         self.s, self.api, self.username, self.bot_id = store, api, username, bot_id
         self.next_global = 0
         self.next_chat = {}
+        migration = 'summary_body_link_v1'
+        if not self.s.db.execute('SELECT 1 FROM settings WHERE key=?', (migration,)).fetchone():
+            with self.s.transaction():
+                for post in self.s.db.execute('SELECT * FROM posts WHERE message IS NOT NULL'):
+                    self.s.enqueue('summary',post['binding'],post['teacher'],generation=100000000000000001)
+                self.s.db.execute('INSERT INTO settings VALUES(?,?)',(migration,'1'))
 
     def _chat(self, cid, label):
         try:
@@ -83,8 +91,9 @@ class Publisher:
         t = self.s.teacher(tid)
         stats = self.s.db.execute("SELECT count(*),avg(CAST(json_extract(data,'$.综合') AS REAL)) FROM reviews WHERE teacher=? AND status='accepted'", (tid,)).fetchone()
         text = '【老师】：%s\n【综合评分】：%s\n【有效评价】：%s\n\n历史评价请查看本帖评论区。' % (
-            t['name'], '%.1f / 10' % stats[1] if stats[0] else '暂无', stats[0])
-        return text, {'inline_keyboard': [[{'text': '给这位老师写评价', 'url': 'https://t.me/%s?start=review_%s' % (self.username, tid)}]]}
+            html.escape(t['name']), '%.1f / 10' % stats[1] if stats[0] else '暂无', stats[0])
+        text += '\n\n✍️ <a href="https://t.me/%s?start=review_%s">给这位老师写评价</a>' % (self.username, tid)
+        return text, {'inline_keyboard': []}
 
     def automatic_forward(self, msg):
         if not msg.get('is_automatic_forward'):
@@ -181,9 +190,9 @@ class Publisher:
             elif kind in ('post', 'checkpost', 'summary'):
                 text, markup = self.summary(j['teacher'])
                 if p and p['message']:
-                    self._edit(j['chat_id'], p['message'], text, reply_markup=markup)
+                    self._edit(j['chat_id'], p['message'], text, reply_markup=markup, parse_mode='HTML', link_preview_options={'is_disabled': True})
                 else:
-                    result = self.api.call('sendMessage', chat_id=j['chat_id'], text=text, reply_markup=markup)
+                    result = self.api.call('sendMessage', chat_id=j['chat_id'], text=text, reply_markup=markup, parse_mode='HTML', link_preview_options={'is_disabled': True})
                     self.s.db.execute('UPDATE posts SET message=? WHERE binding=? AND teacher=?', (result['message_id'], j['binding'], j['teacher']))
             else:
                 r = self.s.db.execute('SELECT * FROM reviews WHERE id=?', (j['review'],)).fetchone()

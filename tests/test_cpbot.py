@@ -242,7 +242,7 @@ class Tests(unittest.TestCase):
         self.bot.message(message(text='yesterday'))
         self.assertIn('YYYY-MM-DD',self.api.calls[-1][1]['text'])
         self.assertNotIn('strptime',self.api.calls[-1][1]['text'])
-        self.bot.message(message(text='2026-10-29 14:30'))
+        self.bot.message(message(text='2026-10-29'))
         self.assertIn('时间已保存',self.api.calls[-1][1]['text'])
         self.assertIn('1/11',self.api.calls[-1][1]['text'])
         self.bot.action({'id':2},'anon')
@@ -363,6 +363,45 @@ class Tests(unittest.TestCase):
         self.s.add_codes(1,tid,['其他'])
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM codes WHERE teacher=?',(tid,)).fetchone()[0],2)
         with self.assertRaises(ValueError):self.bot.action({'id':2},'teacherbind:%s'%tid)
+
+    def test_date_only_input_legacy_backup_and_invalid_dates(self):
+        self.s.add_codes(1,self.tid,['abc'])
+        self.draft(stamp='2026-10-29')
+        self.bot.action({'id':2},'field:时间')
+        for bad in ('2026-02-30','2026-10-29 14:30','2026-1-2'):
+            self.bot.message(message(text=bad))
+            self.assertIn('⚠️',self.api.calls[-1][1]['text'])
+        self.bot.message(message(text='2026-10-29'))
+        rid,status=self.s.submit({'id':2},'token')
+        self.assertEqual(status,'accepted')
+        self.assertEqual(json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(rid,)).fetchone()[0])['时间'],'2026-10-29')
+        self.bot.change_review(1,rid,{'时间':'2026-10-28'})
+        d=json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(rid,)).fetchone()[0])
+        d['时间']='2026-10-28 14:30'
+        self.s.db.execute('UPDATE reviews SET data=? WHERE id=?',(json.dumps(d),rid))
+        validate_backup(self.s.export(99),99)
+        r=self.s.db.execute('SELECT * FROM reviews WHERE id=?',(rid,)).fetchone()
+        self.assertIn('【时间】：2026-10-28',render_review(self.s,r))
+        self.assertNotIn('14:30',render_review(self.s,r))
+
+    def test_master_body_link_and_existing_keyboard_migration(self):
+        self.tick()
+        post=self.s.db.execute('SELECT * FROM posts').fetchone()
+        published=[p for method,p in self.api.calls if method=='sendMessage' and p['chat_id']==-10011][-1]
+        self.assertEqual(published['reply_markup']['inline_keyboard'],[])
+        self.assertIn('href="https://t.me/review_bot?start=review_1"',published['text'])
+        self.assertEqual(published['parse_mode'],'HTML')
+        self.assertTrue(published['link_preview_options']['is_disabled'])
+        self.s.db.execute("DELETE FROM settings WHERE key='summary_body_link_v1'")
+        self.bot=Bot(self.s,self.api,'review_bot',99)
+        self.tick()
+        edited=[p for method,p in self.api.calls if method=='editMessageText'][-1]
+        self.assertEqual(edited['message_id'],post['message'])
+        self.assertEqual(edited['reply_markup'],{'inline_keyboard':[]})
+        self.assertIn('给这位老师写评价</a>',edited['text'])
+        count=self.s.db.execute('SELECT count(*) FROM jobs').fetchone()[0]
+        self.bot=Bot(self.s,self.api,'review_bot',99)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM jobs').fetchone()[0],count)
 
     def test_env_admin_additions_and_revocation_semantics(self):
         self.assertEqual(admin_ids({'SUPERADMIN_ID':'1','SUPERADMIN_IDS':'2, 3 2，4'}),[1,2,3,4])

@@ -8,7 +8,7 @@ from datetime import datetime
 from .api import APIError
 from .identity import targets, member_present
 from .store import display_name
-from .reviews import FIELDS, SCORES, MODES, TZ, now_text, link
+from .reviews import FIELDS, SCORES, MODES, TZ, now_text, link, review_date
 from .publishing import Publisher, render_review
 from .backup import validate_backup, MAX_BACKUP_BYTES
 
@@ -77,7 +77,7 @@ class Bot:
             return '数据冲突，可能身份已绑定或内容重复。请检查后重新输入。'
         kind = pending[0] if pending else ''
         if kind == 'field' and pending[1] == '时间':
-            return '时间格式应为 YYYY-MM-DD HH:MM，例如 2026-10-29 14:30。请重新输入。'
+            return '时间格式应为 YYYY-MM-DD，例如 2026-10-29。请重新输入。'
         if kind == 'reviewedit' and isinstance(error, json.JSONDecodeError):
             return 'JSON 格式不正确，请按示例重新输入，字段名和文字使用英文双引号。'
         if kind in ('teacher','adminadd','setroot','reviewmanage','jobdone') and (
@@ -126,6 +126,8 @@ class Bot:
             value = d.get(field)
             if field == '老师' and value:
                 value = self.store.teacher(int(value))['name']
+            if field == '时间' and value:
+                value = review_date(value, legacy=True)
             lines.append('【%s】：%s' % (field, str(value) if value is not None else '未填写'))
         for i in range(0, len(FIELDS), 2):
             rows.append([(f + (' ✅' if d.get(f) is not None else ''), 'field:' + f) for f in FIELDS[i:i+2]])
@@ -181,7 +183,7 @@ class Bot:
             if field in SCORES:
                 return self.panel(uid, '🔢 选择%s分数（满分 10 分）' % field,
                     [[(str(n), 'score:%s:%s' % (field,n)) for n in range(start,start+5)] for start in (1,6)] + [[('返回草稿','write')]])
-            return self.prompt(uid, '✍️ 请输入%s。%s' % (field, '格式 YYYY-MM-DD HH:MM；不核对预约日期。' if field=='时间' else ''), ('field',field), 'write')
+            return self.prompt(uid, '✍️ 请输入%s。%s' % (field, '格式 YYYY-MM-DD；不核对预约日期。' if field=='时间' else ''), ('field',field), 'write')
         if kind in ('choose','score','anon'):
             d, token = self.store.draft(uid)
             if not token:
@@ -227,7 +229,7 @@ class Bot:
                 pub=self.store.db.execute('''SELECT p.* FROM publications p JOIN bindings b ON b.id=p.binding
                     LEFT JOIN posts t ON t.binding=p.binding AND t.teacher=? WHERE p.review=? AND b.active=1
                     AND (b.mode='feed' OR p.generation=t.generation) ORDER BY CASE b.mode WHEN 'thread' THEN 0 ELSE 1 END,b.id LIMIT 1''',(r['teacher'],r['id'])).fetchone()
-                label='#%s %s · %s'%(r['id'],self.store.teacher(r['teacher'])['name'],json.loads(r['data'])['时间'])
+                label='#%s %s · %s'%(r['id'],self.store.teacher(r['teacher'])['name'],review_date(json.loads(r['data'])['时间'], legacy=True))
                 if r['status'] in ('pending','rejected'):
                     text+='\n'+label+(' · 🕓 待审核' if r['status']=='pending' else ' · ❌ 未通过审核')
                 elif r['status']=='withdrawn': text+='\n'+label+' · 已撤下'
@@ -430,7 +432,7 @@ class Bot:
                 if not isinstance(changes,dict) or any(k not in (*SCORES,'时间','人照','过程') for k in changes):raise ValueError('包含不可修改的字段。')
                 d=json.loads(r['data']);d.update(changes)
                 if any(type(d[k]) is not int or not 1<=d[k]<=10 for k in SCORES):raise ValueError('分数需要 1～10 的整数。')
-                datetime.strptime(d['时间'],'%Y-%m-%d %H:%M')
+                d['时间'] = review_date(d['时间'], legacy='时间' not in changes)
                 if not isinstance(d['过程'],str) or not 1<=len(d['过程'])<=1600 or not isinstance(d['人照'],str) or not 1<=len(d['人照'])<=200:raise ValueError('过程或人照长度不正确。')
                 self.store.db.execute('UPDATE reviews SET data=?,version=version+1 WHERE id=?',(json.dumps(d,ensure_ascii=False),rid))
             self.store.log(uid,'修改车评' if changes else '撤下车评',rid)
@@ -492,9 +494,9 @@ class Bot:
             kind=pending[0]
             if kind=='field':
                 if not text:raise ValueError('请发送文字，不接收图片。')
-                limits={'过程':1600,'人照':200,'留名':80,'时间':16}
+                limits={'过程':1600,'人照':200,'留名':80,'时间':10}
                 if len(text)>limits[pending[1]]:raise ValueError('内容超过长度限制。')
-                if pending[1]=='时间':datetime.strptime(text,'%Y-%m-%d %H:%M')
+                if pending[1]=='时间':text=review_date(text)
                 d,token=self.store.draft(uid);d[pending[1]]=text;self.store.save_draft(uid,d,token or secrets.token_hex(12))
                 self.success(uid, '%s已保存，可继续填写其他字段。' % pending[1])
                 return self.draft_panel(uid)

@@ -15,6 +15,21 @@ def now_text(stamp=None):
     return datetime.fromtimestamp(stamp or time.time(), TZ).strftime('%Y-%m-%d %H:%M')
 
 
+def review_date(value, legacy=False):
+    """New input is a date; existing minute-precision data remains readable."""
+    if not isinstance(value, str):
+        raise ValueError('日期格式应为 YYYY-MM-DD。')
+    formats = ('%Y-%m-%d', '%Y-%m-%d %H:%M') if legacy else ('%Y-%m-%d',)
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if parsed.strftime(fmt) == value:
+                return parsed.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+    raise ValueError('日期格式应为 YYYY-MM-DD，例如 2026-10-29。')
+
+
 def link(chat, message):
     return 'https://t.me/c/%s/%s' % (str(chat).removeprefix('-100'), message)
 
@@ -161,9 +176,9 @@ class ReviewStore:
                 raise ValueError('分数需要通过按钮选择 1～10 分。')
             self.teacher(int(data['老师']))
             try:
-                datetime.strptime(data['时间'], '%Y-%m-%d %H:%M')
+                data['时间'] = review_date(data['时间'], legacy=True)
             except (ValueError, TypeError):
-                raise ValueError('时间格式应为 YYYY-MM-DD HH:MM，不进行预约日期核验。') from None
+                raise ValueError('日期格式应为 YYYY-MM-DD，不进行预约日期核验。') from None
             if len(data['过程']) > 1600 or len(data['人照']) > 200 or len(data['留名']) > 80:
                 raise ValueError('过程最多 1600 字，人照最多 200 字，留名最多 80 字。')
             last = self.db.execute('SELECT created FROM reviews WHERE author=? ORDER BY id DESC LIMIT 1', (user['id'],)).fetchone()
