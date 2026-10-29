@@ -15,6 +15,8 @@ def render_review(store, row):
         value = data.get(key, '')
         if key == '时间' and value:
             value = review_date(value, legacy=True)
+        elif key == '综合':
+            value = '%.1f' % value
         elif key == '老师':
             value = store.teacher(row['teacher'])['name']
         elif key == '留名':

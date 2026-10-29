@@ -54,7 +54,7 @@ class Tests(unittest.TestCase):
             path=Path(str(self.path)+suffix)
             if path.exists():path.unlink()
     def draft(self,uid=2,code='abc',token='token',stamp='2026-10-01 10:00'):
-        d={'时间':stamp,'老师':self.tid,'留名':code,'人照':'符合','过程':'完整文字评价','匿名':True,**{f:8 for f in SCORES}}
+        d={'时间':stamp,'老师':self.tid,'留名':code,'过程':'完整文字评价','匿名':True,**{f:8 for f in SCORES}}
         self.s.save_draft(uid,d,token);return d
     def submit(self,uid=2,code='abc',token='token',stamp='2026-10-01 10:00'):
         self.draft(uid,code,token,stamp)
@@ -78,13 +78,13 @@ class Tests(unittest.TestCase):
         self.s.add_codes(10,self.tid,['abc'])
         self.bot.message(message(text='/start review_1'))
         self.assertEqual(self.s.draft(2)[0]['老师'],self.tid)
-        d=self.draft();self.bot.action({'id':2},'field:综合');self.click('10')
-        self.assertEqual(self.s.draft(2)[0]['综合'],10)
+        d=self.draft();self.bot.action({'id':2},'field:人照');self.click('10')
+        self.assertEqual(self.s.draft(2)[0]['人照'],10)
         self.bot.action({'id':2},'submit')
         r=self.s.db.execute('SELECT * FROM reviews').fetchone();self.assertEqual(r['status'],'accepted')
         self.tick();self.forward();self.tick(3)
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM publications').fetchone()[0],1)
-        self.assertIn('10.0 / 10',self.bot.publisher.summary(self.tid)[0])
+        self.assertIn('8.3 / 10',self.bot.publisher.summary(self.tid)[0])
         self.bot.action({'id':2},'mine:0')
         self.assertIn('https://t.me/c/22/',str(self.api.calls[-1]))
         self.assertNotIn('customer',render_review(self.s,r))
@@ -114,7 +114,10 @@ class Tests(unittest.TestCase):
         self.bot.message(message(text='@target_a',cid=-10044));self.assertEqual(len(self.api.calls),0)
         self.s.bind(1,'lookup',{'id':-10044,'title':'内群'})
         self.bot.message(message(text='查询',cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
-        self.assertIn('鸽子',str(self.api.calls[-1]));self.assertIn('新增',str(self.api.calls[-1]))
+        self.assertIn('鸽子',str(self.api.calls[-1]))
+        self.assertEqual([b['text'] for b in self.api.calls[-1][1]['reply_markup']['inline_keyboard'][0]], ['新增标签','删除标签'])
+        self.bot.show_person(2,p['id'])
+        self.assertEqual([b['text'] for b in self.api.calls[-1][1]['reply_markup']['inline_keyboard'][0]], ['新增标签','删除标签'])
         self.s.set_admin(1,2,False)
         with self.assertRaises(ValueError):self.bot.action({'id':2},'edit:%s'%p['id'])
         with self.assertRaises(ValueError):self.s.set_admin(1,1,False)
@@ -163,11 +166,55 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.s.db.execute('SELECT state FROM codes').fetchone()[0],'used')
     def test_withdraw_and_edit_recompute_no_resurrection(self):
         self.s.add_codes(1,self.tid,['abc']);rid,_=self.submit();self.tick();self.forward();self.tick(3)
-        self.bot.change_review(1,rid,{'综合':10});self.tick(3)
+        with self.assertRaises(ValueError):self.bot.change_review(1,rid,{'综合':10})
+        self.bot.change_review(1,rid,{f:10 for f in SCORES});self.tick(3)
         self.assertIn('10.0',self.bot.publisher.summary(self.tid)[0])
         self.bot.change_review(1,rid,None);self.tick(3)
         self.assertIn('暂无',self.bot.publisher.summary(self.tid)[0]);self.assertIn('撤下',str(self.api.calls))
         self.assertEqual(self.s.db.execute('SELECT status FROM reviews').fetchone()[0],'withdrawn')
+    def test_score_form_derived_preview_and_invalid_inputs(self):
+        self.s.add_codes(1,self.tid,['abc'])
+        d=self.draft();d['综合']=1
+        self.s.save_draft(2,d,'token')
+        self.bot.draft_panel(2)
+        panel=self.api.calls[-1][1]
+        self.assertNotIn('field:综合',str(panel['reply_markup']))
+        self.assertIn('8.0（自动计算）',panel['text'])
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'field:综合')
+        self.bot.action({'id':2},'field:人照')
+        buttons=self.api.calls[-1][1]['reply_markup']['inline_keyboard']
+        self.assertEqual([b['text'] for row in buttons[:2] for b in row],[str(n) for n in range(1,11)])
+        for bad in (0,11,True,'符合'):
+            d['人照']=bad;self.s.save_draft(2,d,'token')
+            with self.assertRaises(ValueError):self.s.submit({'id':2},'token')
+        self.bot.draft_panel(2)
+        self.assertIn('需重新评分',self.api.calls[-1][1]['text'])
+        d['人照']=10;self.s.save_draft(2,d,'token')
+        self.bot.action({'id':2},'preview')
+        self.assertIn('【综合】：8.3',self.api.calls[-1][1]['text'])
+        rid,_=self.s.submit({'id':2},'token')
+        saved=json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(rid,)).fetchone()[0])
+        self.assertAlmostEqual(saved['综合'],50/6)
+        validate_backup(self.s.export(99),99)
+        broken=json.loads(self.s.export(99));saved['综合']=1
+        broken['tables']['reviews'][0]['data']=json.dumps(saved)
+        with self.assertRaises(ValueError):validate_backup(json.dumps(broken).encode(),99)
+
+    def test_legacy_text_score_backup_and_admin_correction(self):
+        self.s.add_codes(1,self.tid,['abc']);rid,_=self.submit()
+        old=json.loads(self.s.db.execute('SELECT data FROM reviews').fetchone()[0])
+        old.update({'人照':'符合','综合':9})
+        self.s.db.execute('UPDATE reviews SET data=? WHERE id=?',(json.dumps(old),rid))
+        self.s.save_draft(3,old,'legacy')
+        backup=validate_backup(self.s.export(99),99)
+        self.assertEqual(json.loads(backup['tables']['reviews'][0]['data'])['人照'],'符合')
+        self.bot.change_review(1,rid,{'过程':'修正过程'})
+        self.assertIn('9.0 / 10',self.bot.publisher.summary(self.tid)[0])
+        with self.assertRaises(ValueError):self.bot.change_review(1,rid,{'颜值':10})
+        self.bot.change_review(1,rid,{'人照':10})
+        self.assertIn('8.3 / 10',self.bot.publisher.summary(self.tid)[0])
+        validate_backup(self.s.export(99),99)
+
     def test_identity_recycling_and_unknown_username(self):
         p=self.s.track('@target_a');self.s.save(p['id'],0,{'id':1},'备注','标签')
         self.s.observe({'id':50,'username':'target_a'},100,True)
@@ -244,7 +291,7 @@ class Tests(unittest.TestCase):
         self.assertNotIn('strptime',self.api.calls[-1][1]['text'])
         self.bot.message(message(text='2026-10-29'))
         self.assertIn('时间已保存',self.api.calls[-1][1]['text'])
-        self.assertIn('1/11',self.api.calls[-1][1]['text'])
+        self.assertIn('1/10',self.api.calls[-1][1]['text'])
         self.bot.action({'id':2},'anon')
         self.assertIn('✅ 实名',str(self.api.calls[-1]))
 

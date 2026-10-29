@@ -7,7 +7,20 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Asia/Shanghai')
 FIELDS = ('时间', '老师', '留名', '人照', '颜值', '身材', '服务', '态度', '环境', '综合', '过程')
-SCORES = ('颜值', '身材', '服务', '态度', '环境', '综合')
+INPUT_FIELDS = tuple(f for f in FIELDS if f != '综合')
+SCORES = ('人照', '颜值', '身材', '服务', '态度', '环境')
+
+def valid_score(value):
+    return type(value) is int and 1 <= value <= 10
+
+def overall_score(data):
+    if not all(valid_score(data.get(f)) for f in SCORES):
+        raise ValueError('人照、颜值、身材、服务、态度、环境均需通过按钮选择 1～10 分。')
+    return sum(data[f] for f in SCORES) / len(SCORES)
+
+def missing_fields(data):
+    return [f for f in INPUT_FIELDS if (not valid_score(data.get(f)) if f in SCORES else not str(data.get(f, '')).strip())]
+
 MODES = {'thread': '老师专帖', 'feed': '车评直发', 'lookup': '内部查档'}
 
 
@@ -170,17 +183,16 @@ class ReviewStore:
             data, current = self.draft(user['id'])
             if token != current:
                 raise ValueError('草稿已变更，请重新打开。')
-            if any(not str(data.get(f, '')).strip() for f in FIELDS):
+            if any(not str(data.get(f, '')).strip() for f in INPUT_FIELDS):
                 raise ValueError('请补齐所有字段。')
-            if any(type(data[f]) is not int or not 1 <= data[f] <= 10 for f in SCORES):
-                raise ValueError('分数需要通过按钮选择 1～10 分。')
+            data['综合'] = overall_score(data)
             self.teacher(int(data['老师']))
             try:
                 data['时间'] = review_date(data['时间'], legacy=True)
             except (ValueError, TypeError):
                 raise ValueError('日期格式应为 YYYY-MM-DD，不进行预约日期核验。') from None
-            if len(data['过程']) > 1600 or len(data['人照']) > 200 or len(data['留名']) > 80:
-                raise ValueError('过程最多 1600 字，人照最多 200 字，留名最多 80 字。')
+            if not isinstance(data['过程'], str) or not isinstance(data['留名'], str) or len(data['过程']) > 1600 or len(data['留名']) > 80:
+                raise ValueError('过程最多 1600 字，留名最多 80 字。')
             last = self.db.execute('SELECT created FROM reviews WHERE author=? ORDER BY id DESC LIMIT 1', (user['id'],)).fetchone()
             if last and time.time() - last[0] < 30:
                 raise ValueError('提交过于频繁，请稍后再试。')

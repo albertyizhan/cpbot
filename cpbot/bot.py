@@ -8,7 +8,7 @@ from datetime import datetime
 from .api import APIError
 from .identity import targets, member_present
 from .store import display_name
-from .reviews import FIELDS, SCORES, MODES, TZ, now_text, link, review_date
+from .reviews import FIELDS, INPUT_FIELDS, SCORES, valid_score, overall_score, missing_fields, MODES, TZ, now_text, link, review_date
 from .publishing import Publisher, render_review
 from .backup import validate_backup, MAX_BACKUP_BYTES
 
@@ -109,7 +109,7 @@ class Bot:
             return self.panel(uid, self.card(p) + '\n\n确定清空标签？保留身份、备注和修改记录。',
                 [[('确认删除', 'delete:%s:%s' % (pid, p['version']))], [('取消', 'person:%s' % pid)]])
         return self.panel(uid, (notice + '\n\n' if notice else '') + self.card(p),
-                          [[('新增', 'edit:%s' % pid), ('删除标签', 'askdelete:%s' % pid)],
+                          [[('新增标签', 'edit:%s' % pid), ('删除标签', 'askdelete:%s' % pid)],
                            [('修改记录', 'history:%s:0' % pid)], [('返回主菜单', 'home')]])
 
     def draft_panel(self, uid):
@@ -117,20 +117,24 @@ class Bot:
         if not token:
             token = secrets.token_hex(12)
             self.store.save_draft(uid, d, token)
-        filled = sum(bool(str(d.get(f, '')).strip()) for f in FIELDS)
-        lines = ['📝 车评草稿 · 已填写 %s/%s 项' % (filled, len(FIELDS)),
+        filled = len(INPUT_FIELDS) - len(missing_fields(d))
+        lines = ['📝 车评草稿 · 已填写 %s/%s 项' % (filled, len(INPUT_FIELDS)),
                  '点击字段逐项填写，提交前可修改。草稿已保存。',
                  '🔒 匿名发布：隐藏身份及留名原文。' if d.get('匿名', True) else '👤 实名发布：公开 Telegram ID、身份链接及已有用户名。']
         rows = []
         for field in FIELDS:
             value = d.get(field)
+            if field == '综合':
+                value = ('%.1f（自动计算）' % overall_score(d)) if all(valid_score(d.get(f)) for f in SCORES) else '六项评分填齐后自动计算'
+            elif field in SCORES and value is not None and not valid_score(value):
+                value = '需重新评分'
             if field == '老师' and value:
                 value = self.store.teacher(int(value))['name']
             if field == '时间' and value:
                 value = review_date(value, legacy=True)
             lines.append('【%s】：%s' % (field, str(value) if value is not None else '未填写'))
-        for i in range(0, len(FIELDS), 2):
-            rows.append([(f + (' ✅' if d.get(f) is not None else ''), 'field:' + f) for f in FIELDS[i:i+2]])
+        for i in range(0, len(INPUT_FIELDS), 2):
+            rows.append([(f + (' ✅' if f not in missing_fields(d) else ''), 'field:' + f) for f in INPUT_FIELDS[i:i+2]])
         rows += [[('✅ 匿名' if d.get('匿名', True) else '✅ 实名', 'anon'), ('预览', 'preview')],
                  [('提交', 'submit'), ('返回主菜单', 'home')]]
         return self.panel(uid, '\n'.join(lines), rows)
@@ -176,8 +180,8 @@ class Bot:
             return self.draft_panel(uid)
         if kind == 'field':
             field = parts[1]
-            if field not in FIELDS:
-                raise ValueError('字段不存在。')
+            if field not in INPUT_FIELDS:
+                raise ValueError('该字段不可填写；综合分由六项评分自动计算。')
             if field == '老师':
                 return self.teachers(uid)
             if field in SCORES:
@@ -200,14 +204,15 @@ class Bot:
             return self.draft_panel(uid)
         if kind=='preview':
             d, token=self.store.draft(uid)
-            missing = [f for f in FIELDS if not str(d.get(f, '')).strip()]
+            missing = missing_fields(d)
             if missing:
                 raise ValueError('请先填写：' + '、'.join(missing))
+            d['综合'] = overall_score(d)
             row={'data':json.dumps(d),'teacher':d['老师'],'manual':0,'anonymous':d.get('匿名',True),'identity':json.dumps(user),'author':uid,'id':'预览'}
             return self.panel(uid,render_review(self.store,row),[[('返回修改','write'),('确认提交','submit')]],parse_mode='HTML')
         if kind=='submit':
             draft,token=self.store.draft(uid)
-            missing = [f for f in FIELDS if not str(draft.get(f, '')).strip()]
+            missing = missing_fields(draft)
             if missing:
                 raise ValueError('还未填写：'+'、'.join(missing)+'。请点击对应字段补齐。')
             rid,status=self.store.submit(user,token)
@@ -391,7 +396,7 @@ class Bot:
             r=self.store.db.execute('SELECT * FROM reviews WHERE id=?',(int(parts[1]),)).fetchone()
             if not r:raise ValueError('车评不存在。')
             return self.panel(uid,render_review(self.store,r)+'\n状态：'+{'accepted':'✅ 已通过','pending':'🕓 待审核','rejected':'❌ 已拒绝','withdrawn':'🚫 已撤下'}.get(r['status'],r['status']),[[('修改字段','reviewedit:'+parts[1]),('撤下','withdraw:'+parts[1])],[('返回','admin')]],parse_mode='HTML')
-        if kind=='reviewedit':return self.prompt(uid,'发送 JSON 对象，例如 {"综合":8,"过程":"更正后的内容"}。仅可修改时间、人照、评分、过程；不会重新消耗留名。',('reviewedit',int(parts[1])),'reviewadmin:'+parts[1])
+        if kind=='reviewedit':return self.prompt(uid,'发送 JSON 对象，例如 {"人照":8,"过程":"更正后的内容"}。仅可修改时间、六项评分、过程；综合分自动计算，不会重新消耗留名。',('reviewedit',int(parts[1])),'reviewadmin:'+parts[1])
         if kind=='withdraw':return self.panel(uid,'确认撤下？将停止计分，各已发布消息改为撤下提示。',[[('确认撤下','withdrawyes:'+parts[1])],[('取消','reviewadmin:'+parts[1])]])
         if kind=='withdrawyes':
             self.change_review(uid,int(parts[1]),None)
@@ -429,11 +434,16 @@ class Bot:
             if not r:raise ValueError('仅可处理正式有效车评。')
             if changes is None:self.store.db.execute("UPDATE reviews SET status='withdrawn',version=version+1 WHERE id=?",(rid,))
             else:
-                if not isinstance(changes,dict) or any(k not in (*SCORES,'时间','人照','过程') for k in changes):raise ValueError('包含不可修改的字段。')
+                if not isinstance(changes,dict) or any(k not in (*SCORES,'时间','过程') for k in changes):raise ValueError('包含不可修改的字段。')
                 d=json.loads(r['data']);d.update(changes)
-                if any(type(d[k]) is not int or not 1<=d[k]<=10 for k in SCORES):raise ValueError('分数需要 1～10 的整数。')
+                if any(not valid_score(v) for k,v in changes.items() if k in SCORES):raise ValueError('分数需要 1～10 的整数。')
+                # Legacy text 人照 has no numeric meaning: preserve its old overall until rescored.
+                if isinstance(d.get('人照'),str):
+                    if any(k in SCORES for k in changes):raise ValueError('这是一条旧版车评，请同时补充人照分数，再更正评分。')
+                else:
+                    d['综合'] = overall_score(d)
                 d['时间'] = review_date(d['时间'], legacy='时间' not in changes)
-                if not isinstance(d['过程'],str) or not 1<=len(d['过程'])<=1600 or not isinstance(d['人照'],str) or not 1<=len(d['人照'])<=200:raise ValueError('过程或人照长度不正确。')
+                if not isinstance(d['过程'],str) or not 1<=len(d['过程'])<=1600:raise ValueError('过程长度不正确。')
                 self.store.db.execute('UPDATE reviews SET data=?,version=version+1 WHERE id=?',(json.dumps(d,ensure_ascii=False),rid))
             self.store.log(uid,'修改车评' if changes else '撤下车评',rid)
             for b in self.store.db.execute("SELECT * FROM bindings WHERE mode IN ('thread','feed')"):
@@ -494,7 +504,8 @@ class Bot:
             kind=pending[0]
             if kind=='field':
                 if not text:raise ValueError('请发送文字，不接收图片。')
-                limits={'过程':1600,'人照':200,'留名':80,'时间':10}
+                if pending[1] not in ('过程','留名','时间'):raise ValueError('评分请返回草稿，点击对应按钮选择；综合分自动计算。')
+                limits={'过程':1600,'留名':80,'时间':10}
                 if len(text)>limits[pending[1]]:raise ValueError('内容超过长度限制。')
                 if pending[1]=='时间':text=review_date(text)
                 d,token=self.store.draft(uid);d[pending[1]]=text;self.store.save_draft(uid,d,token or secrets.token_hex(12))
@@ -739,7 +750,7 @@ class Bot:
                     # Existing state is explicitly dated in the card.
                     pass
             buttons = [[{'text': label, 'url': 'https://t.me/%s?start=%s_%s' % (self.username, intent, p['id'])}
-                        for label, intent in (('新增', 'edit'), ('删除标签', 'delete'))]]
+                        for label, intent in (('新增标签', 'edit'), ('删除标签', 'delete'))]]
             notice = self.match_notice(target)
             self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']), buttons,
                       reply_parameters={'message_id': message['message_id'], 'allow_sending_without_reply': True})

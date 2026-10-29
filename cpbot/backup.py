@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .reviews import FIELDS, SCORES, MODES, review_date
+from .reviews import FIELDS, SCORES, overall_score, valid_score, MODES, review_date
 
 MAX_BACKUP_BYTES = 15 * 1024 * 1024
 TABLES = ('admins', 'people', 'teachers', 'codes', 'drafts', 'reviews', 'bindings',
@@ -105,9 +105,12 @@ def check_relations(db):
             d, identity = json.loads(r['data']), json.loads(r['identity'])
             require(isinstance(d, dict) and all(str(d.get(f, '')).strip() for f in FIELDS), '车评字段缺失。')
             require(type(d['老师']) is int and d['老师'] == r['teacher'], '老师关联不一致。')
-            require(all(type(d[k]) is int and 1 <= d[k] <= 10 for k in SCORES), '评分无效。')
+            legacy = isinstance(d['人照'], str)
+            require(all(valid_score(d[k]) for k in SCORES if not (legacy and k == '人照')), '评分无效。')
+            require(type(d['综合']) in (int,float) and math.isfinite(d['综合']) and 1 <= d['综合'] <= 10, '综合分无效。')
+            require((1 <= len(d['人照']) <= 200 and valid_score(d['综合'])) if legacy else abs(d['综合'] - overall_score(d)) < 1e-9, '综合分与评分不一致。')
             review_date(d['时间'], legacy=True)
-            require(isinstance(d['过程'], str) and len(d['过程']) <= 1600 and isinstance(d['人照'], str) and len(d['人照']) <= 200 and isinstance(d['留名'], str) and len(d['留名']) <= 80, '车评文字无效。')
+            require(isinstance(d['过程'], str) and len(d['过程']) <= 1600 and isinstance(d['留名'], str) and len(d['留名']) <= 80, '车评文字无效。')
             require(isinstance(identity, dict) and identity.get('id') == r['author'] and ('username' not in identity or isinstance(identity['username'], str)), '作者身份无效。')
         except (ValueError, TypeError, KeyError):
             raise ValueError('备份中的车评内容无效。') from None
@@ -117,7 +120,9 @@ def check_relations(db):
             require(isinstance(d,dict) and set(d) <= set(FIELDS) | {'匿名'} and r['user_id'] > 0 and bool(r['token']), '草稿无效。')
             if '老师' in d: require(type(d['老师']) is int and d['老师'] in teacher_ids, '草稿老师不存在。')
             for key, value in d.items():
-                if key in SCORES: require(type(value) is int and 1 <= value <= 10, '草稿评分无效。')
+                if key == '人照' and isinstance(value,str): require(len(value) <= 200, '旧草稿人照过长。')
+                elif key == '综合': require(type(value) in (int,float) and math.isfinite(value) and 1 <= value <= 10, '草稿综合分无效。')
+                elif key in SCORES: require(valid_score(value), '草稿评分无效。')
                 elif key == '匿名': require(type(value) is bool, '草稿匿名状态无效。')
                 elif key != '老师': require(isinstance(value,str) and len(value) <= {'过程':1600,'人照':200,'留名':80,'时间':16}[key], '草稿文字无效。')
         except (ValueError, TypeError):
