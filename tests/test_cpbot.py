@@ -250,7 +250,7 @@ class Tests(unittest.TestCase):
 
     def test_mutation_feedback_and_operational_states(self):
         self.bot.action({'id':1},'teachernew')
-        self.bot.message(message(uid=1,text='新增老师\n-'))
+        self.bot.message(message(uid=1,text='新增老师'))
         self.assertIn('已保存',self.api.calls[-1][1]['text'])
         self.bot.action({'id':1},'codefor:1')
         self.bot.message(message(uid=1,text='first\nsecond'))
@@ -339,6 +339,30 @@ class Tests(unittest.TestCase):
         self.bot.imports[1]['until']=0
         self.click('确认覆盖并恢复',uid=1)
         self.assertTrue(self.s.ready());self.assertIn('过期',self.api.calls[-1][1]['text'])
+
+    def test_teacher_name_and_optional_identity_are_separate(self):
+        self.bot.action({'id':1},'teachernew')
+        self.bot.message(message(uid=1,text='只填名称'))
+        tid=self.s.db.execute("SELECT id FROM teachers WHERE name='只填名称'").fetchone()[0]
+        self.assertIsNone(self.s.teacher(tid)['user_id'])
+        self.assertIn('未绑定',self.api.calls[-1][1]['text'])
+        self.assertIsNotNone(self.s.db.execute('SELECT 1 FROM posts WHERE teacher=?',(tid,)).fetchone())
+        self.bot.action({'id':1},'teacherbind:%s'%tid)
+        self.bot.message(message(uid=1,text='20'))
+        self.s.add_codes(20,tid,['留名'])
+        self.bot.action({'id':1},'teacherrename:%s'%tid)
+        self.bot.message(message(uid=1,text='新名称'))
+        self.assertEqual(self.s.teacher(tid)['user_id'],20)
+        self.assertEqual(self.s.teacher(tid)['name'],'新名称')
+        self.bot.action({'id':1},'teacherbind:%s'%tid)
+        self.bot.message(message(uid=1,text='10'))
+        self.assertEqual(self.s.teacher(tid)['user_id'],20)
+        self.assertIn('已绑定其他老师',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1},'teacherunbindyes:%s'%tid)
+        with self.assertRaises(ValueError):self.s.add_codes(20,tid,['其他'])
+        self.s.add_codes(1,tid,['其他'])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM codes WHERE teacher=?',(tid,)).fetchone()[0],2)
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'teacherbind:%s'%tid)
 
     def test_env_admin_additions_and_revocation_semantics(self):
         self.assertEqual(admin_ids({'SUPERADMIN_ID':'1','SUPERADMIN_IDS':'2, 3 2，4'}),[1,2,3,4])

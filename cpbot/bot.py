@@ -158,7 +158,7 @@ class Bot:
     def action(self, user, action):
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
-        admin_kinds = {'admin','teachersadmin','teachernew','teacheredit','codesadmin','codefor','admins','adminadd','adminremove',
+        admin_kinds = {'admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','codesadmin','codefor','admins','adminadd','adminremove',
                        'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
                        'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','removeadmin','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
         if kind in admin_kinds:
@@ -252,9 +252,30 @@ class Bot:
             row=self.store.db.execute('SELECT * FROM history WHERE id=?',(int(parts[1]),)).fetchone()
             if not row: raise ValueError('记录不存在。')
             return self.panel(uid,'操作人：%s（%s）\n时间：%s\n修改前：%s\n修改后：%s'%(row['actor_name'],row['actor'],date(row['created']),row['before_value'],row['after_value']),[[('返回主菜单','home')]])
-        if kind in ('teachernew','teacheredit'):
-            return self.prompt(uid,'发送两行：老师名称、老师 Telegram 数字 ID（不绑定填 -）。',('teacher',int(parts[1]) if kind=='teacheredit' else None),'admin')
-        if kind=='teachersadmin': return self.teachers(uid,'teacheredit')
+        if kind=='teachernew':
+            return self.prompt(uid,'👩‍🏫 添加老师\n发送老师名称即可（1～80 字）。本人账号可在详情中另行绑定。',('teachernew',),'admin')
+        if kind in ('teacherdetail','teacheredit'):
+            t=self.store.teacher(int(parts[1]))
+            identity='✅ 已绑定本人账号：%s' % t['user_id'] if t['user_id'] else 'ℹ️ 未绑定本人账号，由 superadmin 添加留名。'
+            rows=[[('修改名称','teacherrename:%s'%t['id'])],[('绑定本人账号（可选）' if not t['user_id'] else '更换本人账号','teacherbind:%s'%t['id'])]]
+            if t['user_id']:rows.append([('解除本人绑定','teacherunbind:%s'%t['id'])])
+            rows += [[('添加留名','codefor:%s'%t['id'])],[('返回老师列表','teachersadmin')]]
+            return self.panel(uid,'👩‍🏫 %s · #%s\n%s\n未绑定不影响主帖、客户写评和查评。'%(t['name'],t['id'],identity),rows)
+        if kind=='teacherrename':
+            t=self.store.teacher(int(parts[1]))
+            return self.prompt(uid,'当前名称：%s\n发送新名称（1～80 字），本人账号保持不变。'%t['name'],('teacherrename',t['id']),'teacherdetail:%s'%t['id'])
+        if kind=='teacherbind':
+            t=self.store.teacher(int(parts[1]))
+            return self.prompt(uid,'为「%s」绑定本人账号：发送老师 Telegram 数字 ID。\n绑定后该账号可为此老师添加留名；更换后旧账号立即失去此权限。'%t['name'],('teacherbind',t['id']),'teacherdetail:%s'%t['id'])
+        if kind=='teacherunbind':
+            t=self.store.teacher(int(parts[1]))
+            return self.panel(uid,'⚠️ 确认解除「%s」的本人账号绑定？\n原账号将不能为该老师添加留名，已有留名和评价不变。'%t['name'],[[('确认解除','teacherunbindyes:%s'%t['id'])],[('取消','teacherdetail:%s'%t['id'])]])
+        if kind=='teacherunbindyes':
+            tid=int(parts[1])
+            self.store.set_teacher_account(uid,tid,None)
+            self.success(uid,'本人账号已解绑，历史留名和评价保留。')
+            return self.action(user,'teacherdetail:%s'%tid)
+        if kind=='teachersadmin': return self.teachers(uid,'teacherdetail')
         if kind=='codesadmin': return self.teachers(uid,'codefor')
         if kind=='mycodes':
             t=self.store.db.execute('SELECT * FROM teachers WHERE user_id=?',(uid,)).fetchone()
@@ -509,12 +530,22 @@ class Bot:
                 self.store.save(p['id'],pending[2],user,note,tags_,'新增标签')
                 self.success(uid, '新增内容已保存，下方显示最新资料。')
                 return self.show_person(uid,p['id'])
-            if kind=='teacher':
-                lines=text.splitlines()
-                if len(lines)!=2:raise ValueError('需要两行：名称、数字 ID 或 -。')
-                tid=self.store.save_teacher(uid,lines[0],None if lines[1]=='-' else int(lines[1]),pending[1])
-                self.success(uid, '老师 #%s「%s」已保存；%s' % (tid, lines[0], '未绑定本人账号，由 superadmin 添加留名。' if lines[1]=='-' else '本人账号已绑定，可私聊添加留名。'))
-                return self.admin_panel(uid)
+            if kind in ('teachernew','teacherrename'):
+                if len(text.splitlines())!=1:
+                    raise ValueError('只需发送一行老师名称；本人账号请在详情中单独绑定。')
+                if kind=='teachernew':
+                    tid=self.store.save_teacher(uid,text)
+                else:
+                    tid=pending[1]
+                    self.store.rename_teacher(uid,tid,text)
+                self.success(uid,'老师名称已保存。')
+                return self.action(user,'teacherdetail:%s'%tid)
+            if kind=='teacherbind':
+                if not text.isascii() or not text.isdigit() or not 0<int(text)<2**63:
+                    raise ValueError('请输入有效的 Telegram 数字 ID，不是 @用户名。')
+                self.store.set_teacher_account(uid,pending[1],int(text))
+                self.success(uid,'本人账号已绑定，可私聊添加留名。')
+                return self.action(user,'teacherdetail:%s'%pending[1])
             if kind=='adminadd':
                 self.store.set_admin(uid,int(text))
                 self.success(uid, 'superadmin %s 已加入名单，发送 /start 即可进入后台。' % int(text))

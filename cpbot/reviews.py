@@ -96,6 +96,30 @@ class ReviewStore:
                 self.enqueue('summary', b['id'], tid, generation=time.time_ns() // 1000)
             return tid
 
+    def set_teacher_account(self, actor, tid, uid):
+        self.require_admin(actor)
+        if uid is not None and (type(uid) is not int or not 0 < uid < 2**63):
+            raise ValueError('请输入有效的 Telegram 数字 ID。')
+        try:
+            with self.transaction():
+                self.teacher(tid)
+                self.db.execute('UPDATE teachers SET user_id=? WHERE id=?',(uid,tid))
+                self.log(actor,'绑定老师账号' if uid else '解绑老师账号',tid)
+        except sqlite3.IntegrityError:
+            raise ValueError('此账号已绑定其他老师，请先解除原绑定。') from None
+
+    def rename_teacher(self, actor, tid, name):
+        self.require_admin(actor)
+        if not name.strip() or len(name)>80 or '\n' in name:
+            raise ValueError('老师名称需要一行，1～80 字。')
+        with self.transaction():
+            self.teacher(tid)
+            self.db.execute('UPDATE teachers SET name=? WHERE id=?',(name.strip(),tid))
+            self.log(actor,'修改老师名称',tid)
+            for b in self.db.execute("SELECT id FROM bindings WHERE mode='thread'"):
+                self.ensure_post(b['id'],tid)
+                self.enqueue('summary',b['id'],tid,generation=time.time_ns()//1000)
+
     def add_codes(self, actor, tid, values):
         teacher = self.teacher(tid)
         if not self.admin(actor) and teacher['user_id'] != actor:
