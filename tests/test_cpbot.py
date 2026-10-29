@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from cpbot.__main__ import admin_ids
+from cpbot.backup import validate_backup, MAX_BACKUP_BYTES
 from cpbot.api import APIError
 from cpbot.bot import Bot
 from cpbot.identity import targets
@@ -27,6 +28,7 @@ class FakeAPI:
             return {'id':cid,'type':'channel' if cid in (-10011,-10033) else 'supergroup','title':str(cid),'linked_chat_id':-10022 if cid==-10011 else -10011}
         if method=='getChatMember':return {'status':'administrator','can_post_messages':True,'can_edit_messages':True,'user':{'id':params['user_id']}}
         self.mid+=1;return {'message_id':self.mid}
+    def download_document(self,document,max_bytes):return self.upload
     def document(self,uid,name,content):self.calls.append(('document',{'uid':uid,'content':content}))
 
 
@@ -38,6 +40,7 @@ def message(uid=2,text='',cid=None,**extra):
 class Tests(unittest.TestCase):
     def setUp(self):
         # Explicit paths, no recursive cleanup.
+        self.recovery_paths=[]
         self.path=Path(tempfile.gettempdir())/('cpbot-test-%s.sqlite3'%time.time_ns())
         self.s=Store(str(self.path),1);self.api=FakeAPI();self.bot=Bot(self.s,self.api,'review_bot',99)
         self.tid=self.s.save_teacher(1,'老师甲',10)
@@ -45,6 +48,8 @@ class Tests(unittest.TestCase):
         self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('last_check',?)",(datetime.now(TZ).strftime('%Y-%m-%d'),))
     def tearDown(self):
         self.s.db.close()
+        for path in self.recovery_paths:
+            if path.exists():path.unlink()
         for suffix in ('','-wal','-shm'):
             path=Path(str(self.path)+suffix)
             if path.exists():path.unlink()
@@ -129,8 +134,12 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):self.s.moderate(1,rid2,True)
         self.tick()
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM reviews').fetchone()[0],1)
-        backup=self.s.export();restored=sqlite3.connect(':memory:');restored.executescript(backup.decode())
-        self.assertEqual(restored.execute('SELECT count(*) FROM reviews').fetchone()[0],1);restored.close()
+        backup=self.s.export();restored=Store(':memory:',1)
+        try:
+            recovery=restored.import_backup(1,backup)
+            self.assertEqual(restored.db.execute('SELECT count(*) FROM reviews').fetchone()[0],1)
+            recovery.unlink()
+        finally:restored.db.close()
         self.s.set_admin(1,3);self.bot.action({'id':3},'export');self.assertTrue(any(m=='document' for m,_ in self.api.calls))
     def test_nightly_missing_rebuild_and_pacing(self):
         self.s.add_codes(1,self.tid,['abc']);self.submit();self.tick();self.forward();self.tick(3)
@@ -230,6 +239,74 @@ class Tests(unittest.TestCase):
         self.assertIn('全局发布已暂停',self.api.calls[-2][1]['text'])
         self.bot.action({'id':1},'jobs:0')
         self.assertNotIn('pending=',self.api.calls[-1][1]['text'])
+
+    def test_json_import_end_to_end_permissions_preview_and_recovery(self):
+        self.s.add_codes(1,self.tid,['abc']);self.submit();self.tick();self.forward();self.tick(3)
+        p=self.s.track('50');self.s.save(p['id'],0,{'id':1},'旧备注','旧标签')
+        backup=self.s.export(99)
+        self.s.save(p['id'],1,{'id':1},'新备注','新标签')
+        self.s.set_admin(1,3)
+        self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('offset','123')")
+        self.api.upload=backup
+        self.bot.action({'id':3},'import')
+        self.bot.message(message(uid=3,document={'file_id':'file','file_name':'backup.json'}))
+        self.assertIn('尚未导入',self.api.calls[-1][1]['text'])
+        self.assertEqual(self.s.person(p['id'])['tags'],'新标签')
+        self.click('确认覆盖并恢复',uid=3)
+        self.assertEqual(self.s.person(p['id'])['tags'],'旧标签')
+        self.assertTrue(self.s.admin(3));self.assertFalse(self.s.ready());self.assertTrue(self.bot.paused())
+        self.assertEqual(self.s.db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()[0],'123')
+        recovery=self.s.db.execute("SELECT detail FROM audit WHERE action='导入备份' ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.recovery_paths.append(Path(recovery))
+        old=validate_backup(Path(recovery).read_bytes(),99)
+        self.assertEqual(old['tables']['people'][0]['tags'],'新标签')
+        self.assertTrue(any(m=='document' for m,_ in self.api.calls))
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'import')
+
+    def test_import_failure_rolls_back_and_preserves_recovery(self):
+        content=self.s.export(99)
+        self.s.db.execute("CREATE TRIGGER fail_import BEFORE INSERT ON teachers BEGIN SELECT RAISE(ABORT,'test failure'); END")
+        # Fix a known recovery filename for deterministic evidence and cleanup.
+        recovery=self.path.with_suffix('.recovery.json')
+        self.recovery_paths.append(recovery)
+        original=self.s.recovery_backup
+        def backup(bot):
+            recovery.write_bytes(self.s.export(bot))
+            return recovery
+        self.s.recovery_backup=backup
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):self.s.import_backup(1,content,99)
+            self.assertEqual(self.s.teacher(self.tid)['name'],'老师甲')
+            self.assertTrue(self.s.ready());self.assertTrue(self.s.admin(1))
+            self.assertEqual(validate_backup(recovery.read_bytes(),99)['version'],1)
+        finally:self.s.recovery_backup=original
+
+    def test_json_backup_rejects_invalid_and_cancel_expire(self):
+        content=self.s.export(99)
+        data=json.loads(content)
+        for bad in (b'DROP TABLE teachers;',b'{',content[:10],b'x'*(MAX_BACKUP_BYTES+1)):
+            with self.assertRaises(ValueError):validate_backup(bad,99)
+        for mutate in (
+            lambda d:d.update(version=999),
+            lambda d:d.update(source_bot=100),
+            lambda d:d['tables'].pop('codes'),
+            lambda d:d['tables']['teachers'][0].update(id='wrong'),
+            lambda d:d['tables']['posts'][0].update(teacher=999),
+            lambda d:d['tables']['bindings'][0].update(discussion=-10011),
+        ):
+            d=json.loads(content);mutate(d)
+            with self.assertRaises(ValueError):validate_backup(json.dumps(d).encode(),99)
+        self.api.upload=content
+        self.bot.action({'id':1},'import')
+        self.bot.message(message(uid=1,document={'file_id':'f','file_name':'old.sql'}))
+        self.assertIn('旧 SQL',self.api.calls[-1][1]['text'])
+        self.bot.message(message(uid=1,document={'file_id':'f','file_name':'new.json'}))
+        self.click('取消，不改数据',uid=1);self.assertTrue(self.s.ready());self.assertFalse(self.bot.imports)
+        self.bot.action({'id':1},'import')
+        self.bot.message(message(uid=1,document={'file_id':'f','file_name':'new.json'}))
+        self.bot.imports[1]['until']=0
+        self.click('确认覆盖并恢复',uid=1)
+        self.assertTrue(self.s.ready());self.assertIn('过期',self.api.calls[-1][1]['text'])
 
     def test_env_admin_additions_and_revocation_semantics(self):
         self.assertEqual(admin_ids({'SUPERADMIN_ID':'1','SUPERADMIN_IDS':'2, 3 2，4'}),[1,2,3,4])

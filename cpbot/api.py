@@ -43,3 +43,23 @@ class API:
         if not result.get('ok'):
             raise APIError(result.get('error_code', 0), description=result.get('description', ''))
         return result['result']
+
+    def download_document(self, document, max_bytes):
+        """Download only a Telegram file ID to bounded memory; never use supplied URLs."""
+        from urllib.parse import quote
+        size = document.get('file_size')
+        if size is not None and (type(size) is not int or size < 0 or size > max_bytes):
+            raise ValueError('备份不能超过 15 MB。')
+        info = self.call('getFile', file_id=document['file_id'])
+        path = info.get('file_path', '')
+        if not path or path.startswith('/') or any(part in ('..','.') for part in path.split('/')):
+            raise ValueError('Telegram 文件位置无效，请重新上传。')
+        url = self.base.replace('/bot', '/file/bot', 1).rsplit('/', 1)[0] + '/' + quote(path, safe='/')
+        try:
+            with urlopen(Request(url), timeout=60) as response:
+                content = response.read(max_bytes + 1)
+        except (HTTPError, URLError, OSError):
+            raise APIError(0) from None
+        if len(content) > max_bytes:
+            raise ValueError('备份不能超过 15 MB。')
+        return content

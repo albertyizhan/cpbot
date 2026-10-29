@@ -7,11 +7,13 @@ from contextlib import contextmanager
 
 
 from .reviews import ReviewStore
+from .backup import BackupStore
 
 
-class Store(ReviewStore):
+class Store(ReviewStore, BackupStore):
     def __init__(self, path, owner, configured_admins=()):
         self.owner = owner
+        self.configured_admins = tuple(configured_admins)
         self.db = sqlite3.connect(path, isolation_level=None, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''

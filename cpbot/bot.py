@@ -10,6 +10,7 @@ from .identity import targets, member_present
 from .store import display_name
 from .reviews import FIELDS, SCORES, MODES, TZ, now_text, link
 from .publishing import Publisher, render_review
+from .backup import validate_backup, MAX_BACKUP_BYTES
 
 
 def date(stamp):
@@ -23,6 +24,7 @@ class Bot:
         self.publisher = Publisher(store, api, username, bot_id)
         self.edit_target = None
         self.notices = {}
+        self.imports = {}
 
     def send(self, chat, text, rows=None, **extra):
         return self.api.call('sendMessage', chat_id=chat, text=text,
@@ -150,19 +152,21 @@ class Bot:
             [('🔑 留名管理', 'codesadmin'), ('🕓 待审核', 'queue:0')],
             [('📣 频道 / 群绑定', 'bindings'), ('👑 superadmin 名单', 'admins')],
             [('📤 发布任务', 'jobs:0'), ('🛠 车评处理', 'reviewmanage')],
-            [('💾 导出数据备份', 'export'), ('返回主菜单', 'home')]])
+            [('💾 导出数据备份', 'export'), ('📥 导入数据备份', 'import')],
+            [('返回主菜单', 'home')]])
 
     def action(self, user, action):
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
         admin_kinds = {'admin','teachersadmin','teachernew','teacheredit','codesadmin','codefor','admins','adminadd','adminremove',
                        'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
-                       'setroot','pausejobs','resumejobs','removeadmin','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
+                       'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','removeadmin','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
         if kind in admin_kinds:
             self.store.require_admin(uid)
         if kind not in admin_kinds and kind not in ('home','cancel') and not self.store.ready():
             raise ValueError('尚无可用的老师专帖绑定，业务暂不可用。')
         if kind in ('home','cancel'):
+            self.imports.pop(uid, None)
             return self.home(uid)
         if kind == 'admin':
             return self.admin_panel(uid)
@@ -332,9 +336,33 @@ class Bot:
             self.success(uid, '车评 #%s %s' % (parts[1], '已通过，正在排队发布。' if kind=='approve' else '已拒绝，不会公开；记录到期清理。'))
             return self.action(user,'queue:0')
         if kind=='export':
-            self.api.document(uid,'cpbot-%s.sql'%datetime.now(TZ).strftime('%Y%m%d-%H%M%S'),self.store.export())
+            self.api.document(uid,'cpbot-%s.json'%datetime.now(TZ).strftime('%Y%m%d-%H%M%S'),self.store.export(self.publisher.bot_id))
             self.success(uid, '备份文件已发送到本私聊，请下载并妥善保存。')
             return self.admin_panel(uid)
+        if kind=='import':
+            self.imports.pop(uid, None)
+            return self.prompt(uid,'📥 导入数据备份\n请上传本机器人导出的 JSON 文件（最大 15 MB）。\n将按备份整体恢复，不合并；覆盖当前老师、标签、车评、管理员名单和发布记录。\n上传后先校验和预览，确认后才写入；当前操作者和 .env 管理员保留。',('importfile',),'admin')
+        if kind=='importcancel':
+            self.imports.pop(uid, None)
+            self.success(uid,'已取消导入，当前数据未改变。')
+            return self.admin_panel(uid)
+        if kind=='importconfirm':
+            saved = self.imports.pop(uid, None)
+            if not saved or saved['until'] < time.monotonic():
+                raise ValueError('上传备份已过期，请重新选择导入并上传文件。')
+            recovery = self.store.import_backup(uid,saved['content'],self.publisher.bot_id)
+            # Every old draft/menu/callback refers to the replaced dataset.
+            self.sessions.clear()
+            self.imports.clear()
+            self.triggers.clear()
+            self.publisher.next_chat.clear()
+            self.success(uid,'数据已恢复，导入前数据已保存。所有绑定和发布队列已暂停：请逐个检查频道权限、核对消息位置，再继续发布。')
+            self.admin_panel(uid)
+            try:
+                self.api.document(uid,recovery.name,recovery.read_bytes())
+            except APIError:
+                self.send(uid,'⚠️ 恢复已完成，但原数据备份发送失败；服务器保留位置：'+str(recovery))
+            return
         if kind=='reviewmanage':return self.prompt(uid,'输入车评编号。',('reviewmanage',),'admin')
         if kind=='reviewadmin':
             r=self.store.db.execute('SELECT * FROM reviews WHERE id=?',(int(parts[1]),)).fetchone()
@@ -399,11 +427,11 @@ class Bot:
         self.sessions.pop(uid,None);self.previous_pending=s.get('pending');self.edit_target=msg.get('message_id') or s.get('message')
         try:
             self.action(q['from'],action)
-        except (ValueError,sqlite3.IntegrityError,APIError) as e:
+        except (ValueError,sqlite3.Error,OSError,APIError) as e:
             self.notices.pop(uid, None)
             if uid not in self.sessions:
                 self.sessions[uid] = s
-            detail = self.api_hint(e) if isinstance(e, APIError) else '⚠️ ' + (str(e)[:170] if isinstance(e,ValueError) else '数据冲突，请检查后重试。')
+            detail = self.api_hint(e) if isinstance(e, APIError) else '⚠️ ' + (str(e)[:170] if isinstance(e,ValueError) else '数据写入或备份保存失败，请检查磁盘空间和文件权限；恢复未成功时原数据保留。')
             self.api.call('answerCallbackQuery',callback_query_id=q['id'],text=detail,show_alert=True)
             return
         finally:self.edit_target=None
@@ -423,6 +451,7 @@ class Bot:
         pending = None
         try:
             if text.split(' ',1)[0].split('@')[0] in ('/start','/cancel'):
+                self.imports.pop(uid, None)
                 self.sessions.pop(uid,None);payload=text.partition(' ')[2]
                 if payload.startswith('review_') and payload[7:].isdigit():return self.action(user,'choose:'+payload[7:])
                 if payload.startswith(('edit_','delete_')) and payload.partition('_')[2].isdigit():
@@ -457,6 +486,21 @@ class Bot:
                 self.success(uid, '已为 %s 添加 %s 个留名，未使用前持续有效。' % (self.store.teacher(pending[1])['name'],len([v for v in text.splitlines() if v.strip()])))
                 return self.action(user,'codes:%s'%pending[1])
             self.store.require_admin(uid)
+            if kind=='importfile':
+                document=msg.get('document')
+                if not document:
+                    raise ValueError('请以文件形式上传 JSON 备份，不是粘贴文字或截图。')
+                if not document.get('file_name','').lower().endswith('.json'):
+                    raise ValueError('请上传新版 JSON 备份。旧 SQL 只能在服务器离线恢复后重新导出，机器人不会执行上传 SQL。')
+                content=self.api.download_document(document,MAX_BACKUP_BYTES)
+                data=validate_backup(content,self.publisher.bot_id)
+                self.imports={k:v for k,v in self.imports.items() if v['until']>time.monotonic()}
+                if uid not in self.imports and len(self.imports)>=2:
+                    raise ValueError('已有管理员准备导入，请稍后重试。')
+                self.imports[uid]={'content':content,'until':time.monotonic()+600}
+                tables=data['tables']
+                summary='📥 备份校验通过，尚未导入\n导出时间：%s\n老师：%s · 客户：%s · 车评：%s\n留名：%s · 绑定：%s · superadmin：%s\n\n⚠️ 确认后整体覆盖当前数据，不合并。预览期间的新数据也将被覆盖。\n✅ 恢复前自动保存原数据；保留当前操作者及 .env 管理员。\n⏸ 恢复后绑定及发布全部暂停，须重新检查，防止旧备份重复发帖。' % (date(data['created']),len(tables['teachers']),len(tables['people']),len(tables['reviews']),len(tables['codes']),len(tables['bindings']),len(tables['admins']))
+                return self.panel(uid,summary,[[('确认覆盖并恢复','importconfirm')],[('取消，不改数据','importcancel')]])
             if kind=='addtags':
                 lines=text.splitlines()
                 if len(lines)!=2:raise ValueError('需要两行：备注、标签；不新增填 -。')

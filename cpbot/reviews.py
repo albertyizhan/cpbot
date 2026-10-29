@@ -211,16 +211,3 @@ class ReviewStore:
                     self.ensure_post(bid, t['id'])
             self.log(actor, '绑定 ' + mode, chat['id'])
             return bid
-
-    def export(self):
-        # SQLite backup API includes committed WAL writes; no deployment secrets.
-        target = sqlite3.connect(':memory:')
-        try:
-            self.db.backup(target)
-            target.execute("DELETE FROM settings WHERE key IN ('password','offset')")
-            target.execute('DELETE FROM grants')
-            target.execute('DELETE FROM attempts')
-            target.commit()
-            return ('-- cpbot backup v2 %s\n' % now_text() + '\n'.join(target.iterdump())).encode()
-        finally:
-            target.close()

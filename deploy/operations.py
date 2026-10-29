@@ -19,7 +19,7 @@ from cpbot.__main__ import load_env, admin_ids
 
 # Explicit inventory: upgrades cannot overwrite config, databases or unknown files.
 FILES = ('cpbot/__init__.py', 'cpbot/__main__.py', 'cpbot/api.py', 'cpbot/bot.py',
-         'cpbot/identity.py', 'cpbot/store.py', 'cpbot/reviews.py', 'cpbot/publishing.py', 'deploy/operations.py',
+         'cpbot/identity.py', 'cpbot/store.py', 'cpbot/reviews.py', 'cpbot/publishing.py', 'cpbot/backup.py', 'deploy/operations.py',
          'deploy/cpbot.service', 'manage.sh', '.env.example', '.gitignore', 'README.md')
 
 
