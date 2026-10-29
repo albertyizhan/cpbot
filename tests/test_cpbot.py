@@ -165,6 +165,72 @@ class Tests(unittest.TestCase):
         self.s.observe({'id':51,'username':'target_a'},200,True)
         self.assertEqual(self.s.lookup(user_id=50)['tags'],'标签');self.assertEqual(self.s.lookup(user_id=51)['tags'],'')
         self.assertEqual(len(targets(message(reply_to_message={'from':{'id':60},'date':1}))),1)
+    def test_binding_feedback_all_modes_and_failure_retry(self):
+        # Real entry points, not just store mutations.
+        for mode,cid in (('thread',-10011),('feed',-10033),('lookup',-10044)):
+            if mode=='thread':self.bot.action({'id':1},'unbindyes:%s'%self.bid)
+            self.bot.action({'id':1},'bind:'+mode)
+            self.bot.message(message(uid=1,text=str(cid)))
+            panel=self.api.calls[-1][1]
+            self.assertIn('✅',panel['text']);self.assertIn('绑定成功',panel['text'])
+            self.assertIn(str(cid),panel['text']);self.assertIn('已启用',panel['text'])
+            self.assertIn('待处理',panel['text'])
+        self.bot.action({'id':1},'bind:thread')
+        self.bot.message(message(uid=1,text='-10011'))
+        self.assertIn('⚠️',self.api.calls[-1][1]['text'])
+        self.assertEqual(self.bot.sessions[1]['pending'],('bind','thread'))
+        self.bot.action({'id':1},'bind:feed')
+        original=self.api.call
+        def fail(method,**params):
+            if method=='getChat':raise APIError(403)
+            return original(method,**params)
+        self.api.call=fail
+        self.bot.message(message(uid=1,text='-10055'))
+        self.assertIn('🔒',self.api.calls[-1][1]['text'])
+        self.assertEqual(self.bot.sessions[1]['pending'],('bind','feed'))
+        self.api.call=original
+
+    def test_validation_retains_draft_and_callback_menu(self):
+        self.bot.action({'id':2},'write')
+        nonce=self.bot.sessions[2]['nonce']
+        self.click('提交')
+        self.assertEqual(self.bot.sessions[2]['nonce'],nonce)
+        self.assertIn('还未填写',self.api.calls[-1][1]['text'])
+        self.assertTrue(self.api.calls[-1][1]['show_alert'])
+        self.click('时间')
+        self.bot.message(message(text='yesterday'))
+        self.assertIn('YYYY-MM-DD',self.api.calls[-1][1]['text'])
+        self.assertNotIn('strptime',self.api.calls[-1][1]['text'])
+        self.bot.message(message(text='2026-10-29 14:30'))
+        self.assertIn('时间已保存',self.api.calls[-1][1]['text'])
+        self.assertIn('1/11',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':2},'anon')
+        self.assertIn('✅ 实名',str(self.api.calls[-1]))
+
+    def test_mutation_feedback_and_operational_states(self):
+        self.bot.action({'id':1},'teachernew')
+        self.bot.message(message(uid=1,text='新增老师\n-'))
+        self.assertIn('已保存',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1},'codefor:1')
+        self.bot.message(message(uid=1,text='first\nsecond'))
+        self.assertIn('添加 2 个留名',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1},'adminadd')
+        self.bot.message(message(uid=1,text='3'))
+        self.assertIn('已加入名单',self.api.calls[-1][1]['text'])
+        rid,_=self.submit(code='not-found')
+        self.bot.action({'id':1},'moderate:%s'%rid)
+        self.click('通过',uid=1)
+        self.assertIn('已通过',str(self.api.calls[-2]));self.assertIn('已通过',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1},'pausejobs')
+        self.assertIn('⏸ 已暂停',self.api.calls[-1][1]['text'])
+        self.bot.home(2);self.assertIn('发布队列已暂停',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1},'bindings')
+        self.click('老师专帖 · 专帖',uid=1)
+        self.assertIn('待处理',self.api.calls[-2][1]['text'])
+        self.assertIn('全局发布已暂停',self.api.calls[-2][1]['text'])
+        self.bot.action({'id':1},'jobs:0')
+        self.assertNotIn('pending=',self.api.calls[-1][1]['text'])
+
     def test_env_admin_additions_and_revocation_semantics(self):
         self.assertEqual(admin_ids({'SUPERADMIN_ID':'1','SUPERADMIN_IDS':'2, 3 2，4'}),[1,2,3,4])
         for value in ('', '0', '-1', 'abc', '1,,bad', str(2**63)):

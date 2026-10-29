@@ -22,12 +22,16 @@ class Bot:
         self.sessions, self.triggers = {}, {}
         self.publisher = Publisher(store, api, username, bot_id)
         self.edit_target = None
+        self.notices = {}
 
     def send(self, chat, text, rows=None, **extra):
         return self.api.call('sendMessage', chat_id=chat, text=text,
                              reply_markup={'inline_keyboard': rows or []}, **extra)
 
     def panel(self, uid, text, rows, pending=None, urls=None, **extra):
+        notice = self.notices.pop(uid, None)
+        if notice:
+            text = (html.escape(notice) if extra.get('parse_mode') == 'HTML' else notice) + "\n\n" + text
         nonce = secrets.token_hex(5)
         keyboard = [[{'text': label, 'callback_data': nonce + '|' + action} for label, action in row] for row in rows]
         keyboard += urls or []
@@ -50,19 +54,51 @@ class Bot:
         session['message'] = result['message_id']
         return result
 
+    def success(self, uid, text):
+        self.notices[uid] = '✅ ' + text
+
+    def paused(self):
+        row = self.store.db.execute("SELECT value FROM settings WHERE key='publishing_paused'").fetchone()
+        return bool(row and row[0] == '1')
+
+    def api_hint(self, error):
+        if error.code == 429:
+            return '⏳ Telegram 请求限流，请 %s 秒后重试。' % max(1, error.retry_after)
+        if error.code == 403:
+            return '🔒 无法访问目标，请检查机器人管理员权限和群/频道是否仍可访问。'
+        if error.code == 400:
+            return '⚠️ Telegram 未接受请求，请检查目标 ID、关联讨论组及消息是否有效。'
+        return '⚠️ Telegram 请求结果暂不明确。若刚提交了操作，请先查看当前记录，确认后再重试。'
+
+    def input_error(self, pending, error):
+        if isinstance(error, sqlite3.IntegrityError):
+            return '数据冲突，可能身份已绑定或内容重复。请检查后重新输入。'
+        kind = pending[0] if pending else ''
+        if kind == 'field' and pending[1] == '时间':
+            return '时间格式应为 YYYY-MM-DD HH:MM，例如 2026-10-29 14:30。请重新输入。'
+        if kind == 'reviewedit' and isinstance(error, json.JSONDecodeError):
+            return 'JSON 格式不正确，请按示例重新输入，字段名和文字使用英文双引号。'
+        if kind in ('teacher','adminadd','setroot','reviewmanage','jobdone') and (
+                isinstance(error, TypeError) or 'invalid literal' in str(error) or 'unpack' in str(error)):
+            return '输入格式不正确，请按上方提示填写数字 ID 和所需行数，再发送一次。'
+        return str(error)[:180] or '输入无效，请按上方提示重新填写。'
+
     def home(self, uid):
         rows = []
         if self.store.ready():
             rows = [[('🌷 写车评', 'write'), ('🔎 找老师', 'findteacher')],
                     [('👤 查学生', 'search'), ('📋 我的车评', 'mine:0')]]
             if self.store.db.execute('SELECT 1 FROM teachers WHERE user_id=?', (uid,)).fetchone():
-                rows += [[('添加留名', 'mycodes')]]
+                rows += [[('🔑 添加留名', 'mycodes')]]
         if self.store.admin(uid):
             rows += [[('⚙️ 管理后台', 'admin')]]
-        return self.panel(uid, '请选择功能。' if self.store.ready() else '机器人尚未配置完成，请联系管理员绑定老师专帖频道。', rows)
+        text = '🏠 车评主菜单\n🟢 当前可查询、填写车评。' if self.store.ready() else '⚠️ 机器人尚未配置完成或专帖绑定已失效。\n普通业务暂不可用，请联系管理员检查老师专帖频道。'
+        if self.paused():
+            text += '\n⏸ 发布队列已暂停，已提交的车评会等待管理员恢复发布。'
+        return self.panel(uid, text, rows)
 
     def prompt(self, uid, text, pending, back='home'):
-        return self.panel(uid, text, [[('取消 / 返回', back)]], pending)
+        return self.panel(uid, text + '\n\n✉️ 请直接发送内容，或点击下方取消。', [[('取消 / 返回', back)]], pending)
 
     def show_person(self, uid, pid, intent=None, notice=''):
         p = self.store.person(pid)
@@ -79,7 +115,10 @@ class Bot:
         if not token:
             token = secrets.token_hex(12)
             self.store.save_draft(uid, d, token)
-        lines = ['车评草稿 · 点击字段填写，提交前可修改']
+        filled = sum(bool(str(d.get(f, '')).strip()) for f in FIELDS)
+        lines = ['📝 车评草稿 · 已填写 %s/%s 项' % (filled, len(FIELDS)),
+                 '点击字段逐项填写，提交前可修改。草稿已保存。',
+                 '🔒 匿名发布：隐藏身份及留名原文。' if d.get('匿名', True) else '👤 实名发布：公开 Telegram ID、身份链接及已有用户名。']
         rows = []
         for field in FIELDS:
             value = d.get(field)
@@ -87,8 +126,8 @@ class Bot:
                 value = self.store.teacher(int(value))['name']
             lines.append('【%s】：%s' % (field, str(value) if value is not None else '未填写'))
         for i in range(0, len(FIELDS), 2):
-            rows.append([(f + (' ✓' if d.get(f) is not None else ''), 'field:' + f) for f in FIELDS[i:i+2]])
-        rows += [[('✅ 匿名' if d.get('匿名', True) else '实名', 'anon'), ('预览', 'preview')],
+            rows.append([(f + (' ✅' if d.get(f) is not None else ''), 'field:' + f) for f in FIELDS[i:i+2]])
+        rows += [[('✅ 匿名' if d.get('匿名', True) else '✅ 实名', 'anon'), ('预览', 'preview')],
                  [('提交', 'submit'), ('返回主菜单', 'home')]]
         return self.panel(uid, '\n'.join(lines), rows)
 
@@ -101,16 +140,17 @@ class Bot:
             rows.append([('下一页', 'teacherspage:%s:%s' % (intent, page+1))])
         if page:
             rows.append([('上一页', 'teacherspage:%s:%s' % (intent, page-1))])
-        return self.panel(uid, '选择老师' + ('' if teachers else '\n没有匹配的老师。'), rows + [[('返回主菜单','home')]], ('teacherlist',intent,search))
+        return self.panel(uid, '👩‍🏫 选择老师 · 第 %s 页' % (page+1) + ('\n点击下方老师继续。' if teachers else '\n📭 没有匹配的老师，可返回后换个关键词。'), rows + [[('返回主菜单','home')]], ('teacherlist',intent,search))
 
     def admin_panel(self, uid):
         self.store.require_admin(uid)
-        return self.panel(uid, '管理后台', [
-            [('老师列表', 'teachersadmin'), ('添加老师', 'teachernew')],
-            [('留名管理', 'codesadmin'), ('待审核', 'queue:0')],
-            [('频道 / 群绑定', 'bindings'), ('superadmin 名单', 'admins')],
-            [('发布任务', 'jobs:0'), ('车评处理', 'reviewmanage')],
-            [('导出数据备份', 'export'), ('返回主菜单', 'home')]])
+        counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers), (SELECT count(*) FROM bindings WHERE mode='thread' AND active=1), (SELECT count(*) FROM reviews WHERE status='pending' AND expires>?)", (time.time(),)).fetchone()
+        return self.panel(uid, '⚙️ 管理后台\n👩‍🏫 老师 %s 位 · 📣 可用专帖频道 %s 个\n🕓 待审核 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), [
+            [('👩‍🏫 老师列表', 'teachersadmin'), ('➕ 添加老师', 'teachernew')],
+            [('🔑 留名管理', 'codesadmin'), ('🕓 待审核', 'queue:0')],
+            [('📣 频道 / 群绑定', 'bindings'), ('👑 superadmin 名单', 'admins')],
+            [('📤 发布任务', 'jobs:0'), ('🛠 车评处理', 'reviewmanage')],
+            [('💾 导出数据备份', 'export'), ('返回主菜单', 'home')]])
 
     def action(self, user, action):
         uid = user['id']
@@ -135,9 +175,9 @@ class Bot:
             if field == '老师':
                 return self.teachers(uid)
             if field in SCORES:
-                return self.panel(uid, '选择%s分数（满分 10 分）' % field,
+                return self.panel(uid, '🔢 选择%s分数（满分 10 分）' % field,
                     [[(str(n), 'score:%s:%s' % (field,n)) for n in range(start,start+5)] for start in (1,6)] + [[('返回草稿','write')]])
-            return self.prompt(uid, '请输入%s。%s' % (field, '格式 YYYY-MM-DD HH:MM；不核对预约日期。' if field=='时间' else ''), ('field',field), 'write')
+            return self.prompt(uid, '✍️ 请输入%s。%s' % (field, '格式 YYYY-MM-DD HH:MM；不核对预约日期。' if field=='时间' else ''), ('field',field), 'write')
         if kind in ('choose','score','anon'):
             d, token = self.store.draft(uid)
             if not token:
@@ -154,14 +194,18 @@ class Bot:
             return self.draft_panel(uid)
         if kind=='preview':
             d, token=self.store.draft(uid)
-            if not d.get('老师'):
-                raise ValueError('请先选择老师。')
+            missing = [f for f in FIELDS if not str(d.get(f, '')).strip()]
+            if missing:
+                raise ValueError('请先填写：' + '、'.join(missing))
             row={'data':json.dumps(d),'teacher':d['老师'],'manual':0,'anonymous':d.get('匿名',True),'identity':json.dumps(user),'author':uid,'id':'预览'}
             return self.panel(uid,render_review(self.store,row),[[('返回修改','write'),('确认提交','submit')]],parse_mode='HTML')
         if kind=='submit':
-            _,token=self.store.draft(uid)
+            draft,token=self.store.draft(uid)
+            missing = [f for f in FIELDS if not str(draft.get(f, '')).strip()]
+            if missing:
+                raise ValueError('还未填写：'+'、'.join(missing)+'。请点击对应字段补齐。')
             rid,status=self.store.submit(user,token)
-            return self.panel(uid,'车评 #%s：%s' % (rid,'核验通过，正在排队发布。' if status=='accepted' else '留名未通过，已进入审核。审核区保留 72 小时。'),[[('返回主菜单','home')]])
+            return self.panel(uid,'📝 车评 #%s\n%s' % (rid,('✅ 核验通过。⏸ 发布已暂停，恢复后自动发布。' if self.paused() else '✅ 核验通过，正在限速排队发布。发布后可在「我的车评」查看链接。') if status=='accepted' else '🕓 留名未通过，已进入人工审核；审核区保留 72 小时。请等待管理员处理，不必重复提交。'),[[('返回主菜单','home')]])
         if kind=='findteacher':
             return self.prompt(uid,'输入老师名称，或发送“全部”浏览。',('findteacher',))
         if kind=='teacherspage':
@@ -173,17 +217,19 @@ class Bot:
                 urls.append([{'text':p['title'],'url':link(p['chat_id'],p['message'])}])
             return self.panel(uid,t['name']+(' · 选择评价主帖' if urls else ' · 主帖正在准备中。'),[[('给这位老师写评价','choose:%s'%t['id']),('返回主菜单','home')]],urls=urls)
         if kind=='mine':
-            page=max(0,int(parts[1])); rows=[]; text='我的车评 · 第 %s 页'%(page+1); urls=[]
-            reviews=self.store.db.execute("SELECT * FROM reviews WHERE author=? AND status IN ('accepted','withdrawn') ORDER BY id DESC LIMIT 9 OFFSET ?",(uid,page*8)).fetchall()
+            page=max(0,int(parts[1])); rows=[]; text='📋 我的车评 · 第 %s 页'%(page+1); urls=[]
+            reviews=self.store.db.execute("SELECT * FROM reviews WHERE author=? AND status IN ('accepted','withdrawn','pending','rejected') ORDER BY id DESC LIMIT 9 OFFSET ?",(uid,page*8)).fetchall()
             for r in reviews[:8]:
                 pub=self.store.db.execute('''SELECT p.* FROM publications p JOIN bindings b ON b.id=p.binding
                     LEFT JOIN posts t ON t.binding=p.binding AND t.teacher=? WHERE p.review=? AND b.active=1
                     AND (b.mode='feed' OR p.generation=t.generation) ORDER BY CASE b.mode WHEN 'thread' THEN 0 ELSE 1 END,b.id LIMIT 1''',(r['teacher'],r['id'])).fetchone()
                 label='#%s %s · %s'%(r['id'],self.store.teacher(r['teacher'])['name'],json.loads(r['data'])['时间'])
-                if r['status']=='withdrawn': text+='\n'+label+' · 已撤下'
+                if r['status'] in ('pending','rejected'):
+                    text+='\n'+label+(' · 🕓 待审核' if r['status']=='pending' else ' · ❌ 未通过审核')
+                elif r['status']=='withdrawn': text+='\n'+label+' · 已撤下'
                 elif pub: urls.append([{'text':label,'url':link(pub['chat_id'],pub['message'])}])
                 else: text+='\n'+label+' · 待发布 / 请联系管理员核对任务'
-            if not reviews: text+='\n暂无已通过车评。'
+            if not reviews: text+='\n📭 暂无车评。可返回主菜单选择「写车评」。'
             if page: rows.append([('上一页','mine:%s'%(page-1))])
             if len(reviews)>8: rows.append([('下一页','mine:%s'%(page+1))])
             return self.panel(uid,text,rows+[[('返回主菜单','home')]],urls=urls)
@@ -195,6 +241,7 @@ class Bot:
             if kind=='askdelete': return self.show_person(uid,p['id'],'delete')
             if kind=='edit': return self.prompt(uid,'发送两行：新增备注、追加标签。某行不新增请填 -。',('addtags',p['id'],p['version']),'person:%s'%p['id'])
             self.store.save(p['id'],int(parts[2]),user,p['note'],'','删除标签')
+            self.success(uid, '标签已清空，备注和身份资料保留。')
             return self.show_person(uid,p['id'])
         if kind=='history': return self.history(uid,int(parts[1]),max(0,int(parts[2])))
         if kind=='entry':
@@ -213,24 +260,42 @@ class Bot:
             tid=int(parts[1]); t=self.store.teacher(tid)
             if not self.store.admin(uid) and t['user_id']!=uid: raise ValueError('只能操作自己的留名。')
             count=self.store.db.execute("SELECT count(*) FROM codes WHERE teacher=? AND state='open'",(tid,)).fetchone()[0]
-            return self.prompt(uid,'%s · 未使用留名 %s 个\n发送留名，每行一个；未使用的同名留名不能重复。'%(t['name'],count),('codes',tid),'admin' if self.store.admin(uid) else 'home')
+            return self.prompt(uid,'🔑 %s · 未使用留名 %s 个\n发送留名，每行一个；未使用的同名留名不能重复。'%(t['name'],count),('codes',tid),'admin' if self.store.admin(uid) else 'home')
         if kind=='admins':
             rows=[[('移除 %s'%r[0],'adminremove:%s'%r[0])] for r in self.store.db.execute('SELECT user_id FROM admins ORDER BY user_id')]
-            return self.panel(uid,'superadmin 名单',rows+[[('添加','adminadd'),('返回','admin')]])
+            return self.panel(uid,'👑 superadmin 名单\n下列账号拥有同等管理权限。添加后立即生效。',rows+[[('添加','adminadd'),('返回','admin')]])
         if kind=='adminadd': return self.prompt(uid,'发送要添加的 Telegram 数字 ID。',('adminadd',),'admins')
         if kind=='adminremove':
-            return self.panel(uid,'确认移除 %s？'%parts[1],[[('确认移除','removeadmin:%s'%parts[1])],[('取消','admins')]])
+            return self.panel(uid,'⚠️ 确认移除 %s？\n该账号将失去后台权限。若 .env 仍包含此 ID，重启后会重新加入。'%parts[1],[[('确认移除','removeadmin:%s'%parts[1])],[('取消','admins')]])
         if kind=='removeadmin':
-            self.store.set_admin(uid,int(parts[1]),False);return self.home(uid)
+            self.store.set_admin(uid,int(parts[1]),False)
+            self.success(uid, '已移除管理员 %s。如该 ID 仍在 .env 中，重启后会重新添加。' % parts[1])
+            return self.home(uid)
         if kind=='bindings':
             rows=[[('%s · %s%s'%(MODES[b['mode']],b['title'],'（暂停）' if not b['active'] else ''),'binding:%s'%b['id'])] for b in self.store.db.execute('SELECT * FROM bindings')]
             rows += [[('添加'+name,'bind:'+mode)] for mode,name in MODES.items()]
-            return self.panel(uid,'模式绑定 · 频道与群不可重复占用',rows+[[('返回','admin')]])
+            return self.panel(uid,'📣 模式绑定\n✅ 已启用 %s 个 · ⏸ 已暂停 %s 个\n频道和群不可重复占用。选择绑定可查看状态、同步进度。' % (self.store.db.execute('SELECT count(*) FROM bindings WHERE active=1').fetchone()[0], self.store.db.execute('SELECT count(*) FROM bindings WHERE active=0').fetchone()[0]),rows+[[('返回','admin')]])
         if kind=='bind': return self.prompt(uid,'发送目标频道/群的数字 ID 或 @用户名。先把机器人设为管理员；专帖频道必须关联讨论组。',('bind',parts[1]),'bindings')
         if kind=='binding':
             b=self.store.db.execute('SELECT * FROM bindings WHERE id=?',(int(parts[1]),)).fetchone()
             if not b: raise ValueError('绑定不存在。')
-            return self.panel(uid,'%s · %s\n频道/群：%s\n讨论组：%s\n%s'%(MODES[b['mode']],b['title'],b['chat_id'],b['discussion'] or '无',b['error'] or '已启用'),[[('重新检查权限 / 恢复','recheck:'+parts[1]),('解除绑定','unbind:'+parts[1])], [('登记讨论串根消息','setroot:'+parts[1])],[('返回','bindings')]])
+            counts = dict(self.store.db.execute('SELECT state,count(*) FROM jobs WHERE binding=? GROUP BY state',(b['id'],)).fetchall())
+            status = '🟢 已启用' if b['active'] else '⏸ 已暂停'
+            progress = '📤 待处理 %s · 完成 %s · 需处理 %s' % (counts.get('pending',0), counts.get('done',0), counts.get('blocked',0)+counts.get('uncertain',0))
+            detail = '\n'.join(('%s · %s' % (MODES[b['mode']], b['title']), status,
+                '频道/群：%s' % b['chat_id'], '讨论组：%s' % (b['discussion'] or '不需要'), progress))
+            if self.paused() and b['mode'] != 'lookup':
+                detail += '\n⏸ 全局发布已暂停，请到发布任务中继续。'
+            waiting = self.store.db.execute('SELECT count(*) FROM posts WHERE binding=? AND message IS NOT NULL AND root IS NULL',(b['id'],)).fetchone()[0]
+            if waiting:
+                detail += '\n⏳ %s 位老师正在等待讨论串关联。长时间不变请检查讨论组权限或登记根消息。' % waiting
+            if b['error']:
+                detail += '\n⚠️ ' + b['error']
+            if b['mode']=='thread' and not self.store.db.execute('SELECT 1 FROM teachers').fetchone():
+                detail += '\nℹ️ 暂无老师，添加老师后才会创建主帖。'
+            rows = [[('重新检查权限 / 恢复','recheck:'+parts[1]),('解除绑定','unbind:'+parts[1])]]
+            if b['mode']=='thread': rows.append([('登记讨论串根消息','setroot:'+parts[1])])
+            return self.panel(uid,detail,rows+[[('返回','bindings')]])
         if kind=='setroot':
             return self.prompt(uid,'自动转发事件未收到时，可手动补充。发送两行：老师编号、讨论组中该主帖自动转发消息的 message_id。',('setroot',int(parts[1])),'bindings')
         if kind=='recheck':
@@ -240,6 +305,7 @@ class Bot:
             if discussion!=b['discussion']: raise ValueError('讨论组已变更，请解除旧绑定后重新绑定。')
             self.store.db.execute("UPDATE bindings SET active=1,error='' WHERE id=?",(b['id'],))
             self.store.db.execute("UPDATE jobs SET state='pending' WHERE binding=? AND state='blocked'",(b['id'],))
+            self.success(uid, '权限及关联检查通过，绑定已恢复；受阻任务已重新排队。')
             return self.action(user,'binding:'+parts[1])
         if kind=='unbind': return self.panel(uid,'解除绑定会停止后续发布，已发出的消息保留。最后一个专帖绑定解除后业务停止。',[[('确认解除','unbindyes:'+parts[1])],[('取消','bindings')]])
         if kind=='unbindyes':
@@ -249,49 +315,59 @@ class Bot:
                 self.store.db.execute('DELETE FROM jobs WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM posts WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM bindings WHERE id=?',(bid,));self.store.log(uid,'解除绑定',bid)
+            self.success(uid, '绑定已解除，后续不再向此目标发布；远端消息保留。')
             return self.action(user,'bindings')
         if kind=='queue':
             page=max(0,int(parts[1])); records=self.store.db.execute("SELECT * FROM reviews WHERE status='pending' AND expires>? ORDER BY id LIMIT 9 OFFSET ?",(time.time(),page*8)).fetchall()
             rows=[[('#%s · %s'%(r['id'],self.store.teacher(r['teacher'])['name']),'moderate:%s'%r['id'])] for r in records[:8]]
             if len(records)>8:rows.append([('下一页','queue:%s'%(page+1))])
             if page:rows.append([('上一页','queue:%s'%(page-1))])
-            return self.panel(uid,'待审核 · 保留 72 小时',rows+[[('返回','admin')]])
+            return self.panel(uid,'🕓 待审核 · 第 %s 页\n记录进入审核区后保留 72 小时。%s' % (page+1, '\n📭 当前没有待审核车评。' if not records else ''),rows+[[('返回','admin')]])
         if kind=='moderate':
             r=self.store.db.execute("SELECT * FROM reviews WHERE id=? AND status='pending' AND expires>?",(int(parts[1]),time.time())).fetchone()
             if not r:raise ValueError('记录已过期或处理。')
             return self.panel(uid,render_review(self.store,r)+'\n\n后台留名：'+html.escape(json.loads(r['data'])['留名'])+'\n作者 ID：'+str(r['author']),[[('通过','approve:'+parts[1]),('不通过','reject:'+parts[1])],[('返回','queue:0')]],parse_mode='HTML')
         if kind in ('approve','reject'):
-            self.store.moderate(uid,int(parts[1]),kind=='approve');return self.action(user,'queue:0')
+            self.store.moderate(uid,int(parts[1]),kind=='approve')
+            self.success(uid, '车评 #%s %s' % (parts[1], '已通过，正在排队发布。' if kind=='approve' else '已拒绝，不会公开；记录到期清理。'))
+            return self.action(user,'queue:0')
         if kind=='export':
             self.api.document(uid,'cpbot-%s.sql'%datetime.now(TZ).strftime('%Y%m%d-%H%M%S'),self.store.export())
+            self.success(uid, '备份文件已发送到本私聊，请下载并妥善保存。')
             return self.admin_panel(uid)
         if kind=='reviewmanage':return self.prompt(uid,'输入车评编号。',('reviewmanage',),'admin')
         if kind=='reviewadmin':
             r=self.store.db.execute('SELECT * FROM reviews WHERE id=?',(int(parts[1]),)).fetchone()
             if not r:raise ValueError('车评不存在。')
-            return self.panel(uid,render_review(self.store,r)+'\n状态：'+r['status'],[[('修改字段','reviewedit:'+parts[1]),('撤下','withdraw:'+parts[1])],[('返回','admin')]],parse_mode='HTML')
+            return self.panel(uid,render_review(self.store,r)+'\n状态：'+{'accepted':'✅ 已通过','pending':'🕓 待审核','rejected':'❌ 已拒绝','withdrawn':'🚫 已撤下'}.get(r['status'],r['status']),[[('修改字段','reviewedit:'+parts[1]),('撤下','withdraw:'+parts[1])],[('返回','admin')]],parse_mode='HTML')
         if kind=='reviewedit':return self.prompt(uid,'发送 JSON 对象，例如 {"综合":8,"过程":"更正后的内容"}。仅可修改时间、人照、评分、过程；不会重新消耗留名。',('reviewedit',int(parts[1])),'reviewadmin:'+parts[1])
         if kind=='withdraw':return self.panel(uid,'确认撤下？将停止计分，各已发布消息改为撤下提示。',[[('确认撤下','withdrawyes:'+parts[1])],[('取消','reviewadmin:'+parts[1])]])
         if kind=='withdrawyes':
             self.change_review(uid,int(parts[1]),None)
+            self.success(uid, '车评已撤下、不再计分，公开消息正在排队更新。')
             return self.action(user,'reviewadmin:'+parts[1])
         if kind in ('pausejobs','resumejobs'):
             self.store.db.execute("INSERT OR REPLACE INTO settings VALUES('publishing_paused',?)",('1' if kind=='pausejobs' else '0',))
             self.store.log(uid,'暂停发布' if kind=='pausejobs' else '继续发布','')
+            self.success(uid, '发布队列已暂停，已提交内容保留，审核区仍会到期清理。' if kind=='pausejobs' else '发布队列已继续，将按限速处理待办任务。')
             return self.action(user,'jobs:0')
         if kind=='jobs':
             page=max(0,int(parts[1])); rows=self.store.db.execute("SELECT * FROM jobs WHERE state IN ('uncertain','blocked') ORDER BY id LIMIT 9 OFFSET ?",(page*8,)).fetchall()
-            counts=', '.join('%s=%s'%(r[0],r[1]) for r in self.store.db.execute('SELECT state,count(*) FROM jobs GROUP BY state'))
-            buttons=[[('#%s %s · %s'%(r['id'],r['state'],r['error'][:20]),'job:%s'%r['id'])] for r in rows[:8]]
+            states={'pending':'⏳ 待处理','sending':'📤 请求中','done':'✅ 完成','blocked':'⚠️ 受阻','uncertain':'❓ 待核对','superseded':'已替代'}
+            counts='\n'.join('%s：%s'%(states.get(r[0],r[0]),r[1]) for r in self.store.db.execute('SELECT state,count(*) FROM jobs GROUP BY state'))
+            buttons=[[('#%s %s · %s'%(r['id'],states.get(r['state'],r['state']),r['error'][:20]),'job:%s'%r['id'])] for r in rows[:8]]
             if len(rows)>8:buttons.append([('下一页','jobs:%s'%(page+1))])
             if page:buttons.append([('上一页','jobs:%s'%(page-1))])
-            return self.panel(uid,'发布任务\n'+counts,buttons+[[('暂停任务','pausejobs'),('继续任务','resumejobs')],[('返回','admin')]])
+            return self.panel(uid,'📤 发布任务 · '+('⏸ 已暂停' if self.paused() else '▶️ 运行中')+'\n'+(counts or '📭 暂无发布任务。'),buttons+[[('暂停任务','pausejobs'),('继续任务','resumejobs')],[('返回','admin')]])
         if kind=='job':
             j=self.store.db.execute('SELECT * FROM jobs WHERE id=?',(int(parts[1]),)).fetchone()
             if not j:raise ValueError('任务不存在。')
-            return self.panel(uid,'任务 #%s · %s\n%s\n结果不明时请先核对目标：若已发送，登记远端消息 ID；若确认未发送，才重试。'%(j['id'],j['kind'],j['error']),[[('确认未发送，重试','retry:'+parts[1]),('已发送，登记消息 ID','jobdone:'+parts[1])],[('返回','jobs:0')]])
+            kinds={'post':'创建老师主帖','comment':'发布评价评论','feed':'频道直发','summary':'更新总评价','checkpost':'巡检主帖','check':'巡检评价','health':'检查权限'}
+            return self.panel(uid,'📤 任务 #%s · %s\n%s\n结果不明时请先核对目标：若已发送，登记远端消息 ID；若确认未发送，才重试。'%(j['id'],kinds.get(j['kind'],j['kind']),j['error']),[[('确认未发送，重试','retry:'+parts[1]),('已发送，登记消息 ID','jobdone:'+parts[1])],[('返回','jobs:0')]])
         if kind=='retry':
-            self.store.db.execute("UPDATE jobs SET state='pending',due=0 WHERE id=? AND state IN ('blocked','uncertain')",(int(parts[1]),));self.store.log(uid,'人工重试任务',parts[1]);return self.action(user,'jobs:0')
+            self.store.db.execute("UPDATE jobs SET state='pending',due=0 WHERE id=? AND state IN ('blocked','uncertain')",(int(parts[1]),));self.store.log(uid,'人工重试任务',parts[1])
+            self.success(uid, '任务已重新排队，将按限速处理。')
+            return self.action(user,'jobs:0')
         if kind=='jobdone':return self.prompt(uid,'发送目标中已发出消息的数字 message_id。',('jobdone',int(parts[1])),'jobs:0')
         raise ValueError('未知操作，请返回主菜单。')
 
@@ -319,15 +395,20 @@ class Bot:
     def callback(self, q):
         uid=q['from']['id'];msg=q.get('message',{});nonce,_,action=q.get('data','').partition('|');s=self.sessions.get(uid)
         if msg.get('chat',{}).get('type')!='private' or msg['chat']['id']!=uid or not s or nonce!=s['nonce'] or s['until']<time.monotonic():
-            return self.api.call('answerCallbackQuery',callback_query_id=q['id'],text='菜单已过期，请发送 /start。',show_alert=True)
+            return self.api.call('answerCallbackQuery',callback_query_id=q['id'],text='⌛ 菜单已过期或已使用，请发送 /start 重新打开。草稿仍保留。',show_alert=True)
         self.sessions.pop(uid,None);self.previous_pending=s.get('pending');self.edit_target=msg.get('message_id') or s.get('message')
         try:
             self.action(q['from'],action)
-        except (ValueError,sqlite3.IntegrityError) as e:
-            self.api.call('answerCallbackQuery',callback_query_id=q['id'],text=str(e)[:180] if isinstance(e,ValueError) else '数据冲突，请重新检查。',show_alert=True)
-            self.home(uid);return
+        except (ValueError,sqlite3.IntegrityError,APIError) as e:
+            self.notices.pop(uid, None)
+            if uid not in self.sessions:
+                self.sessions[uid] = s
+            detail = self.api_hint(e) if isinstance(e, APIError) else '⚠️ ' + (str(e)[:170] if isinstance(e,ValueError) else '数据冲突，请检查后重试。')
+            self.api.call('answerCallbackQuery',callback_query_id=q['id'],text=detail,show_alert=True)
+            return
         finally:self.edit_target=None
-        self.api.call('answerCallbackQuery',callback_query_id=q['id'])
+        feedback={'score':'✅ 分数已保存','choose':'✅ 已选择老师','anon':'✅ 发布身份已切换','pausejobs':'⏸ 队列已暂停','resumejobs':'▶️ 队列已继续','recheck':'✅ 检查通过','approve':'✅ 已通过，排队发布','reject':'✅ 已拒绝','retry':'✅ 已重新排队','delete':'✅ 标签已清空','withdrawyes':'✅ 已撤下','removeadmin':'✅ 名单已更新','unbindyes':'✅ 已解除绑定','export':'✅ 备份文件已发送'}
+        self.api.call('answerCallbackQuery',callback_query_id=q['id'],text=feedback.get(action.split(':')[0],''))
 
     def message(self, msg, edited=False):
         if self.publisher.automatic_forward(msg):return
@@ -339,6 +420,7 @@ class Bot:
                 if uid and not edited and not user.get('is_bot'):self.query(msg)
             return
         if chat['type']!='private' or not uid or edited:return
+        pending = None
         try:
             if text.split(' ',1)[0].split('@')[0] in ('/start','/cancel'):
                 self.sessions.pop(uid,None);payload=text.partition(' ')[2]
@@ -349,7 +431,9 @@ class Bot:
             if not self.store.ready() and not self.store.admin(uid):return self.home(uid)
             session=self.sessions.get(uid);pending=session.get('pending') if session else None
             if session and session['until']<time.monotonic():
-                self.sessions.pop(uid,None);return self.home(uid)
+                self.sessions.pop(uid,None)
+                self.notices[uid] = '⌛ 上次输入已过期，请重新选择操作。草稿仍保留。'
+                return self.home(uid)
             if not pending:
                 if targets(msg) or text.isdigit():
                     if text.isdigit():return self.show_person(uid,self.store.track(text)['id'])
@@ -361,37 +445,61 @@ class Bot:
                 limits={'过程':1600,'人照':200,'留名':80,'时间':16}
                 if len(text)>limits[pending[1]]:raise ValueError('内容超过长度限制。')
                 if pending[1]=='时间':datetime.strptime(text,'%Y-%m-%d %H:%M')
-                d,token=self.store.draft(uid);d[pending[1]]=text;self.store.save_draft(uid,d,token or secrets.token_hex(12));return self.draft_panel(uid)
+                d,token=self.store.draft(uid);d[pending[1]]=text;self.store.save_draft(uid,d,token or secrets.token_hex(12))
+                self.success(uid, '%s已保存，可继续填写其他字段。' % pending[1])
+                return self.draft_panel(uid)
             if kind=='findteacher':return self.teachers(uid,'teacherlink','' if text=='全部' else text)
             if kind=='search':
                 found=targets(msg);p=self.resolve(found[0]) if found else self.store.track(text)
                 return self.show_person(uid,p['id'],notice=self.match_notice(found[0]) if found else '')
             if kind=='codes':
-                self.store.add_codes(uid,pending[1],text.splitlines());return self.action(user,'codes:%s'%pending[1])
+                self.store.add_codes(uid,pending[1],text.splitlines())
+                self.success(uid, '已为 %s 添加 %s 个留名，未使用前持续有效。' % (self.store.teacher(pending[1])['name'],len([v for v in text.splitlines() if v.strip()])))
+                return self.action(user,'codes:%s'%pending[1])
             self.store.require_admin(uid)
             if kind=='addtags':
                 lines=text.splitlines()
                 if len(lines)!=2:raise ValueError('需要两行：备注、标签；不新增填 -。')
                 p=self.store.person(pending[1]);note,tags_=[x.strip() for x in lines]
                 note='\n'.join(filter(None,(p['note'],'' if note=='-' else note)));tags_='、'.join(filter(None,(p['tags'],'' if tags_=='-' else tags_)))
-                self.store.save(p['id'],pending[2],user,note,tags_,'新增标签');return self.show_person(uid,p['id'])
+                self.store.save(p['id'],pending[2],user,note,tags_,'新增标签')
+                self.success(uid, '新增内容已保存，下方显示最新资料。')
+                return self.show_person(uid,p['id'])
             if kind=='teacher':
                 lines=text.splitlines()
                 if len(lines)!=2:raise ValueError('需要两行：名称、数字 ID 或 -。')
-                self.store.save_teacher(uid,lines[0],None if lines[1]=='-' else int(lines[1]),pending[1]);return self.admin_panel(uid)
-            if kind=='adminadd':self.store.set_admin(uid,int(text));return self.action(user,'admins')
+                tid=self.store.save_teacher(uid,lines[0],None if lines[1]=='-' else int(lines[1]),pending[1])
+                self.success(uid, '老师 #%s「%s」已保存；%s' % (tid, lines[0], '未绑定本人账号，由 superadmin 添加留名。' if lines[1]=='-' else '本人账号已绑定，可私聊添加留名。'))
+                return self.admin_panel(uid)
+            if kind=='adminadd':
+                self.store.set_admin(uid,int(text))
+                self.success(uid, 'superadmin %s 已加入名单，发送 /start 即可进入后台。' % int(text))
+                return self.action(user,'admins')
             if kind=='bind':
                 cid=int(text) if text.lstrip('-').isdigit() else text
-                c,d=self.publisher.validate(pending[1],cid);self.store.bind(uid,pending[1],c,d);return self.action(user,'bindings')
+                c,d=self.publisher.validate(pending[1],cid)
+                bid=self.store.bind(uid,pending[1],c,d)
+                effect={'thread':'将限速创建老师主帖，并从旧到新补发历史评价。','feed':'之后的新车评会发布到此频道，不补发历史。','lookup':'此群已允许转发、回复和 @用户名查档。'}[pending[1]]
+                if self.paused() and pending[1] != 'lookup':
+                    effect += '⏸ 发布队列当前暂停，恢复后开始处理。'
+                if pending[1] == 'lookup' and not self.store.ready():
+                    effect = '群配置已保存；仍需先绑定有效的老师专帖频道，查档才会开放。'
+                self.success(uid, '%s绑定成功，权限检查已通过。%s' % (MODES[pending[1]], effect))
+                return self.action(user,'binding:%s' % bid)
             if kind=='setroot':
                 tid,root=map(int,text.splitlines())
                 b=self.store.db.execute("SELECT * FROM bindings WHERE id=? AND mode='thread'",(pending[1],)).fetchone()
                 if not b or root<=0:raise ValueError('无效绑定或消息 ID。')
                 changed=self.store.db.execute('UPDATE posts SET root=? WHERE binding=? AND teacher=? AND message IS NOT NULL',(root,b['id'],tid)).rowcount
                 if not changed:raise ValueError('老师主帖尚未创建。')
-                self.store.log(uid,'登记讨论根消息',text);return self.action(user,'bindings')
+                self.store.log(uid,'登记讨论根消息',text)
+                self.success(uid, '讨论串位置已保存，待发评价将在队列运行时继续发布。')
+                return self.action(user,'binding:%s' % b['id'])
             if kind=='reviewmanage':return self.action(user,'reviewadmin:'+str(int(text)))
-            if kind=='reviewedit':self.change_review(uid,pending[1],json.loads(text));return self.action(user,'reviewadmin:%s'%pending[1])
+            if kind=='reviewedit':
+                self.change_review(uid,pending[1],json.loads(text))
+                self.success(uid, '更正已保存，评分和公开消息正在排队同步。')
+                return self.action(user,'reviewadmin:%s'%pending[1])
             if kind=='jobdone':
                 mid=int(text)
                 if mid<=0:raise ValueError('消息 ID 必须大于 0。')
@@ -403,9 +511,14 @@ class Bot:
                         p=self.store.db.execute('SELECT generation FROM posts WHERE binding=? AND teacher=?',(j['binding'],j['teacher'])).fetchone()
                         self.store.db.execute('INSERT OR REPLACE INTO publications VALUES(?,?,?,?,?)',(j['binding'],j['review'],p[0] if p else 1,mid,j['discussion'] if j['mode']=='thread' else j['chat_id']))
                     self.store.db.execute("UPDATE jobs SET state='done' WHERE id=?",(j['id'],));self.store.log(uid,'登记发送结果',j['id'])
+                self.success(uid, '远端消息位置已登记，任务已完成，不会重复发送。')
                 return self.action(user,'jobs:0')
+        except APIError as error:
+            self.notices.pop(uid, None)
+            self.send(uid,self.api_hint(error))
         except (ValueError,TypeError,sqlite3.IntegrityError) as error:
-            self.send(uid,str(error)[:200] if not isinstance(error,sqlite3.IntegrityError) else '数据冲突，可能身份已绑定或内容重复。')
+            self.notices.pop(uid, None)
+            self.send(uid,'⚠️ '+self.input_error(pending,error))
 
     def handle(self, update):
         if 'callback_query' in update:return self.callback(update['callback_query'])
@@ -419,9 +532,9 @@ class Bot:
             if e['chat'].get('type') == 'channel' and e['new_chat_member']['status'] in ('administrator','creator'):
                 try:
                     self.publisher.validate('thread',cid)
-                    notice='频道检查通过，可在后台选择绑定模式。'
+                    notice='✅ 频道权限和讨论组检查通过。\nℹ️ 当前尚未自动绑定，请在管理后台选择绑定模式。'
                 except (ValueError,APIError):
-                    notice='频道检查未通过，请核对机器人发布/编辑权限、关联讨论组及其管理员权限。'
+                    notice='⚠️ 专帖频道检查未通过。\n请核对发布/编辑权限、关联讨论组及群内管理员权限；直发模式可在后台单独检查。'
                 for admin in self.store.db.execute('SELECT user_id FROM admins'):
                     try:self.send(admin[0],notice+'\n频道 ID：'+str(cid))
                     except APIError:pass
@@ -429,10 +542,10 @@ class Bot:
                 self.store.db.execute("UPDATE bindings SET active=0,error='机器人管理员权限已失效' WHERE chat_id=? OR discussion=?",(cid,cid))
 
     def card(self, p, chat_id=None):
-        text = '\n'.join(('当前名称：' + (p['name'] or '未知'),
+        text = '\n'.join(('👤 当前名称：' + (p['name'] or '未知'),
                           'Telegram ID：' + (str(p['user_id']) if p['user_id'] else '待识别'),
                           '用户名：' + ('@' + p['username'] if p['username'] else '未知 / 未设置'),
-                          '群备注：' + (p['note'] or '无'), '群标签：' + (p['tags'] or '无')))
+                          '📝 群备注：' + (p['note'] or '无'), '🏷 群标签：' + (p['tags'] or '无')))
         memberships = self.store.db.execute('SELECT * FROM memberships WHERE person=?' +
                                             (' AND chat_id=?' if chat_id else '') + ' ORDER BY observed DESC LIMIT 8',
                                             (p['id'], chat_id) if chat_id else (p['id'],)).fetchall()
