@@ -44,12 +44,39 @@ class API:
             raise APIError(result.get('error_code', 0), description=result.get('description', ''))
         return result['result']
 
+    def photo(self, content, **params):
+        """Upload a local proof; also supports replacing withdrawn media."""
+        import secrets
+        method = params.pop('_method', 'sendPhoto')
+        boundary = secrets.token_hex(16)
+        if method == 'editMessageMedia':
+            params['media'] = {'type':'photo','media':'attach://photo',
+                               'caption':params.pop('caption',''),'parse_mode':'HTML'}
+        body = bytearray()
+        for key, value in params.items():
+            value = json.dumps(value) if isinstance(value,(dict,list,bool)) else str(value)
+            body.extend(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary,key,value)).encode())
+        body.extend(('--%s\r\nContent-Disposition: form-data; name="photo"; filename="proof.jpg"\r\nContent-Type: application/octet-stream\r\n\r\n' % boundary).encode())
+        body.extend(content)
+        body.extend(('\r\n--%s--\r\n' % boundary).encode())
+        try:
+            with urlopen(Request(self.base+method,bytes(body),{'Content-Type':'multipart/form-data; boundary='+boundary}),timeout=60) as response:
+                result=json.load(response)
+        except HTTPError as error:
+            try:result=json.load(error)
+            except (ValueError,OSError):raise APIError(error.code) from None
+        except (URLError,OSError,ValueError):
+            raise APIError(0) from None
+        if not result.get('ok'):
+            raise APIError(result.get('error_code',0),result.get('parameters',{}).get('retry_after',0),result.get('description',''))
+        return result['result']
+
     def download_document(self, document, max_bytes):
         """Download only a Telegram file ID to bounded memory; never use supplied URLs."""
         from urllib.parse import quote
         size = document.get('file_size')
         if size is not None and (type(size) is not int or size < 0 or size > max_bytes):
-            raise ValueError('备份不能超过 15 MB。')
+            raise ValueError('文件超过大小限制（%s MB）。' % (max_bytes//1024//1024))
         info = self.call('getFile', file_id=document['file_id'])
         path = info.get('file_path', '')
         if not path or path.startswith('/') or any(part in ('..','.') for part in path.split('/')):
@@ -61,5 +88,5 @@ class API:
         except (HTTPError, URLError, OSError):
             raise APIError(0) from None
         if len(content) > max_bytes:
-            raise ValueError('备份不能超过 15 MB。')
+            raise ValueError('文件超过大小限制（%s MB）。' % (max_bytes//1024//1024))
         return content

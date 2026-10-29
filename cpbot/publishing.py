@@ -12,6 +12,8 @@ def render_review(store, row):
     data = json.loads(row['data'])
     result = []
     for key in FIELDS:
+        if key == '出击证明':
+            continue
         value = data.get(key, '')
         if key == '时间' and value:
             value = review_date(value, legacy=True)
@@ -22,9 +24,7 @@ def render_review(store, row):
         elif key == '留名':
             value = '人工审核通过' if row['manual'] else ('已核验' if row['anonymous'] else value)
         result.append('【%s】：%s' % (key, html.escape(str(value))))
-    if row['anonymous']:
-        result.append('【作者】：匿名')
-    else:
+    if not row['anonymous']:
         identity = json.loads(row['identity'])
         uid = row['author']
         result.append('【作者】：<a href="tg://user?id=%s">%s</a>%s' %
@@ -130,6 +130,8 @@ class Publisher:
                     self.s.enqueue('checkpost', b['id'], t['id'], generation=int(local.strftime('%Y%m%d')))
                     for r in self.s.db.execute("SELECT id FROM reviews WHERE teacher=? AND status='accepted' ORDER BY json_extract(data,'$.时间'),id", (t['id'],)):
                         self.s.enqueue('check', b['id'], t['id'], r['id'], int(local.strftime('%Y%m%d')))
+                        if json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(r['id'],)).fetchone()[0]).get('出击证明'):
+                            self.s.enqueue('proof',b['id'],t['id'],r['id'],int(local.strftime('%Y%m%d')))
             self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('last_check',?)", (day,))
 
     def rebuild(self, bid, tid):
@@ -162,18 +164,18 @@ class Publisher:
         if not job:
             return
         j = dict(job)
-        target = j['discussion'] if j['kind'] in ('comment', 'check') else j['chat_id']
+        target = j['discussion'] if j['mode']=='thread' and j['kind'] in ('comment', 'check', 'proof') else j['chat_id']
         if self.next_chat.get(target, 0) > now:
             self.s.db.execute('UPDATE jobs SET due=? WHERE id=?', (self.next_chat[target], j['id']))
             return
         p = self.s.db.execute('SELECT * FROM posts WHERE binding=? AND teacher=?', (j['binding'], j['teacher'])).fetchone()
-        if j['kind'] in ('comment', 'check') and (not p or not p['root']):
+        if j['mode']=='thread' and j['kind'] in ('comment', 'check', 'proof') and (not p or not p['root']):
             self.s.db.execute("UPDATE jobs SET due=?,error='等待频道自动转发到讨论组' WHERE id=?", (now + 10, j['id']))
             return
         # A comment waits for earlier reviews for this teacher/target to finish.
         if j['kind'] == 'comment':
             earlier = self.s.db.execute('''SELECT 1 FROM jobs x JOIN reviews r ON r.id=x.review JOIN reviews current ON current.id=?
-                WHERE x.binding=? AND x.teacher=? AND x.generation=? AND x.kind='comment'
+                WHERE x.binding=? AND x.teacher=? AND x.generation=? AND x.kind IN ('comment','proof')
                 AND x.state NOT IN ('done','superseded') AND (json_extract(r.data,'$.时间')<json_extract(current.data,'$.时间')
                 OR (json_extract(r.data,'$.时间')=json_extract(current.data,'$.时间') AND r.id<current.id)) LIMIT 1''',
                 (j['review'], j['binding'], j['teacher'], j['generation'])).fetchone()
@@ -185,7 +187,31 @@ class Publisher:
         self.s.db.execute("UPDATE jobs SET state='sending' WHERE id=?", (j['id'],))
         try:
             kind = j['kind']
-            if kind == 'health':
+            if kind == 'proof':
+                r=self.s.db.execute('SELECT * FROM reviews WHERE id=?',(j['review'],)).fetchone()
+                generation=p['generation'] if j['mode']=='thread' else 1
+                pub=self.s.db.execute('SELECT * FROM publications WHERE binding=? AND review=? AND generation=?',(j['binding'],j['review'],generation)).fetchone()
+                if not pub:
+                    self.s.db.execute("UPDATE jobs SET state='pending',due=? WHERE id=?",(now+3,j['id']))
+                    return
+                proof=self.s.db.execute('SELECT * FROM proof_publications WHERE binding=? AND review=? AND generation=?',(j['binding'],j['review'],generation)).fetchone()
+                if r['status']=='accepted':
+                    content=self.s.proof_path(json.loads(r['data'])['出击证明']).read_bytes()
+                    caption='📷 出击证明 · 车评 #%s'%r['id']
+                    if proof:
+                        self.api.call('editMessageCaption',chat_id=target,message_id=proof['message'],caption=caption)
+                    else:
+                        sent=self.api.photo(content,chat_id=target,caption=caption,reply_parameters={'message_id':pub['message'],'allow_sending_without_reply':False})
+                        self.s.db.execute('INSERT INTO proof_publications VALUES(?,?,?,?,?)',(j['binding'],j['review'],generation,sent['message_id'],target))
+                elif proof:
+                    # Replace the public proof with a neutral image when withdrawing.
+                    import struct, zlib
+                    def chunk(kind,content):
+                        return struct.pack('!I',len(content))+kind+content+struct.pack('!I',zlib.crc32(kind+content))
+                    blank=(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!2I5B',320,180,8,2,0,0,0))
+                           +chunk(b'IDAT',zlib.compress((b'\x00'+b'\xe8\xe8\xe8'*320)*180))+chunk(b'IEND',b''))
+                    self.api.photo(blank,_method='editMessageMedia',chat_id=target,message_id=proof['message'],caption='此评价已由管理员撤下。')
+            elif kind == 'health':
                 _, discussion = self.validate(j['mode'], j['chat_id'])
                 if discussion != j['discussion']:
                     raise ValueError('频道讨论组关联已变化，请重新绑定。')
@@ -215,13 +241,15 @@ class Publisher:
             if j['review'] and j['mode'] == 'thread' and j['kind'] == 'comment':
                 # Refresh after successful publishing. One revision key per accepted review.
                 self.s.enqueue('summary', j['binding'], j['teacher'], generation=j['review'] + 1000000)
-        except ValueError as error:
+        except (ValueError,OSError) as error:
             if j['kind'] == 'health':
                 self.s.db.execute('UPDATE bindings SET active=0,error=? WHERE id=?', (str(error), j['binding']))
             self.s.db.execute("UPDATE jobs SET state='blocked',error=? WHERE id=?", (str(error), j['id']))
         except APIError as error:
             description = error.description.lower()
-            if error.code == 429:
+            if 'message is not modified' in description:
+                self.s.db.execute("UPDATE jobs SET state='done',error='' WHERE id=?",(j['id'],))
+            elif error.code == 429:
                 until = now + max(1, error.retry_after)
                 self.next_global = until
                 self.s.db.execute("UPDATE jobs SET state='pending',due=?,error='Telegram 限流' WHERE id=?", (until, j['id']))
@@ -233,6 +261,8 @@ class Publisher:
                     self.rebuild(j['binding'], j['teacher'])
                     self.s.db.execute("UPDATE jobs SET state='superseded' WHERE id=?", (j['id'],))
                 else:
+                    if j['kind']=='proof':
+                        self.s.db.execute('DELETE FROM proof_publications WHERE binding=? AND review=? AND generation=1',(j['binding'],j['review']))
                     self.s.db.execute("UPDATE jobs SET state='blocked',error='原消息已丢失' WHERE id=?", (j['id'],))
             else:
                 self.s.db.execute("UPDATE jobs SET state='blocked',error=? WHERE id=?", (error.description[:200], j['id']))

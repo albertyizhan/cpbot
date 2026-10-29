@@ -6,8 +6,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Asia/Shanghai')
-FIELDS = ('时间', '老师', '留名', '人照', '颜值', '身材', '服务', '态度', '环境', '综合', '过程')
+FIELDS = ('时间', '老师', '出击证明', '人照', '颜值', '身材', '服务', '态度', '环境', '综合', '过程')
 INPUT_FIELDS = tuple(f for f in FIELDS if f != '综合')
+LEGACY_FIELDS = tuple('留名' if f == '出击证明' else f for f in FIELDS)
+
+def valid_proof(value):
+    import re
+    return isinstance(value, str) and re.fullmatch(r'[a-f0-9]{32}\.jpg', value) is not None
 SCORES = ('人照', '颜值', '身材', '服务', '态度', '环境')
 
 def valid_score(value):
@@ -19,7 +24,7 @@ def overall_score(data):
     return sum(data[f] for f in SCORES) / len(SCORES)
 
 def missing_fields(data):
-    return [f for f in INPUT_FIELDS if (not valid_score(data.get(f)) if f in SCORES else not str(data.get(f, '')).strip())]
+    return [f for f in INPUT_FIELDS if (not valid_score(data.get(f)) if f in SCORES else (not valid_proof(data.get(f)) if f == '出击证明' else not str(data.get(f, '')).strip()))]
 
 MODES = {'thread': '老师专帖', 'feed': '车评直发', 'lookup': '内部查档'}
 
@@ -65,6 +70,9 @@ class ReviewStore:
         CREATE TABLE IF NOT EXISTS posts(binding INTEGER NOT NULL REFERENCES bindings(id),teacher INTEGER NOT NULL,
             message INTEGER,root INTEGER,generation INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(binding,teacher));
         CREATE TABLE IF NOT EXISTS publications(binding INTEGER NOT NULL,review INTEGER NOT NULL REFERENCES reviews(id),
+            generation INTEGER NOT NULL,message INTEGER NOT NULL,chat_id INTEGER NOT NULL,
+            PRIMARY KEY(binding,review,generation));
+        CREATE TABLE IF NOT EXISTS proof_publications(binding INTEGER NOT NULL,review INTEGER NOT NULL REFERENCES reviews(id),
             generation INTEGER NOT NULL,message INTEGER NOT NULL,chat_id INTEGER NOT NULL,
             PRIMARY KEY(binding,review,generation));
         CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,binding INTEGER NOT NULL,
@@ -205,19 +213,16 @@ class ReviewStore:
                 self.enqueue('summary',b['id'],tid,generation=time.time_ns()//1000)
 
     def add_codes(self, actor, tid, values):
-        teacher = self.teacher(tid)
-        if not self.admin(actor) and teacher['user_id'] != actor:
-            raise ValueError('只能为自己添加留名。')
-        values = [v.strip() for v in values if v.strip()]
-        if not values or any(len(v) > 80 for v in values) or len(set(values)) != len(values):
-            raise ValueError('留名不能为空、不能在本次输入中重复，每个最多 80 字。')
-        try:
-            with self.transaction():
-                for value in values:
-                    self.db.execute('INSERT INTO codes(teacher,value,created) VALUES(?,?,?)', (tid, value, time.time()))
-                self.log(actor, '添加留名', '%s：%s 个' % (tid, len(values)))
-        except sqlite3.IntegrityError:
-            raise ValueError('存在尚未使用的同名留名，本次未添加。') from None
+        raise ValueError('留名机制已取消，请上传出击证明后直接提交车评。')
+
+    def proof_path(self, name):
+        from pathlib import Path
+        if not valid_proof(name):
+            raise ValueError('出击证明无效，请重新上传图片。')
+        location = self.db.execute('PRAGMA database_list').fetchone()['file']
+        if not location:
+            raise ValueError('出击证明需要持久化数据库目录。')
+        return Path(location).parent / 'proofs' / name
 
     def draft(self, uid):
         row = self.db.execute('SELECT * FROM drafts WHERE user_id=?', (uid,)).fetchone()
@@ -239,47 +244,35 @@ class ReviewStore:
             data, current = self.draft(user['id'])
             if token != current:
                 raise ValueError('草稿已变更，请重新打开。')
-            if any(not str(data.get(f, '')).strip() for f in INPUT_FIELDS):
+            if missing_fields(data):
                 raise ValueError('请补齐所有字段。')
+            path=self.proof_path(data['出击证明'])
+            if not path.is_file() or path.stat().st_size==0:
+                raise ValueError('出击证明文件缺失，请重新上传图片。')
+            data.pop('留名',None)
             data['综合'] = overall_score(data)
             self.teacher(int(data['老师']))
             try:
                 data['时间'] = review_date(data['时间'], legacy=True)
             except (ValueError, TypeError):
                 raise ValueError('日期格式应为 YYYY-MM-DD，不进行预约日期核验。') from None
-            if not isinstance(data['过程'], str) or not isinstance(data['留名'], str) or len(data['过程']) > 1600 or len(data['留名']) > 80:
-                raise ValueError('过程最多 1600 字，留名最多 80 字。')
+            if not isinstance(data['过程'], str) or len(data['过程']) > 1600:
+                raise ValueError('过程最多 1600 字。')
             last = self.db.execute('SELECT created FROM reviews WHERE author=? ORDER BY id DESC LIMIT 1', (user['id'],)).fetchone()
             if last and time.time() - last[0] < 30:
                 raise ValueError('提交过于频繁，请稍后再试。')
-            code = self.db.execute("SELECT id FROM codes WHERE teacher=? AND value=? AND state='open'",
-                                   (data['老师'], data['留名'].strip())).fetchone()
-            status = 'accepted' if code else 'pending'
-            if not code and self.db.execute("SELECT 1 FROM reviews WHERE author=? AND teacher=? AND status='pending'",
-                                            (user['id'], data['老师'])).fetchone():
-                raise ValueError('该老师已有一条待审核申请，请等待处理。')
+            status = 'accepted'
             now = time.time()
             rid = self.db.execute('''INSERT INTO reviews(author,identity,teacher,data,anonymous,status,created,expires,submission)
                 VALUES(?,?,?,?,?,?,?,?,?)''', (user['id'], json.dumps(user, ensure_ascii=False), data['老师'],
                 json.dumps(data, ensure_ascii=False), int(data.get('匿名', True)), status, now,
-                now + 72*3600 if not code else None, token)).lastrowid
-            if code:
-                self.db.execute("UPDATE codes SET state='used',used_review=? WHERE id=? AND state='open'", (rid, code['id']))
-                self.enqueue_review(rid)
+                None, token)).lastrowid
+            self.enqueue_review(rid)
             self.db.execute('DELETE FROM drafts WHERE user_id=?', (user['id'],))
             return rid, status
 
     def moderate(self, actor, rid, approve):
-        self.require_admin(actor)
-        with self.transaction():
-            row = self.db.execute("SELECT * FROM reviews WHERE id=? AND status='pending' AND expires>?", (rid, time.time())).fetchone()
-            if not row:
-                raise ValueError('审核记录已处理或超过 72 小时。')
-            self.db.execute('UPDATE reviews SET status=?,manual=1,expires=? WHERE id=?',
-                            ('accepted' if approve else 'rejected', None if approve else row['expires'], rid))
-            if approve:
-                self.enqueue_review(rid)
-            self.log(actor, '审核通过' if approve else '审核拒绝', rid)
+        raise ValueError('车评审核已取消，新车评上传出击证明后直接发布。')
 
     def enqueue(self, kind, bid, tid, rid=0, generation=1):
         self.db.execute('INSERT OR IGNORE INTO jobs(kind,binding,teacher,review,generation) VALUES(?,?,?,?,?)',
@@ -292,6 +285,8 @@ class ReviewStore:
             self.enqueue('post', bid, tid, generation=p['generation'])
         for r in self.db.execute("SELECT id FROM reviews WHERE teacher=? AND status='accepted' ORDER BY json_extract(data,'$.时间'),id", (tid,)):
             self.enqueue('comment', bid, tid, r['id'], p['generation'])
+            if json.loads(self.db.execute('SELECT data FROM reviews WHERE id=?',(r['id'],)).fetchone()[0]).get('出击证明'):
+                self.enqueue('proof', bid, tid, r['id'], p['generation'])
         return p
 
     def enqueue_review(self, rid):
@@ -301,6 +296,8 @@ class ReviewStore:
                 self.ensure_post(b['id'], r['teacher'])
             else:
                 self.enqueue('feed', b['id'], r['teacher'], rid)
+                if json.loads(r['data']).get('出击证明'):
+                    self.enqueue('proof', b['id'], r['teacher'], rid)
 
     def bind(self, actor, mode, chat, discussion=None):
         self.require_admin(actor)

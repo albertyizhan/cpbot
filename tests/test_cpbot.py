@@ -1,4 +1,5 @@
 import json
+import secrets
 import sqlite3
 import tempfile
 import time
@@ -28,6 +29,11 @@ class FakeAPI:
             return {'id':cid,'type':'channel' if cid in (-10011,-10033) else 'supergroup','title':str(cid),'linked_chat_id':-10022 if cid==-10011 else -10011}
         if method=='getChatMember':return {'status':'administrator','can_post_messages':True,'can_edit_messages':True,'user':{'id':params['user_id']}}
         self.mid+=1;return {'message_id':self.mid}
+    def photo(self,content,**params):
+        self.calls.append(('photo',params))
+        if self.failure:
+            failure=self.failure;self.failure=None;raise failure
+        self.mid+=1;return {'message_id':self.mid}
     def download_document(self,document,max_bytes):return self.upload
     def document(self,uid,name,content):self.calls.append(('document',{'uid':uid,'content':content}))
 
@@ -41,6 +47,7 @@ class Tests(unittest.TestCase):
     def setUp(self):
         # Explicit paths, no recursive cleanup.
         self.recovery_paths=[]
+        self.proof_files=[]
         self.path=Path(tempfile.gettempdir())/('cpbot-test-%s.sqlite3'%time.time_ns())
         self.s=Store(str(self.path),1);self.api=FakeAPI();self.bot=Bot(self.s,self.api,'review_bot',99)
         self.tid=self.s.save_teacher(1,'老师甲',10)
@@ -48,13 +55,19 @@ class Tests(unittest.TestCase):
         self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('last_check',?)",(datetime.now(TZ).strftime('%Y-%m-%d'),))
     def tearDown(self):
         self.s.db.close()
+        for path in self.proof_files:
+            if path.exists():path.unlink()
         for path in self.recovery_paths:
             if path.exists():path.unlink()
+            if path.suffix=='.json' and path.with_suffix('.zip').exists():path.with_suffix('.zip').unlink()
         for suffix in ('','-wal','-shm'):
             path=Path(str(self.path)+suffix)
             if path.exists():path.unlink()
     def draft(self,uid=2,code='abc',token='token',stamp='2026-10-01 10:00'):
-        d={'时间':stamp,'老师':self.tid,'留名':code,'过程':'完整文字评价','匿名':True,**{f:8 for f in SCORES}}
+        proof=secrets.token_hex(16)+'.jpg'
+        path=self.s.proof_path(proof);path.parent.mkdir(exist_ok=True);path.write_bytes(b'photo')
+        self.proof_files.append(path)
+        d={'时间':stamp,'老师':self.tid,'出击证明':proof,'过程':'完整文字评价','匿名':True,**{f:8 for f in SCORES}}
         self.s.save_draft(uid,d,token);return d
     def submit(self,uid=2,code='abc',token='token',stamp='2026-10-01 10:00'):
         self.draft(uid,code,token,stamp)
@@ -75,7 +88,7 @@ class Tests(unittest.TestCase):
         self.bot.handle({'callback_query':{'id':'cb','from':{'id':uid},'message':{'chat':{'id':uid,'type':'private'},'message_id':100},'data':data}})
         return data
     def test_normal_form_codes_publish_links_scores(self):
-        self.s.add_codes(10,self.tid,['abc'])
+
         self.bot.message(message(text='/start review_1'))
         self.assertEqual(self.s.draft(2)[0]['老师'],self.tid)
         d=self.draft();self.bot.action({'id':2},'field:人照');self.click('10')
@@ -90,20 +103,16 @@ class Tests(unittest.TestCase):
         self.assertNotIn('customer',render_review(self.s,r))
         data=self.click('返回主菜单');self.click('',data=data)
         self.assertTrue(self.api.calls[-1][1]['show_alert'])
-    def test_concurrent_code_consumption_and_reuse(self):
-        self.s.add_codes(10,self.tid,['abc'])
-        with self.assertRaises(ValueError):self.s.add_codes(1,self.tid,['abc'])
+    def test_direct_submit_idempotence_and_proof_required(self):
         self.draft();self.draft(3,token='other')
-        other=Store(str(self.path),1)
-        try:
-            self.assertEqual(self.s.submit({'id':2},'token')[1],'accepted')
-            self.assertEqual(other.submit({'id':3},'other')[1],'pending')
-            self.assertEqual(self.s.submit({'id':2},'token')[0],1)
-        finally:other.db.close()
-        self.s.add_codes(1,self.tid,['abc'])
-        self.s.moderate(1,2,True)
-        self.assertEqual(self.s.db.execute("SELECT count(*) FROM codes WHERE state='open'").fetchone()[0],1)
-        with self.assertRaises(ValueError):self.s.moderate(1,2,True)
+        self.assertEqual(self.s.submit({'id':2},'token')[1],'accepted')
+        self.assertEqual(self.s.submit({'id':3},'other')[1],'accepted')
+        self.assertEqual(self.s.submit({'id':2},'token')[0],1)
+        with self.assertRaises(ValueError):self.s.add_codes(1,self.tid,['abc'])
+        with self.assertRaises(ValueError):self.s.moderate(1,1,True)
+        d=self.draft(4,token='four');d.pop('出击证明');self.s.save_draft(4,d,'four')
+        with self.assertRaises(ValueError):self.s.submit({'id':4},'four')
+
     def test_permissions_global_tags_and_group_opt_in(self):
         self.assertFalse(self.s.allowed(2))
         # Old password grants do not confer superadmin rights.
@@ -129,23 +138,166 @@ class Tests(unittest.TestCase):
         self.assertFalse(self.s.ready());self.bot.home(2)
         self.assertIn('尚未配置',str(self.api.calls[-1]))
         self.bot.home(1);self.assertIn('管理后台',str(self.api.calls[-1]))
-    def test_moderation_expiry_manual_and_export(self):
-        rid,_=self.submit();self.s.moderate(1,rid,True)
-        r=self.s.db.execute('SELECT * FROM reviews').fetchone()
-        self.assertIn('人工审核通过',render_review(self.s,r))
-        rid2,_=self.submit(3,token='three');self.s.db.execute('UPDATE reviews SET expires=? WHERE id=?',(time.time()-1,rid2))
-        with self.assertRaises(ValueError):self.s.moderate(1,rid2,True)
-        self.tick()
+    def test_proof_upload_preview_publication_and_backup(self):
+        self.draft()
+        self.bot.action({'id':2},'field:出击证明')
+        self.bot.message(message(text='文字不能做证明'))
+        self.assertIn('照片',self.api.calls[-1][1]['text'])
+        self.api.upload=b'new photo'
+        self.bot.message(message(photo=[{'file_id':'p','width':100,'height':100}]))
+        d=self.s.draft(2)[0];path=self.s.proof_path(d['出击证明']);self.proof_files.append(path)
+        self.assertEqual(path.read_bytes(),b'new photo')
+        self.bot.action({'id':2},'preview')
+        self.assertTrue(any(m=='photo' for m,_ in self.api.calls))
+        rid,status=self.s.submit({'id':2,'username':'customer'},'token')
+        self.assertEqual(status,'accepted')
+        self.tick();self.forward();self.tick(8)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM proof_publications').fetchone()[0],1)
+        proof_call=[p for m,p in self.api.calls if m=='photo' and p['chat_id']==-10022][-1]
+        pub=self.s.db.execute('SELECT * FROM publications').fetchone()
+        self.assertEqual(proof_call['reply_parameters']['message_id'],pub['message'])
+        row=self.s.db.execute('SELECT * FROM reviews').fetchone()
+        text=render_review(self.s,row)
+        self.assertNotIn('作者',text);self.assertNotIn('留名',text)
+        real=dict(row);real['anonymous']=0
+        self.assertIn('tg://user?id=2',render_review(self.s,real))
+        self.assertIn('@customer',render_review(self.s,real))
+        data=validate_backup(self.s.export(99),99)
+        self.assertIn(d['出击证明'],data['media'])
+        data['media']={}
+        with self.assertRaises(ValueError):validate_backup(json.dumps(data).encode(),99)
+        self.bot.change_review(1,rid,None);self.tick(8)
+        self.assertTrue(any(m=='photo' and p.get('_method')=='editMessageMedia' for m,p in self.api.calls))
+
+    def test_split_backup_upload_mismatch_zip_safety_and_restore(self):
+        import io,zipfile
+        self.submit()
+        self.bot.action({'id':1},'export')
+        docs=[p for m,p in self.api.calls if m=='document']
+        self.assertEqual(len(docs),2)
+        text,images=docs[0]['content'],docs[1]['content']
+        self.assertNotIn('media',json.loads(text))
+        validate_backup(text,99,images)
+        other_text,other_images=self.s.export(99,split=True)
+        with self.assertRaisesRegex(ValueError,'同一批'):validate_backup(text,99,other_images)
+        buffer=io.BytesIO()
+        with zipfile.ZipFile(buffer,'w') as archive:
+            archive.writestr('manifest.json',json.dumps({'bundle':json.loads(text)['image_bundle']}))
+            archive.writestr('../evil.jpg',b'bad')
+        with self.assertRaises(ValueError):validate_backup(text,99,buffer.getvalue())
+        self.bot.action({'id':1},'import')
+        self.api.upload=images
+        self.bot.message(message(uid=1,document={'file_id':'a','file_name':'images.zip'}))
+        self.assertIn('继续上传',self.api.calls[-1][1]['text'])
+        self.api.upload=text
+        self.bot.message(message(uid=1,document={'file_id':'b','file_name':'data.json'}))
+        self.assertIn('尚未导入',self.api.calls[-1][1]['text'])
+        self.click('确认覆盖并恢复',uid=1)
+        self.assertTrue(self.bot.paused())
+        recovery=self.s.db.execute("SELECT detail FROM audit WHERE action='导入备份' ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.recovery_paths.append(Path(recovery))
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM reviews').fetchone()[0],1)
-        backup=self.s.export();restored=Store(':memory:',1)
-        try:
-            recovery=restored.import_backup(1,backup)
-            self.assertEqual(restored.db.execute('SELECT count(*) FROM reviews').fetchone()[0],1)
-            recovery.unlink()
-        finally:restored.db.close()
-        self.s.set_admin(1,3);self.bot.action({'id':3},'export');self.assertTrue(any(m=='document' for m,_ in self.api.calls))
+
+    def test_target_silent_observation_separate_from_lookup(self):
+        self.s.db.execute("INSERT INTO settings VALUES('membership_target',?)",(json.dumps({'id':-10055,'title':'目标群'}),))
+        before=len(self.api.calls)
+        self.bot.message(message(uid=50,cid=-10055,text='@unknown_name') | {'from':{'id':50,'username':'old_name'}})
+        self.assertEqual(len(self.api.calls),before)
+        self.assertEqual(self.s.lookup(username='old_name')['user_id'],50)
+        self.assertIsNone(self.s.lookup(username='unknown_name'))
+        self.bot.message(message(uid=50,cid=-10055,text='编辑消息') | {'from':{'id':50,'username':'new_name'}},edited=True)
+        self.assertIsNone(self.s.lookup(username='old_name'))
+        self.assertEqual(self.s.lookup(username='new_name')['user_id'],50)
+        self.bot.message(message(uid=51,cid=-10066,text='非目标群'))
+        self.assertIsNone(self.s.lookup(user_id=51))
+        self.s.db.execute('UPDATE bindings SET active=0')
+        self.bot.message(message(uid=52,cid=-10055,text='专帖关闭仍记录') | {'from':{'id':52,'username':'quiet_member'}})
+        self.assertEqual(self.s.lookup(username='quiet_member')['user_id'],52)
+        self.bot.message(message(uid=52,cid=-10055,text='去掉用户名') | {'from':{'id':52}})
+        self.assertIsNone(self.s.lookup(username='quiet_member'))
+        self.bot.message(message(uid=50,cid=-10055,new_chat_members=[{'id':53,'username':'new_joiner'}]))
+        person=self.s.lookup(user_id=53)
+        self.assertEqual(person['username'],'new_joiner')
+        self.bot.handle({'chat_member':{'chat':{'id':-10055,'type':'supergroup','title':'目标群'},'date':int(time.time())+1,
+            'old_chat_member':{'status':'member','user':{'id':53}},
+            'new_chat_member':{'status':'left','user':{'id':53,'username':'new_joiner'}}}})
+        self.assertEqual(self.s.db.execute('SELECT present FROM memberships WHERE person=? AND chat_id=-10055',(person['id'],)).fetchone()[0],0)
+        self.assertEqual(len(self.api.calls),before)
+
+    def test_designated_membership_target_not_current_group(self):
+        self.bot.action({'id':1},'membertargetset')
+        self.bot.message(message(uid=1,text='-10055'))
+        self.assertIn('检查通过',self.api.calls[-1][1]['text'])
+        original=self.api.call
+        def status(method,**params):
+            if method=='getChatMember' and params['user_id']==50:
+                self.assertEqual(params['chat_id'],-10055)
+                return {'status':'restricted','is_member':True}
+            return original(method,**params)
+        self.api.call=status
+        p=self.s.track('50');self.bot.show_person(2,p['id'])
+        self.assertIn('是否在群：是',self.api.calls[-1][1]['text'])
+        self.assertIn('入群时间：未知',self.api.calls[-1][1]['text'])
+        self.s.bind(1,'lookup',{'id':-10044,'title':'查询群'})
+        self.bot.message(message(text='查',cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
+        self.assertIn('判定群：-10055',self.api.calls[-1][1]['text'])
+        def failed(method,**params):
+            if method=='getChatMember' and params['user_id']==50:raise APIError(429,10)
+            return original(method,**params)
+        self.api.call=failed;self.bot.show_person(2,p['id'])
+        self.assertIn('暂时无法确认',self.api.calls[-1][1]['text'])
+        self.assertNotIn('是否在群：否',self.api.calls[-1][1]['text'])
+        self.api.call=lambda method,**params: {'status':'left'} if method=='getChatMember' and params['user_id']==50 else original(method,**params)
+        self.bot.show_person(2,p['id']);self.assertIn('是否在群：否',self.api.calls[-1][1]['text'])
+        self.bot.show_person(2,self.s.track('@unknown_name')['id'])
+        self.assertIn('尚未识别',self.api.calls[-1][1]['text'])
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'membertargetclear')
+        text,images=self.s.export(99,split=True)
+        self.assertEqual(validate_backup(text,99,images)['membership_target']['id'],-10055)
+        self.api.call=original
+
+    def test_proof_timeout_never_blindly_resends(self):
+        self.submit();self.tick();self.forward()
+        self.tick()  # publish review text
+        self.s.db.execute("UPDATE jobs SET state='done' WHERE kind='summary'")
+        self.api.failure=APIError(0)
+        self.tick()  # proof upload result unknown
+        job=self.s.db.execute("SELECT * FROM jobs WHERE kind='proof'").fetchone()
+        self.assertEqual(job['state'],'uncertain')
+        count=sum(m=='photo' for m,p in self.api.calls)
+        self.tick(3)
+        self.assertEqual(sum(m=='photo' for m,p in self.api.calls),count)
+        self.bot.action({'id':1},'jobdone:%s'%job['id'])
+        self.bot.message(message(uid=1,text='800'))
+        self.assertEqual(self.s.db.execute('SELECT message FROM proof_publications').fetchone()[0],800)
+        self.assertNotEqual(self.s.db.execute('SELECT message FROM publications').fetchone()[0],800)
+
+    def test_proof_feed_retry_and_files_restore(self):
+        self.s.bind(1,'feed',{'id':-10033,'title':'直发'})
+        rid,_=self.submit()
+        self.tick();self.forward();self.tick(12)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM proof_publications').fetchone()[0],2)
+        self.assertTrue(any(m=='photo' and p['chat_id']==-10033 for m,p in self.api.calls))
+        content=self.s.export(99)
+        name=json.loads(self.s.db.execute('SELECT data FROM reviews').fetchone()[0])['出击证明']
+        path=self.s.proof_path(name);path.unlink()
+        recovery=self.s.recovery_backup
+        recovery_path=self.path.with_suffix('.media-recovery.json');self.recovery_paths.append(recovery_path)
+        recovery_path.write_bytes(content)
+        self.s.recovery_backup=lambda bot:recovery_path
+        try:self.s.import_backup(1,content,99)
+        finally:self.s.recovery_backup=recovery
+        self.assertEqual(path.read_bytes(),b'photo')
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM proof_publications').fetchone()[0],2)
+        old=json.loads(content)
+        old.pop('media');old['tables'].pop('proof_publications')
+        for row in old['tables']['reviews']:
+            d=json.loads(row['data']);d.pop('出击证明');d['留名']='旧留名';row['data']=json.dumps(d)
+        old['tables']['jobs']=[j for j in old['tables']['jobs'] if j['kind']!='proof']
+        validate_backup(json.dumps(old).encode(),99)
+
     def test_nightly_missing_rebuild_and_pacing(self):
-        self.s.add_codes(1,self.tid,['abc']);self.submit();self.tick();self.forward();self.tick(3)
+        self.submit();self.tick();self.forward();self.tick(3)
         self.s.db.execute("DELETE FROM settings WHERE key='last_check'")
         stamp=datetime(2026,10,30,2,30,tzinfo=TZ).timestamp()
         self.bot.publisher.nightly(stamp);count=self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='check'").fetchone()[0]
@@ -159,13 +311,13 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM publications WHERE generation=2').fetchone()[0],1)
         calls=len(self.api.calls);self.bot.publisher.next_global=time.time()+100;self.bot.publisher.tick();self.assertEqual(calls,len(self.api.calls))
     def test_rate_limit_uncertain_and_failed_send_keeps_code_used(self):
-        self.s.add_codes(1,self.tid,['abc']);self.submit()
+        self.submit()
         self.api.failure=APIError(429,30);self.tick()
         job=self.s.db.execute("SELECT * FROM jobs WHERE kind='post'").fetchone();self.assertEqual(job['state'],'pending');self.assertGreater(job['due'],time.time())
         self.api.failure=APIError(0);self.tick();self.assertEqual(self.s.db.execute("SELECT state FROM jobs WHERE kind='post'").fetchone()[0],'uncertain')
-        self.assertEqual(self.s.db.execute('SELECT state FROM codes').fetchone()[0],'used')
+        self.assertEqual(self.s.db.execute('SELECT status FROM reviews').fetchone()[0],'accepted')
     def test_withdraw_and_edit_recompute_no_resurrection(self):
-        self.s.add_codes(1,self.tid,['abc']);rid,_=self.submit();self.tick();self.forward();self.tick(3)
+        rid,_=self.submit();self.tick();self.forward();self.tick(3)
         with self.assertRaises(ValueError):self.bot.change_review(1,rid,{'综合':10})
         self.bot.change_review(1,rid,{f:10 for f in SCORES});self.tick(3)
         self.assertIn('10.0',self.bot.publisher.summary(self.tid)[0])
@@ -173,7 +325,7 @@ class Tests(unittest.TestCase):
         self.assertIn('暂无',self.bot.publisher.summary(self.tid)[0]);self.assertIn('撤下',str(self.api.calls))
         self.assertEqual(self.s.db.execute('SELECT status FROM reviews').fetchone()[0],'withdrawn')
     def test_score_form_derived_preview_and_invalid_inputs(self):
-        self.s.add_codes(1,self.tid,['abc'])
+
         d=self.draft();d['综合']=1
         self.s.save_draft(2,d,'token')
         self.bot.draft_panel(2)
@@ -201,7 +353,7 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_backup(json.dumps(broken).encode(),99)
 
     def test_legacy_text_score_backup_and_admin_correction(self):
-        self.s.add_codes(1,self.tid,['abc']);rid,_=self.submit()
+        rid,_=self.submit()
         old=json.loads(self.s.db.execute('SELECT data FROM reviews').fetchone()[0])
         old.update({'人照':'符合','综合':9})
         self.s.db.execute('UPDATE reviews SET data=? WHERE id=?',(json.dumps(old),rid))
@@ -299,16 +451,12 @@ class Tests(unittest.TestCase):
         self.bot.action({'id':1},'teachernew')
         self.bot.message(message(uid=1,text='新增老师'))
         self.assertIn('已保存',self.api.calls[-1][1]['text'])
-        self.bot.action({'id':1},'codefor:1')
-        self.bot.message(message(uid=1,text='first\nsecond'))
-        self.assertIn('添加 2 个留名',self.api.calls[-1][1]['text'])
+        with self.assertRaises(ValueError):self.bot.action({'id':1},'codefor:1')
         self.bot.action({'id':1},'adminadd')
         self.bot.message(message(uid=1,text='3'))
         self.assertIn('已加入名单',self.api.calls[-1][1]['text'])
         rid,_=self.submit(code='not-found')
-        self.bot.action({'id':1},'moderate:%s'%rid)
-        self.click('通过',uid=1)
-        self.assertIn('已通过',str(self.api.calls[-2]));self.assertIn('已通过',self.api.calls[-1][1]['text'])
+        self.assertEqual(self.s.db.execute('SELECT status FROM reviews WHERE id=?',(rid,)).fetchone()[0],'accepted')
         self.bot.action({'id':1},'pausejobs')
         self.assertIn('⏸ 已暂停',self.api.calls[-1][1]['text'])
         self.bot.home(2);self.assertIn('发布队列已暂停',self.api.calls[-1][1]['text'])
@@ -320,7 +468,7 @@ class Tests(unittest.TestCase):
         self.assertNotIn('pending=',self.api.calls[-1][1]['text'])
 
     def test_json_import_end_to_end_permissions_preview_and_recovery(self):
-        self.s.add_codes(1,self.tid,['abc']);self.submit();self.tick();self.forward();self.tick(3)
+        self.submit();self.tick();self.forward();self.tick(3)
         p=self.s.track('50');self.s.save(p['id'],0,{'id':1},'旧备注','旧标签')
         backup=self.s.export(99)
         self.s.save(p['id'],1,{'id':1},'新备注','新标签')
@@ -337,7 +485,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.s.db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()[0],'123')
         recovery=self.s.db.execute("SELECT detail FROM audit WHERE action='导入备份' ORDER BY id DESC LIMIT 1").fetchone()[0]
         self.recovery_paths.append(Path(recovery))
-        old=validate_backup(Path(recovery).read_bytes(),99)
+        self.recovery_paths.append(Path(recovery).with_suffix('.zip'))
+        old=validate_backup(Path(recovery).read_bytes(),99,Path(recovery).with_suffix('.zip').read_bytes())
         self.assertEqual(old['tables']['people'][0]['tags'],'新标签')
         self.assertTrue(any(m=='document' for m,_ in self.api.calls))
         with self.assertRaises(ValueError):self.bot.action({'id':2},'import')
@@ -438,9 +587,9 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM posts').fetchone()[0],4)
         self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='post'").fetchone()[0],4)
         self.bot.home(30)
-        self.assertIn('添加留名',str(self.api.calls[-1]))
+        self.assertNotIn('添加留名',str(self.api.calls[-1]))
         tid=self.s.db.execute('SELECT id FROM teachers WHERE user_id=30').fetchone()[0]
-        self.s.add_codes(30,tid,['新留名'])
+        self.assertEqual(self.s.teacher(tid)['user_id'],30)
         self.click('',uid=1,data=confirm)
         self.assertTrue(self.api.calls[-1][1]['show_alert'])
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],4)
@@ -496,7 +645,7 @@ class Tests(unittest.TestCase):
         self.assertIsNotNone(self.s.db.execute('SELECT 1 FROM posts WHERE teacher=?',(tid,)).fetchone())
         self.bot.action({'id':1},'teacherbind:%s'%tid)
         self.bot.message(message(uid=1,text='20'))
-        self.s.add_codes(20,tid,['留名'])
+        self.assertEqual(self.s.teacher(tid)['user_id'],20)
         self.bot.action({'id':1},'teacherrename:%s'%tid)
         self.bot.message(message(uid=1,text='新名称'))
         self.assertEqual(self.s.teacher(tid)['user_id'],20)
@@ -507,12 +656,11 @@ class Tests(unittest.TestCase):
         self.assertIn('已绑定其他老师',self.api.calls[-1][1]['text'])
         self.bot.action({'id':1},'teacherunbindyes:%s'%tid)
         with self.assertRaises(ValueError):self.s.add_codes(20,tid,['其他'])
-        self.s.add_codes(1,tid,['其他'])
-        self.assertEqual(self.s.db.execute('SELECT count(*) FROM codes WHERE teacher=?',(tid,)).fetchone()[0],2)
+        self.assertIsNone(self.s.teacher(tid)['user_id'])
         with self.assertRaises(ValueError):self.bot.action({'id':2},'teacherbind:%s'%tid)
 
     def test_date_only_input_legacy_backup_and_invalid_dates(self):
-        self.s.add_codes(1,self.tid,['abc'])
+
         self.draft(stamp='2026-10-29')
         self.bot.action({'id':2},'field:时间')
         for bad in ('2026-02-30','2026-10-29 14:30','2026-1-2'):

@@ -63,6 +63,11 @@ def backup():
                 archive.add(env, arcname='config.env', recursive=False)
             if db.exists():
                 archive.add(snapshot, arcname='database.sqlite3', recursive=False)
+            proofs=db.parent/'proofs'
+            if proofs.is_dir():
+                for image in proofs.iterdir():
+                    if image.is_file() and image.suffix=='.jpg':
+                        archive.add(image,arcname='proofs/'+image.name,recursive=False)
             manifest = json.dumps({'database_path': str(db), 'env_path': str(env),
                                     'created': time.time()}, ensure_ascii=False).encode()
             info = tarfile.TarInfo('manifest.json')

@@ -15,7 +15,7 @@ def member_present(member):
     if status in ('creator', 'administrator', 'member'):
         return True
     if status == 'restricted':
-        return bool(member.get('is_member'))
+        return member['is_member'] if type(member.get('is_member')) is bool else None
     if status in ('left', 'kicked'):
         return False
     return None
