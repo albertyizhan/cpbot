@@ -577,8 +577,10 @@ class Bot:
                 try:
                     self.publisher.validate('thread',cid)
                     notice='✅ 频道权限和讨论组检查通过。\nℹ️ 当前尚未自动绑定，请在管理后台选择绑定模式。'
-                except (ValueError,APIError):
-                    notice='⚠️ 专帖频道检查未通过。\n请核对发布/编辑权限、关联讨论组及群内管理员权限；直发模式可在后台单独检查。'
+                except ValueError as error:
+                    notice='⚠️ 专帖频道检查未通过。\n'+str(error)
+                except APIError as error:
+                    notice=self.api_hint(error)
                 for admin in self.store.db.execute('SELECT user_id FROM admins'):
                     try:self.send(admin[0],notice+'\n频道 ID：'+str(cid))
                     except APIError:pass

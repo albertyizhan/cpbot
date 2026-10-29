@@ -35,30 +35,49 @@ class Publisher:
         self.next_global = 0
         self.next_chat = {}
 
+    def _chat(self, cid, label):
+        try:
+            return self.api.call('getChat', chat_id=cid)
+        except APIError as error:
+            if error.code in (400, 403):
+                raise ValueError('%s（%s）无法访问，请确认目标 ID 正确，并已将当前机器人 @%s 加入。' % (label, cid, self.username)) from None
+            raise
+
     def validate(self, mode, cid):
-        chat = self.api.call('getChat', chat_id=cid)
+        label = '查档群' if mode == 'lookup' else '频道'
+        chat = self._chat(cid, label)
         expected = ('group', 'supergroup') if mode == 'lookup' else ('channel',)
         if chat['type'] not in expected:
-            raise ValueError('目标类型不符合此模式。')
-        self._rights(chat['id'], mode != 'lookup')
+            raise ValueError('目标类型不符合此模式：%s（%s）不是%s。' % (chat.get('title', ''), chat['id'], label))
+        target = '%s「%s」' % (label, chat.get('title', chat['id']))
+        self._rights(chat['id'], mode != 'lookup', target)
         discussion = chat.get('linked_chat_id') if mode == 'thread' else None
         if mode == 'thread':
             if not str(chat['id']).startswith('-100'):
                 raise ValueError('需要有效频道 ID。')
             if not discussion:
-                raise ValueError('频道尚未关联讨论组，请先在 Telegram 配置。')
-            self._rights(discussion, False)
-            group = self.api.call('getChat', chat_id=discussion)
+                raise ValueError('%s尚未关联讨论组。请在频道设置 → 讨论，关联群组后重试。' % target)
+            group = self._chat(discussion, '关联讨论组（频道权限已通过）')
+            self._rights(discussion, False, '关联讨论组「%s」（频道权限已通过）' % group.get('title', discussion))
             if group.get('linked_chat_id') != chat['id']:
-                raise ValueError('讨论组关联关系不一致。')
+                raise ValueError('频道与讨论组关联关系不一致，请检查 Telegram 的频道讨论设置。')
         return chat, discussion
 
-    def _rights(self, cid, channel):
-        m = self.api.call('getChatMember', chat_id=cid, user_id=self.bot_id)
-        if m.get('status') not in ('administrator', 'creator'):
-            raise ValueError('机器人需要在频道和相关群中拥有管理员权限。')
-        if channel and m.get('status') != 'creator' and not (m.get('can_post_messages') and m.get('can_edit_messages')):
-            raise ValueError('频道需要发布、编辑消息权限。')
+    def _rights(self, cid, channel, label):
+        try:
+            m = self.api.call('getChatMember', chat_id=cid, user_id=self.bot_id)
+        except APIError as error:
+            if error.code in (400, 403):
+                raise ValueError('%s（%s）无法检查 @%s 的身份，请确认机器人已加入该目标。' % (label, cid, self.username)) from None
+            raise
+        status = m.get('status')
+        if status not in ('administrator', 'creator'):
+            state = {'member':'普通成员', 'left':'未加入或已退出', 'kicked':'已被移除', 'restricted':'受限制成员'}.get(status, '未知身份')
+            raise ValueError('%s（%s）：@%s 当前为%s，需要将此机器人设为管理员。频道和讨论组的管理员身份相互独立。' % (label, cid, self.username, state))
+        if channel and status != 'creator':
+            missing = [name for key, name in (('can_post_messages','发布消息'), ('can_edit_messages','编辑消息')) if not m.get(key)]
+            if missing:
+                raise ValueError('%s（%s）：@%s 已是管理员，但缺少「%s」权限，请在频道管理员设置中开启。' % (label, cid, self.username, '、'.join(missing)))
 
     def summary(self, tid):
         t = self.s.teacher(tid)

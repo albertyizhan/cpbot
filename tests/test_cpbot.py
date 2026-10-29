@@ -174,6 +174,38 @@ class Tests(unittest.TestCase):
         self.s.observe({'id':51,'username':'target_a'},200,True)
         self.assertEqual(self.s.lookup(user_id=50)['tags'],'标签');self.assertEqual(self.s.lookup(user_id=51)['tags'],'')
         self.assertEqual(len(targets(message(reply_to_message={'from':{'id':60},'date':1}))),1)
+    def test_binding_reports_exact_permission_target(self):
+        original=self.api.call
+        self.assertEqual(self.bot.publisher.validate('thread',-10011)[1],-10022)
+        def group_member(method,**params):
+            if method=='getChatMember' and params['chat_id']==-10022:
+                self.assertEqual(params['user_id'],99)
+                return {'status':'member'}
+            return original(method,**params)
+        self.api.call=group_member
+        with self.assertRaisesRegex(ValueError,'关联讨论组.*频道权限已通过.*普通成员'):
+            self.bot.publisher.validate('thread',-10011)
+        def missing_channel_right(method,**params):
+            if method=='getChatMember' and params['chat_id']==-10011:
+                return {'status':'administrator','can_post_messages':True,'can_edit_messages':False}
+            return original(method,**params)
+        self.api.call=missing_channel_right
+        with self.assertRaisesRegex(ValueError,'已是管理员.*编辑消息'):
+            self.bot.publisher.validate('thread',-10011)
+        def no_group_access(method,**params):
+            if method=='getChat' and params['chat_id']==-10022:raise APIError(400)
+            return original(method,**params)
+        self.api.call=no_group_access
+        with self.assertRaisesRegex(ValueError,'关联讨论组.*频道权限已通过.*无法访问'):
+            self.bot.publisher.validate('thread',-10011)
+        def limited(method,**params):
+            if method=='getChatMember':raise APIError(429,30)
+            return original(method,**params)
+        self.api.call=limited
+        with self.assertRaises(APIError) as error:self.bot.publisher.validate('thread',-10011)
+        self.assertEqual(error.exception.code,429)
+        self.api.call=original
+
     def test_binding_feedback_all_modes_and_failure_retry(self):
         # Real entry points, not just store mutations.
         for mode,cid in (('thread',-10011),('feed',-10033),('lookup',-10044)):
@@ -195,7 +227,7 @@ class Tests(unittest.TestCase):
             return original(method,**params)
         self.api.call=fail
         self.bot.message(message(uid=1,text='-10055'))
-        self.assertIn('🔒',self.api.calls[-1][1]['text'])
+        self.assertIn('无法访问',self.api.calls[-1][1]['text'])
         self.assertEqual(self.bot.sessions[1]['pending'],('bind','feed'))
         self.api.call=original
 
