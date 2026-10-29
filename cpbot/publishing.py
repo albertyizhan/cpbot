@@ -149,6 +149,14 @@ class Publisher:
                 return
             raise
 
+    def poll_timeout(self):
+        """Long-poll while idle; updates still return immediately on arrival."""
+        row = self.s.db.execute('''SELECT
+            EXISTS(SELECT 1 FROM settings WHERE key='publishing_paused' AND value='1'),
+            EXISTS(SELECT 1 FROM jobs j JOIN bindings b ON b.id=j.binding
+                   WHERE j.state='pending' AND b.active=1)''').fetchone()
+        return 20 if row[0] or not row[1] else 1
+
     def tick(self):
         now = time.time()
         if time.monotonic() >= self.next_cleanup:

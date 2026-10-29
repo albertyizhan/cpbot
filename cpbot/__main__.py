@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import signal
 import threading
+import time
 
 from .api import API, APIError
 from .bot import Bot
@@ -74,11 +75,15 @@ def main():
         saved = store.db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()
         offset = int(saved[0]) if saved else 0
         logging.info('cpbot started as @%s', me['username'])
+        measured_at, measured_cpu = time.monotonic(), time.process_time()
+        measured_changes = store.db.total_changes
+        update_count = poll_count = 0
         while not stop.is_set():
             try:
-                updates = api.call('getUpdates', offset=offset, timeout=1, limit=20,
-                                   allowed_updates=['message', 'edited_message', 'callback_query', 'chat_member', 'my_chat_member'])
                 bot.publisher.tick()
+                updates = api.call('getUpdates', offset=offset, timeout=bot.publisher.poll_timeout(), limit=20,
+                                   allowed_updates=['message', 'edited_message', 'callback_query', 'chat_member', 'my_chat_member'])
+                poll_count += 1
                 for update in updates:
                     if stop.is_set():
                         break
@@ -92,6 +97,15 @@ def main():
                         logging.warning('Update %s rejected: %s', update['update_id'], error)
                     offset = update['update_id'] + 1
                     store.db.execute("INSERT OR REPLACE INTO settings VALUES('offset',?)", (str(offset),))
+                    update_count += 1
+                now = time.monotonic()
+                if now - measured_at >= 60:
+                    cpu = time.process_time()
+                    logging.info('load window_s=%.1f cpu_s=%.3f updates=%s polls=%s db_changes=%s',
+                                 now-measured_at, cpu-measured_cpu, update_count, poll_count,
+                                 store.db.total_changes-measured_changes)
+                    measured_at, measured_cpu, measured_changes = now, cpu, store.db.total_changes
+                    update_count = poll_count = 0
             except APIError as error:
                 if error.code in (401, 409):
                     raise SystemExit('Token 无效或存在另一个轮询 / Webhook 实例，请检查配置。') from None

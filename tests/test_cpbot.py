@@ -231,6 +231,19 @@ class Tests(unittest.TestCase):
         self.s.ensure_post(self.bid,self.tid)
         self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='comment'").fetchone()[0],101)
 
+    def test_idle_long_poll_preserves_queue_responsiveness(self):
+        self.assertEqual(self.bot.publisher.poll_timeout(),1)
+        self.s.db.execute("UPDATE jobs SET state='done'")
+        self.assertEqual(self.bot.publisher.poll_timeout(),20)
+        self.s.enqueue('summary',self.bid,self.tid,generation=999)
+        self.assertEqual(self.bot.publisher.poll_timeout(),1)
+        self.s.db.execute("INSERT INTO settings VALUES('publishing_paused','1')")
+        self.assertEqual(self.bot.publisher.poll_timeout(),20)
+        self.s.db.execute("UPDATE settings SET value='0' WHERE key='publishing_paused'")
+        self.assertEqual(self.bot.publisher.poll_timeout(),1)
+        self.s.db.execute('UPDATE bindings SET active=0')
+        self.assertEqual(self.bot.publisher.poll_timeout(),20)
+
     def test_queue_indices_and_cleanup_interval(self):
         plan=' '.join(str(tuple(r)) for r in self.s.db.execute("EXPLAIN QUERY PLAN SELECT * FROM jobs WHERE state='pending' AND due<=0"))
         self.assertIn('jobs_pending_due',plan)

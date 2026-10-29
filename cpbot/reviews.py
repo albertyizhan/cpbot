@@ -217,6 +217,11 @@ class ReviewStore:
     def identify_teacher(self, user):
         uid=user.get('id');username=(user.get('username') or '').lower()
         if not uid or user.get('is_bot') or not username:return
+        # Most observed members are not pending teachers. Do not run an UPDATE
+        # for every ordinary group message; the username index makes this cheap.
+        pending=self.db.execute('SELECT id FROM teachers WHERE username=? COLLATE NOCASE AND user_id IS NULL',
+                                (username,)).fetchone()
+        if not pending:return
         changed=self.db.execute("UPDATE teachers SET user_id=? WHERE user_id IS NULL AND username=? COLLATE NOCASE AND NOT EXISTS(SELECT 1 FROM teachers WHERE user_id=?)",(uid,username,uid)).rowcount
         if changed:self.log(uid,'用户名自动绑定老师账号',username)
 
