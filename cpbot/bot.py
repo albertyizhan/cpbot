@@ -105,7 +105,7 @@ class Bot:
     def show_person(self, uid, pid, intent=None, notice=''):
         p = self.store.person(pid)
         if intent == 'delete':
-            self.store.require_admin(uid)
+            self.store.require_editor(uid)
             return self.panel(uid, self.card(p) + '\n\n确定清空标签？保留身份、备注和修改记录。',
                 [[('确认删除', 'delete:%s:%s' % (pid, p['version']))], [('取消', 'person:%s' % pid)]])
         return self.panel(uid, (notice + '\n\n' if notice else '') + self.card(p) + self.target_membership(p),
@@ -151,8 +151,9 @@ class Bot:
             LEFT JOIN people p ON p.user_id=t.user_id
             WHERE (? NOT LIKE '@%' AND instr(lower(t.name),lower(?))>0)
                OR (t.user_id IS NOT NULL AND p.username=? COLLATE NOCASE)
+               OR (t.user_id IS NULL AND t.username=? COLLATE NOCASE)
             ORDER BY t.id LIMIT 9 OFFSET ?''',
-            (search,search,search.lstrip('@'),max(0,page)*8)).fetchall()
+            (search,search,search.lstrip('@'),search.lstrip('@'),max(0,page)*8)).fetchall()
         rows = [[('%s · #%s' % (t['name'], t['id']), '%s:%s' % (intent, t['id']))] for t in teachers[:8]]
         rows.append([('搜索老师','teachersearch:'+intent)])
         if search:
@@ -173,12 +174,13 @@ class Bot:
         pages = (len(entries) + 14) // 15
         if not 0 <= page < pages:
             raise ValueError('预览页码无效。')
-        bound = sum(account is not None for _, account in entries)
+        bound = sum(entry[1] is not None for entry in entries)
         lines = ['📋 老师导入预览 · 尚未保存',
                  '共 %s 位 · 绑定账号 %s 位 · 未绑定 %s 位' % (len(entries), bound, len(entries)-bound),
                  '第 %s/%s 页 · 确认将导入整批名单，预览 10 分钟内有效。' % (page+1, pages)]
-        for index, (name, account) in enumerate(entries[page*15:(page+1)*15], page*15+1):
-            lines.append('%s. %s\n   %s' % (index, name, '账号 ID：%s' % account if account else '未绑定本人账号'))
+        for index, entry in enumerate(entries[page*15:(page+1)*15], page*15+1):
+            name,account=entry[:2];username=entry[2] if len(entry)>2 else None
+            lines.append('%s. %s\n   %s' % (index, name, '账号 ID：%s%s' % (account,' · @'+username if username else '') if account else ('等待识别 @'+username if username else '未绑定本人账号')))
         rows = []
         navigation = []
         if page:
@@ -316,7 +318,7 @@ class Bot:
         if kind=='search': return self.prompt(uid,'发送客户 ID、@用户名，或转发目标消息。',('search',))
         if kind=='person': return self.show_person(uid,int(parts[1]))
         if kind in ('edit','askdelete','delete'):
-            self.store.require_admin(uid)
+            self.store.require_editor(uid)
             p=self.store.person(int(parts[1]))
             if kind=='askdelete': return self.show_person(uid,p['id'],'delete')
             if kind=='edit': return self.prompt(uid,'发送两行：新增备注、追加标签。某行不新增请填 -。',('addtags',p['id'],p['version']),'person:%s'%p['id'])
@@ -332,7 +334,7 @@ class Bot:
             return self.prompt(uid,'👩‍🏫 添加老师\n发送老师名称即可（1～80 字）。本人账号可在详情中另行绑定。',('teachernew',),'admin')
         if kind=='teacherbatch':
             self.teacher_imports.pop(uid, None)
-            return self.prompt(uid,'📥 批量导入老师\n每行一位，每批最多 100 位，可混用：\n老师甲\n老师乙 | 123456789\n老师丙 987654321\n\n不带 ID 不绑定本人账号；带 ID 可用于老师用户名搜索。名称末尾是数字时，请用 | 明确分隔 ID。\n先生成列表预览，确认后才保存；重名或账号冲突不会覆盖已有资料。',('teacherbatch',),'teacherbatchcancel')
+            return self.prompt(uid,'📥 批量导入老师\n每行一位，每批最多 100 位，可混用：\n老师甲\n老师乙 | @teacher_b\n老师丙 | @teacher_c | 987654321\n老师丁 | 123456789\n\n用户名和数字 ID 均可省略；仅填用户名将等待账号出现后自动绑定。已绑定老师可编辑学生标签。名称末尾是数字时，请用 | 明确分隔 ID。\n先生成列表预览，确认后才保存；重名或账号冲突不会覆盖已有资料。',('teacherbatch',),'teacherbatchcancel')
         if kind=='teacherbatchcancel':
             self.teacher_imports.pop(uid, None)
             self.success(uid,'已取消，本批老师未导入。')
@@ -349,7 +351,7 @@ class Bot:
             return self.admin_panel(uid)
         if kind in ('teacherdetail','teacheredit'):
             t=self.store.teacher(int(parts[1]))
-            identity='✅ 已绑定本人账号：%s' % t['user_id'] if t['user_id'] else 'ℹ️ 未绑定本人账号，可按名称搜索。'
+            identity='✅ 已绑定本人账号：%s' % t['user_id'] if t['user_id'] else ('⏳ 等待识别 @'+t['username'] if t.get('username') else 'ℹ️ 未绑定本人账号，可按名称搜索。')
             rows=[[('修改名称','teacherrename:%s'%t['id'])],[('绑定本人账号（可选）' if not t['user_id'] else '更换本人账号','teacherbind:%s'%t['id'])]]
             if t['user_id']:rows.append([('解除本人绑定','teacherunbind:%s'%t['id'])])
             rows += [[('返回老师列表','teachersadmin')]]
@@ -545,17 +547,18 @@ class Bot:
         if self.publisher.automatic_forward(msg):return
         chat=msg['chat'];user=msg.get('from',{});uid=user.get('id');text=msg.get('text','').strip()
         if chat['type'] in ('group','supergroup'):
-            b=self.store.db.execute("SELECT 1 FROM bindings WHERE mode='lookup' AND chat_id=? AND active=1",(chat['id'],)).fetchone()
-            target=self.store.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
-            is_target=bool(target and json.loads(target[0])['id']==chat['id'])
-            lookup_enabled=bool(b and self.store.ready())
+            route=self.store.db.execute('''SELECT
+                EXISTS(SELECT 1 FROM settings WHERE key='membership_target' AND json_extract(value,'$.id')=?),
+                EXISTS(SELECT 1 FROM bindings WHERE mode='lookup' AND chat_id=? AND active=1)
+                AND EXISTS(SELECT 1 FROM bindings WHERE mode='thread' AND active=1)''',(chat['id'],chat['id'])).fetchone()
+            is_target,lookup_enabled=route
             if is_target or lookup_enabled:
                 self.observe_message(msg)
             if lookup_enabled and uid and not edited and not user.get('is_bot'):
                 self.query(msg)
             return
         if chat['type']!='private' or not uid or edited:return
-        if self.store.db.execute('SELECT 1 FROM teachers WHERE user_id=?',(uid,)).fetchone():
+        if self.store.db.execute('SELECT 1 FROM teachers WHERE user_id=? OR (user_id IS NULL AND username=? COLLATE NOCASE)',(uid,user.get('username'))).fetchone():
             self.store.observe(user,msg.get('date',time.time()),create=True)
         pending = None
         try:
@@ -611,6 +614,14 @@ class Bot:
             if kind=='search':
                 found=targets(msg);p=self.resolve(found[0]) if found else self.store.track(text)
                 return self.show_person(uid,p['id'],notice=self.match_notice(found[0]) if found else '')
+            if kind=='addtags':
+                lines=text.splitlines()
+                if len(lines)!=2:raise ValueError('需要两行：备注、标签；不新增填 -。')
+                p=self.store.person(pending[1]);note,tags_=[x.strip() for x in lines]
+                note='\n'.join(filter(None,(p['note'],'' if note=='-' else note)));tags_='、'.join(filter(None,(p['tags'],'' if tags_=='-' else tags_)))
+                self.store.save(p['id'],pending[2],user,note,tags_,'新增标签')
+                self.success(uid, '新增内容已保存，下方显示最新资料。')
+                return self.show_person(uid,p['id'])
             self.store.require_admin(uid)
             if kind=='membertargetset':
                 cid=int(text) if text.lstrip('-').isdigit() else text
@@ -649,14 +660,6 @@ class Bot:
                 tables=data['tables']
                 summary='📥 备份校验通过，尚未导入\n导出时间：%s\n老师：%s · 客户：%s · 车评：%s\n证明图：%s · 绑定：%s · superadmin：%s\n\n⚠️ 确认后整体覆盖当前数据，不合并。预览期间的新数据也将被覆盖。\n✅ 恢复前自动保存原数据；保留当前操作者及 .env 管理员。\n⏸ 恢复后绑定及发布全部暂停，须重新检查，防止旧备份重复发帖。' % (date(data['created']),len(tables['teachers']),len(tables['people']),len(tables['reviews']),len(data.get('media',{})),len(tables['bindings']),len(tables['admins']))
                 return self.panel(uid,summary,[[('确认覆盖并恢复','importconfirm')],[('取消，不改数据','importcancel')]],('importfile',))
-            if kind=='addtags':
-                lines=text.splitlines()
-                if len(lines)!=2:raise ValueError('需要两行：备注、标签；不新增填 -。')
-                p=self.store.person(pending[1]);note,tags_=[x.strip() for x in lines]
-                note='\n'.join(filter(None,(p['note'],'' if note=='-' else note)));tags_='、'.join(filter(None,(p['tags'],'' if tags_=='-' else tags_)))
-                self.store.save(p['id'],pending[2],user,note,tags_,'新增标签')
-                self.success(uid, '新增内容已保存，下方显示最新资料。')
-                return self.show_person(uid,p['id'])
             if kind in ('teachernew','teacherrename'):
                 if len(text.splitlines())!=1:
                     raise ValueError('只需发送一行老师名称；本人账号请在详情中单独绑定。')
@@ -808,18 +811,12 @@ class Bot:
     def observe_message(self, message):
         chat, stamp = message['chat'], message.get('date', time.time())
         if not message.get('sender_chat'):
-            p = self.store.observe(message.get('from', {}), stamp, create=True)
-            if p:
-                self.store.member(p['id'], chat, True, stamp)
+            self.store.observe_member(message.get('from', {}), chat, True, stamp)
         for user in message.get('new_chat_members', []):
-            p = self.store.observe(user, stamp, create=True)
-            if p:
-                self.store.member(p['id'], chat, True, stamp, stamp)
+            self.store.observe_member(user, chat, True, stamp, stamp)
         user = message.get('left_chat_member')
         if user:
-            p = self.store.observe(user, stamp, create=True)
-            if p:
-                self.store.member(p['id'], chat, False, stamp)
+            self.store.observe_member(user, chat, False, stamp)
     def member_update(self, event):
         chat = event['chat']
         if chat.get('type') not in ('group', 'supergroup'):
@@ -829,10 +826,8 @@ class Bot:
         if present is None:
             return
         stamp = event['date']
-        p = self.store.observe(member.get('user', {}), stamp, create=True)
-        if p:
-            joined = stamp if present and member_present(event.get('old_chat_member', {})) is False else None
-            self.store.member(p['id'], chat, present, stamp, joined)
+        joined = stamp if present and member_present(event.get('old_chat_member', {})) is False else None
+        self.store.observe_member(member.get('user', {}), chat, present, stamp, joined)
     def resolve(self, target):
         user, username, stamp, hidden_name = target
         if user:

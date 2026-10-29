@@ -2,6 +2,7 @@
 import io
 import zipfile
 import secrets
+import re
 import base64
 import json
 import math
@@ -104,6 +105,8 @@ def validate_backup(content, bot_id=0, images=None):
                 if not isinstance(rows, list):
                     raise ValueError('数据表格式错误：' + table)
                 for row in rows:
+                    if table=='teachers' and isinstance(row,dict) and 'username' not in row:
+                        row['username']=None
                     if not isinstance(row, dict) or set(row) != set(columns):
                         raise ValueError('数据字段不完整：' + table)
                     for column in info:
@@ -144,6 +147,7 @@ def check_relations(db):
         require(r['user_id'] > 0, '管理员 ID 无效。')
     for t in db.execute('SELECT * FROM teachers'):
         require(t['id'] > 0 and 1 <= len(t['name']) <= 80 and (t['user_id'] is None or t['user_id'] > 0), '老师资料无效。')
+        require(t['username'] is None or isinstance(t['username'],str) and re.fullmatch(r'[a-z][a-z0-9_]{3,31}',t['username']), '老师用户名无效。')
     for r in reviews.values():
         require(r['status'] in ('accepted','pending','rejected','withdrawn') and r['author'] > 0 and r['anonymous'] in (0,1) and r['manual'] in (0,1), '车评状态无效。')
         require((r['status'] in ('pending','rejected')) == (r['expires'] is not None), '审核到期时间不一致。')
@@ -212,27 +216,35 @@ class BackupStore:
                 for row in data['tables'][table]:
                     name=json.loads(row['data']).get('出击证明')
                     if name:names.add(name)
-            data['media']={name:base64.b64encode(self.proof_path(name).read_bytes()).decode('ascii') for name in names}
-            content=json.dumps(data,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode()
-            if not split and len(content)>MAX_BACKUP_BYTES:
-                raise ValueError('含图片的备份超过 15 MB，请在服务器使用 manage.sh backup 完整备份。')
             if split:
                 bundle=secrets.token_hex(16)
-                media=data.pop('media')
                 data['image_bundle']=bundle
-                data['image_files']=sorted(media)
+                data['image_files']=sorted(names)
                 target_setting=self.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
                 data['membership_target']=json.loads(target_setting[0]) if target_setting else None
                 text=json.dumps(data,ensure_ascii=False,separators=(',',':')).encode()
                 if len(text)>MAX_BACKUP_BYTES:raise ValueError('JSON 数据超过 15 MB，请使用服务器完整备份。')
                 buffer=io.BytesIO()
-                with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as archive:
+                # JPEGs already are compressed. Stream files into the archive rather
+                # than base64-encoding the entire collection and decoding it again.
+                with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_STORED) as archive:
                     archive.writestr('manifest.json',json.dumps({'bundle':bundle}))
-                    for name,encoded in media.items():
-                        archive.writestr(name,base64.b64decode(encoded))
+                    total=0
+                    for name in sorted(names):
+                        path=self.proof_path(name)
+                        size=path.stat().st_size
+                        if not 0<size<=10*1024*1024:raise ValueError('本地证明图为空或超过 10 MB。')
+                        total+=size
+                        if total>MAX_IMAGE_TOTAL_BYTES:raise ValueError('图片总量超过恢复限制，请使用服务器完整备份。')
+                        archive.write(path,arcname=name)
+                        if buffer.tell()>MAX_IMAGE_ZIP_BYTES:raise ValueError('图片 ZIP 超过 19 MB，请使用服务器完整备份。')
                 images=buffer.getvalue()
                 if len(images)>MAX_IMAGE_ZIP_BYTES:raise ValueError('图片 ZIP 超过 19 MB，无法通过当前机器人下载接口恢复，请使用服务器完整备份。')
                 return text,images
+            data['media']={name:base64.b64encode(self.proof_path(name).read_bytes()).decode('ascii') for name in names}
+            content=json.dumps(data,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode()
+            if len(content)>MAX_BACKUP_BYTES:
+                raise ValueError('含图片的备份超过 15 MB，请在服务器使用 manage.sh backup 完整备份。')
             return content
         finally:
             target.close()

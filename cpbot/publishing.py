@@ -38,6 +38,7 @@ class Publisher:
         self.s, self.api, self.username, self.bot_id = store, api, username, bot_id
         self.next_global = 0
         self.next_chat = {}
+        self.next_cleanup = 0
         migration = 'summary_body_link_v1'
         if not self.s.db.execute('SELECT 1 FROM settings WHERE key=?', (migration,)).fetchone():
             with self.s.transaction():
@@ -128,9 +129,9 @@ class Publisher:
                         self.rebuild(b['id'], t['id'])
                     # A new daily generation of edit jobs, not a new publication generation.
                     self.s.enqueue('checkpost', b['id'], t['id'], generation=int(local.strftime('%Y%m%d')))
-                    for r in self.s.db.execute("SELECT id FROM reviews WHERE teacher=? AND status='accepted' ORDER BY json_extract(data,'$.时间'),id", (t['id'],)):
+                    for r in self.s.db.execute("SELECT id,data FROM reviews WHERE teacher=? AND status='accepted' ORDER BY json_extract(data,'$.时间'),id", (t['id'],)):
                         self.s.enqueue('check', b['id'], t['id'], r['id'], int(local.strftime('%Y%m%d')))
-                        if json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(r['id'],)).fetchone()[0]).get('出击证明'):
+                        if json.loads(r['data']).get('出击证明'):
                             self.s.enqueue('proof',b['id'],t['id'],r['id'],int(local.strftime('%Y%m%d')))
             self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('last_check',?)", (day,))
 
@@ -150,7 +151,9 @@ class Publisher:
 
     def tick(self):
         now = time.time()
-        self.s.db.execute("DELETE FROM reviews WHERE status IN ('pending','rejected') AND expires<=?", (now,))
+        if time.monotonic() >= self.next_cleanup:
+            self.s.db.execute("DELETE FROM reviews WHERE status IN ('pending','rejected') AND expires<=?", (now,))
+            self.next_cleanup = time.monotonic() + 60
         self.nightly(now)
         paused = self.s.db.execute("SELECT value FROM settings WHERE key='publishing_paused'").fetchone()
         if paused and paused[0] == '1':
@@ -158,9 +161,10 @@ class Publisher:
         if now < self.next_global:
             return
         job = self.s.db.execute('''SELECT j.*,b.mode,b.chat_id,b.discussion FROM jobs j JOIN bindings b ON b.id=j.binding
+            LEFT JOIN reviews r ON r.id=j.review
             WHERE j.state='pending' AND j.due<=? AND b.active=1
             ORDER BY CASE j.kind WHEN 'health' THEN 0 WHEN 'post' THEN 1 WHEN 'checkpost' THEN 2 ELSE 3 END,
-            CASE WHEN j.review=0 THEN '' ELSE COALESCE((SELECT json_extract(data,'$.时间') FROM reviews WHERE id=j.review),'') END,j.review,j.id LIMIT 1''', (now,)).fetchone()
+            CASE WHEN j.review=0 THEN '' ELSE COALESCE(json_extract(r.data,'$.时间'),'') END,j.review,j.id LIMIT 1''', (now,)).fetchone()
         if not job:
             return
         j = dict(job)

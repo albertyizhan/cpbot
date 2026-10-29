@@ -3,7 +3,7 @@ import json
 import re
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 from .reviews import ReviewStore
@@ -35,6 +35,7 @@ class Store(ReviewStore, BackupStore):
                 actor INTEGER NOT NULL,actor_name TEXT NOT NULL,action TEXT NOT NULL,
                 before_value TEXT NOT NULL,after_value TEXT NOT NULL,created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS people_name ON people(name);
+            CREATE INDEX IF NOT EXISTS history_person_id ON history(person,id);
         ''')
 
         self.setup_reviews()
@@ -46,16 +47,24 @@ class Store(ReviewStore, BackupStore):
 
     @contextmanager
     def transaction(self):
-        self.db.execute('BEGIN IMMEDIATE')
+        nested = self.db.in_transaction
+        self.db.execute('SAVEPOINT nested_write' if nested else 'BEGIN IMMEDIATE')
         try:
             yield
-            self.db.execute('COMMIT')
+            self.db.execute('RELEASE nested_write' if nested else 'COMMIT')
         except BaseException:
-            self.db.execute('ROLLBACK')
+            if nested:
+                self.db.execute('ROLLBACK TO nested_write')
+                self.db.execute('RELEASE nested_write')
+            else:
+                self.db.execute('ROLLBACK')
             raise
 
     def allowed(self, uid):
-        return self.admin(uid)
+        return self.admin(uid) or bool(self.db.execute('SELECT 1 FROM teachers WHERE user_id=?',(uid,)).fetchone())
+
+    def require_editor(self, uid):
+        if not self.allowed(uid):raise ValueError('仅已绑定老师和 superadmin 可以修改学生标签。')
 
     def person(self, pid):
         row = self.db.execute('SELECT * FROM people WHERE id=?', (pid,)).fetchone()
@@ -96,8 +105,11 @@ class Store(ReviewStore, BackupStore):
         if not uid or user.get('is_bot'):
             return None
         username = (user.get('username') or '').lower() or None
-        with self.transaction():
-            by_id, by_name = self.lookup(uid), self.lookup(username=username) if username else None
+        with (nullcontext() if self.db.in_transaction else self.transaction()):
+            matches = self.db.execute('SELECT * FROM people WHERE user_id=? OR username=? COLLATE NOCASE',
+                                      (uid, username)).fetchall()
+            by_id = next((dict(p) for p in matches if p['user_id'] == uid), None)
+            by_name = next((dict(p) for p in matches if username and p['username'] and p['username'].lower() == username), None)
             if not by_id and not by_name and not create:
                 return None
             if by_name and by_name['user_id'] not in (None, uid):
@@ -113,23 +125,39 @@ class Store(ReviewStore, BackupStore):
                 cursor = self.db.execute('INSERT INTO people(user_id) VALUES(?)', (uid,))
                 p = self.person(cursor.lastrowid)
             if stamp >= p['observed']:
-                self.db.execute('UPDATE people SET user_id=?,username=?,name=?,observed=? WHERE id=?',
-                                (uid, username, display_name(user), stamp, p['id']))
-            return self.person(p['id'])
+                name = display_name(user)
+                if (p['user_id'],p['username'],p['name'],p['observed']) != (uid,username,name,stamp):
+                    self.db.execute('UPDATE people SET user_id=?,username=?,name=?,observed=? WHERE id=?',
+                                    (uid, username, name, stamp, p['id']))
+                    p.update(user_id=uid,username=username,name=name,observed=stamp)
+            if stamp >= p['observed']:
+                self.identify_teacher(user)
+            return p
 
     def member(self, pid, chat, present, stamp, joined=None):
         self.db.execute('''INSERT INTO memberships VALUES(?,?,?,?,?,?)
             ON CONFLICT(person,chat_id) DO UPDATE SET title=excluded.title,
             joined=COALESCE(excluded.joined,memberships.joined),present=excluded.present,observed=excluded.observed
-            WHERE excluded.observed>=memberships.observed''',
+            WHERE excluded.observed>=memberships.observed AND
+            (excluded.title IS NOT memberships.title OR excluded.present IS NOT memberships.present
+             OR excluded.observed IS NOT memberships.observed
+             OR (excluded.joined IS NOT NULL AND excluded.joined IS NOT memberships.joined))''',
             (pid, chat['id'], chat.get('title', str(chat['id'])), joined, present, stamp))
+
+    def observe_member(self, user, chat, present, stamp, joined=None):
+        # Identity and membership become durable together, with one disk commit.
+        with self.transaction():
+            person = self.observe(user, stamp, create=True)
+            if person:
+                self.member(person['id'], chat, present, stamp, joined)
+            return person
 
     def save(self, pid, version, user, note, tags, action='编辑'):
         if len(note) > 500 or len(tags) > 300:
             raise ValueError('备注最多 500 字，标签最多 300 字。')
         with self.transaction():
             if not self.allowed(user['id']):
-                raise ValueError('仅 superadmin 可以修改标签。')
+                raise ValueError('仅已绑定老师和 superadmin 可以修改标签。')
             p = self.person(pid)
             changed = self.db.execute('UPDATE people SET note=?,tags=?,version=version+1 WHERE id=? AND version=?',
                                       (note, tags, pid, version)).rowcount

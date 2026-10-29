@@ -1,5 +1,6 @@
 """Transactional review domain. Telegram publications are replicas, never source data."""
 import json
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -81,7 +82,17 @@ class ReviewStore:
             UNIQUE(kind,binding,teacher,review,generation));
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor INTEGER NOT NULL,action TEXT NOT NULL,
             detail TEXT NOT NULL,created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS jobs_pending_due ON jobs(due,binding) WHERE state='pending';
+        CREATE INDEX IF NOT EXISTS jobs_open_review ON jobs(binding,teacher,generation,review)
+            WHERE state NOT IN ('done','superseded');
+        CREATE INDEX IF NOT EXISTS reviews_teacher_time ON reviews(teacher,status,json_extract(data,'$.时间'),id);
+        CREATE INDEX IF NOT EXISTS reviews_author_created ON reviews(author,created DESC);
+        CREATE INDEX IF NOT EXISTS reviews_expiry ON reviews(expires) WHERE status IN ('pending','rejected');
+        CREATE INDEX IF NOT EXISTS publications_review ON publications(review,binding,generation);
         ''')
+        if 'username' not in {r['name'] for r in self.db.execute('PRAGMA table_info(teachers)')}:
+            self.db.execute('ALTER TABLE teachers ADD COLUMN username TEXT COLLATE NOCASE')
+        self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS teachers_username ON teachers(username COLLATE NOCASE)')
         with self.transaction():
             if not self.db.execute("SELECT 1 FROM settings WHERE key='admins_initialized'").fetchone():
                 self.db.execute('INSERT OR IGNORE INTO admins VALUES(?)', (self.owner,))
@@ -139,66 +150,75 @@ class ReviewStore:
         try:
             with self.transaction():
                 self.teacher(tid)
-                self.db.execute('UPDATE teachers SET user_id=? WHERE id=?',(uid,tid))
+                self.db.execute('UPDATE teachers SET user_id=?,username=NULL WHERE id=?',(uid,tid))
                 self.log(actor,'绑定老师账号' if uid else '解绑老师账号',tid)
         except sqlite3.IntegrityError:
             raise ValueError('此账号已绑定其他老师，请先解除原绑定。') from None
 
     def parse_teachers(self, actor, text):
-        """Parse name-only or name | ID lines; preview never writes data."""
         self.require_admin(actor)
-        entries = []
-        for line_no, line in enumerate(text.splitlines(), 1):
-            line = line.strip()
-            if not line:
-                continue
-            uid = None
-            if '|' in line or '｜' in line:
-                parts = line.replace('｜', '|').split('|')
-                if len(parts) != 2:
-                    raise ValueError('第 %s 行格式错误，请使用 老师名称 | 数字ID。' % line_no)
-                name, raw = (v.strip() for v in parts)
-                if not raw.isascii() or not raw.isdigit() or not 0 < int(raw) < 2**63:
-                    raise ValueError('第 %s 行需要有效的 Telegram 数字 ID。' % line_no)
-                uid = int(raw)
+        entries=[]
+        for number,line in enumerate(text.splitlines(),1):
+            line=line.strip()
+            if not line:continue
+            if any(sep in line for sep in ('|','｜','+','＋')):
+                parts=[p.strip() for p in re.split(r'[|｜+＋]',line)]
+                if len(parts)>3:raise ValueError('第 %s 行字段过多。'%number)
+                name=parts[0];extras=parts[1:]
             else:
-                parts = line.rsplit(None, 1)
-                if len(parts) == 2 and parts[1].isascii() and parts[1].isdigit():
-                    name, raw = parts
-                    uid = int(raw)
+                parts=line.split();extras=[]
+                while len(parts)>1 and (parts[-1].startswith('@') or parts[-1].isascii() and parts[-1].isdigit()):
+                    extras.insert(0,parts.pop())
+                name=' '.join(parts)
+            username=None;uid=None
+            for value in extras:
+                if not value:continue
+                if value.isascii() and value.isdigit():
+                    if uid is not None:raise ValueError('第 %s 行有多个 ID。'%number)
+                    uid=int(value)
                 else:
-                    name = line
-            entries.append((name.strip(), uid))
+                    value=value.lstrip('@').lower()
+                    if username is not None or not re.fullmatch(r'[a-z][a-z0-9_]{3,31}',value):
+                        raise ValueError('第 %s 行用户名无效。'%number)
+                    username=value
+            entries.append((name,uid,username))
         self.validate_teachers(entries)
         return entries
 
     def validate_teachers(self, entries):
-        if not 1 <= len(entries) <= 100:
-            raise ValueError('每批请填写 1～100 位老师，每行一位。')
-        names, accounts = set(), set()
-        for index, (name, uid) in enumerate(entries, 1):
-            if not 1 <= len(name) <= 80 or '\n' in name or (uid is not None and (type(uid) is not int or not 0 < uid < 2**63)):
-                raise ValueError('第 %s 位老师名称或数字 ID 无效。' % index)
-            if name in names or self.db.execute('SELECT 1 FROM teachers WHERE name=?', (name,)).fetchone():
-                raise ValueError('第 %s 位「%s」名称重复，请修改后重新预览；不会覆盖已有老师。' % (index, name))
-            if uid is not None and (uid in accounts or self.db.execute('SELECT 1 FROM teachers WHERE user_id=?', (uid,)).fetchone()):
-                raise ValueError('第 %s 位的账号 %s 已绑定或在本批中重复。' % (index, uid))
-            names.add(name)
-            if uid is not None:
-                accounts.add(uid)
+        if not 1<=len(entries)<=100:raise ValueError('每批请填写 1～100 位老师，每行一位。')
+        names,accounts,usernames=set(),set(),set()
+        for index,entry in enumerate(entries,1):
+            name,uid=entry[:2];username=entry[2] if len(entry)>2 else None
+            if not 1<=len(name)<=80 or '\n' in name or (uid is not None and (type(uid) is not int or not 0<uid<2**63)):
+                raise ValueError('第 %s 位老师名称或数字 ID 无效。'%index)
+            if username is not None and (not isinstance(username,str) or not re.fullmatch(r'[a-z][a-z0-9_]{3,31}',username)):
+                raise ValueError('第 %s 位用户名无效。'%index)
+            if name in names or self.db.execute('SELECT 1 FROM teachers WHERE name=?',(name,)).fetchone():
+                raise ValueError('第 %s 位名称重复，不会覆盖已有老师。'%index)
+            if uid is not None and (uid in accounts or self.db.execute('SELECT 1 FROM teachers WHERE user_id=?',(uid,)).fetchone()):
+                raise ValueError('第 %s 位账号 ID 已绑定或重复。'%index)
+            if username and (username in usernames or self.db.execute('SELECT 1 FROM teachers WHERE username=? COLLATE NOCASE',(username,)).fetchone()):
+                raise ValueError('第 %s 位用户名已登记或重复。'%index)
+            names.add(name);accounts.add(uid);usernames.add(username)
 
     def import_teachers(self, actor, entries):
         with self.transaction():
-            self.require_admin(actor)
-            self.validate_teachers(entries)
-            ids = []
-            for name, uid in entries:
-                tid = self.db.execute('INSERT INTO teachers(name,user_id) VALUES(?,?)', (name, uid)).lastrowid
-                ids.append(tid)
-                self.log(actor, '批量添加老师', tid)
+            self.require_admin(actor);self.validate_teachers(entries)
+            ids=[]
+            for entry in entries:
+                name,uid=entry[:2];username=entry[2] if len(entry)>2 else None
+                tid=self.db.execute('INSERT INTO teachers(name,user_id,username) VALUES(?,?,?)',(name,uid,username)).lastrowid
+                ids.append(tid);self.log(actor,'批量添加老师',tid)
                 for b in self.db.execute("SELECT id FROM bindings WHERE mode='thread'"):
-                    self.ensure_post(b['id'], tid)
+                    self.ensure_post(b['id'],tid)
             return ids
+
+    def identify_teacher(self, user):
+        uid=user.get('id');username=(user.get('username') or '').lower()
+        if not uid or user.get('is_bot') or not username:return
+        changed=self.db.execute("UPDATE teachers SET user_id=? WHERE user_id IS NULL AND username=? COLLATE NOCASE AND NOT EXISTS(SELECT 1 FROM teachers WHERE user_id=?)",(uid,username,uid)).rowcount
+        if changed:self.log(uid,'用户名自动绑定老师账号',username)
 
     def rename_teacher(self, actor, tid, name):
         self.require_admin(actor)
@@ -278,14 +298,16 @@ class ReviewStore:
         self.db.execute('INSERT OR IGNORE INTO jobs(kind,binding,teacher,review,generation) VALUES(?,?,?,?,?)',
                         (kind, bid, tid, rid, generation))
 
-    def ensure_post(self, bid, tid):
+    def ensure_post(self, bid, tid, backfill=True):
         self.db.execute('INSERT OR IGNORE INTO posts(binding,teacher) VALUES(?,?)', (bid, tid))
         p = self.db.execute('SELECT * FROM posts WHERE binding=? AND teacher=?', (bid, tid)).fetchone()
         if not p['message']:
             self.enqueue('post', bid, tid, generation=p['generation'])
-        for r in self.db.execute("SELECT id FROM reviews WHERE teacher=? AND status='accepted' ORDER BY json_extract(data,'$.时间'),id", (tid,)):
+        if not backfill:
+            return p
+        for r in self.db.execute("SELECT id,data FROM reviews WHERE teacher=? AND status='accepted' ORDER BY json_extract(data,'$.时间'),id", (tid,)):
             self.enqueue('comment', bid, tid, r['id'], p['generation'])
-            if json.loads(self.db.execute('SELECT data FROM reviews WHERE id=?',(r['id'],)).fetchone()[0]).get('出击证明'):
+            if json.loads(r['data']).get('出击证明'):
                 self.enqueue('proof', bid, tid, r['id'], p['generation'])
         return p
 
@@ -293,7 +315,12 @@ class ReviewStore:
         r = self.db.execute('SELECT * FROM reviews WHERE id=?', (rid,)).fetchone()
         for b in self.db.execute("SELECT * FROM bindings WHERE mode IN ('thread','feed')"):
             if b['mode'] == 'thread':
-                self.ensure_post(b['id'], r['teacher'])
+                # Binding/rebuild/nightly own historical reconciliation. New submissions
+                # only enqueue themselves; otherwise N reviews cause O(N²) inserts.
+                p = self.ensure_post(b['id'], r['teacher'], backfill=False)
+                self.enqueue('comment', b['id'], r['teacher'], rid, p['generation'])
+                if json.loads(r['data']).get('出击证明'):
+                    self.enqueue('proof', b['id'], r['teacher'], rid, p['generation'])
             else:
                 self.enqueue('feed', b['id'], r['teacher'], rid)
                 if json.loads(r['data']).get('出击证明'):

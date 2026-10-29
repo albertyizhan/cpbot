@@ -198,6 +198,47 @@ class Tests(unittest.TestCase):
         self.recovery_paths.append(Path(recovery))
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM reviews').fetchone()[0],1)
 
+    def test_observation_atomicity_and_query_budget(self):
+        self.s.db.execute("INSERT INTO settings VALUES('membership_target',?)",(json.dumps({'id':-10055,'title':'目标群'}),))
+        self.bot.message(message(uid=50,cid=-10055))
+        trace=[];self.s.db.set_trace_callback(trace.append)
+        before=self.s.db.total_changes
+        self.bot.message(message(uid=50,cid=-10055))
+        self.assertEqual(self.s.db.total_changes,before)
+        self.assertLessEqual(len(trace),6)
+        self.assertEqual(sum(q=='COMMIT' for q in trace),1)
+        self.s.db.set_trace_callback(None)
+        self.s.db.execute("CREATE TRIGGER fail_member BEFORE INSERT ON memberships WHEN NEW.chat_id=-10066 BEGIN SELECT RAISE(ABORT,'test'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.s.observe_member({'id':70,'username':'atomic_user'},{'id':-10066},True,100)
+        self.assertIsNone(self.s.lookup(user_id=70))
+        self.assertIsNone(self.s.lookup(username='atomic_user'))
+        self.s.observe_member({'id':50,'username':'new_user'},{'id':-10055},False,time.time()+10)
+        self.assertEqual(self.s.lookup(username='new_user')['user_id'],50)
+        self.assertIsNone(self.s.lookup(username='customer'))
+
+    def test_new_review_queue_cost_independent_of_history(self):
+        rid,_=self.submit()
+        for n in range(100):
+            self.s.db.execute("INSERT INTO reviews(author,identity,teacher,data,anonymous,status,created,submission) SELECT author,identity,teacher,data,anonymous,status,created,? FROM reviews WHERE id=?",('history'+str(n),rid))
+        trace=[];self.s.db.set_trace_callback(trace.append)
+        self.s.enqueue_review(rid)
+        self.s.db.set_trace_callback(None)
+        self.assertLessEqual(len(trace),10)
+        self.assertEqual(sum(q.startswith('INSERT OR IGNORE INTO jobs') for q in trace),3)
+        self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='comment'").fetchone()[0],1)
+        # Full backfill remains available for a new target or reconciliation.
+        self.s.ensure_post(self.bid,self.tid)
+        self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='comment'").fetchone()[0],101)
+
+    def test_queue_indices_and_cleanup_interval(self):
+        plan=' '.join(str(tuple(r)) for r in self.s.db.execute("EXPLAIN QUERY PLAN SELECT * FROM jobs WHERE state='pending' AND due<=0"))
+        self.assertIn('jobs_pending_due',plan)
+        trace=[];self.s.db.set_trace_callback(trace.append)
+        self.bot.publisher.tick();self.bot.publisher.tick()
+        self.s.db.set_trace_callback(None)
+        self.assertEqual(sum(q.startswith('DELETE FROM reviews') for q in trace),1)
+
     def test_target_silent_observation_separate_from_lookup(self):
         self.s.db.execute("INSERT INTO settings VALUES('membership_target',?)",(json.dumps({'id':-10055,'title':'目标群'}),))
         before=len(self.api.calls)
@@ -573,6 +614,48 @@ class Tests(unittest.TestCase):
         self.click('返回草稿')
         self.assertIn('车评草稿',self.api.calls[-2][1]['text'])
 
+    def test_teacher_username_pending_binding_and_editor_permissions(self):
+        entries=self.s.parse_teachers(1,'乙+@teacher_b\n丙 | @teacher_c | 80\n丁 | 90\n戊')
+        ids=self.s.import_teachers(1,entries)
+        self.assertIsNone(self.s.teacher(ids[0])['user_id'])
+        self.assertFalse(self.s.allowed(70))
+        p=self.s.track('100')
+        with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':70},'','x')
+        self.bot.message(message(uid=70,text='/start') | {'from':{'id':70,'username':'Teacher_B'}})
+        self.assertEqual(self.s.teacher(ids[0])['user_id'],70)
+        self.assertTrue(self.s.allowed(70))
+        self.bot.action({'id':70},'edit:%s'%p['id'])
+        self.bot.message(message(uid=70,text='备注\n标签') | {'from':{'id':70,'username':'Teacher_B'}})
+        self.assertEqual(self.s.person(p['id'])['tags'],'标签')
+        with self.assertRaises(ValueError):self.bot.action({'id':70},'admin')
+        with self.assertRaises(ValueError):self.s.set_admin(70,100)
+        self.bot.action({'id':70},'askdelete:%s'%p['id'])
+        self.bot.action({'id':70},'delete:%s:1'%p['id'])
+        self.assertEqual(self.s.person(p['id'])['tags'],'')
+        self.bot.message(message(uid=71,text='/start') | {'from':{'id':71,'username':'Teacher_B'}})
+        self.assertEqual(self.s.teacher(ids[0])['user_id'],70)
+        self.assertFalse(self.s.allowed(71))
+        self.s.set_teacher_account(1,ids[0],None)
+        self.bot.message(message(uid=70,text='/start') | {'from':{'id':70,'username':'Teacher_B'}})
+        self.assertFalse(self.s.allowed(70))
+        self.assertIsNone(self.s.teacher(ids[0])['user_id'])
+        validate_backup(self.s.export(99),99)
+
+    def test_teacher_auto_binding_target_group_and_conflicts(self):
+        ids=self.s.import_teachers(1,self.s.parse_teachers(1,'乙 | @pending_a\n丙 | @pending_b'))
+        self.s.db.execute("INSERT INTO settings VALUES('membership_target',?)",(json.dumps({'id':-10055,'title':'目标'}),))
+        self.bot.message(message(uid=75,cid=-10055,text='发言') | {'from':{'id':75,'username':'pending_a'}})
+        self.assertEqual(self.s.teacher(ids[0])['user_id'],75)
+        self.bot.message(message(uid=75,cid=-10055,text='换名') | {'from':{'id':75,'username':'pending_b'}})
+        self.assertIsNone(self.s.teacher(ids[1])['user_id'])
+        self.s.bind(1,'lookup',{'id':-10044,'title':'内部群'})
+        self.bot.message(message(uid=76,cid=-10044,text='发言') | {'from':{'id':76,'username':'pending_b'}})
+        self.assertEqual(self.s.teacher(ids[1])['user_id'],76)
+        with self.assertRaises(ValueError):self.s.parse_teachers(1,'其他 | @PENDING_A')
+        old=json.loads(self.s.export(99))
+        for teacher in old['tables']['teachers']:teacher.pop('username')
+        validate_backup(json.dumps(old).encode(),99)
+
     def test_teacher_batch_preview_confirm_and_teacher_codes(self):
         self.bot.action({'id':1},'teacherbatch')
         self.bot.message(message(uid=1,text='老师乙\n老师丙 | 30\n老师丁 40'))
@@ -603,7 +686,7 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):self.bot.action({'id':2},'teacherbatch')
         self.bot.action({'id':1},'teacherbatch')
         self.bot.message(message(uid=1,text='老师乙 | abc'))
-        self.assertIn('数字 ID',self.api.calls[-1][1]['text'])
+        self.assertIn('无效',self.api.calls[-1][1]['text'])
         self.bot.message(message(uid=1,text='老师乙\n老师丙 | 30'))
         self.s.save_teacher(1,'其他老师',30)
         self.click('确认导入全部 2 位',uid=1)
