@@ -1,331 +1,198 @@
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
+from cpbot.__main__ import admin_ids
 from cpbot.api import APIError
 from cpbot.bot import Bot
 from cpbot.identity import targets
+from cpbot.publishing import render_review
+from cpbot.reviews import TZ, SCORES
 from cpbot.store import Store
 
 
 class FakeAPI:
     def __init__(self):
-        self.calls = []
-        self.error = None
+        self.calls=[];self.failure=None;self.mid=100
+    def call(self,method,**params):
+        self.calls.append((method,params))
+        if self.failure and method in ('sendMessage','editMessageText'):
+            failure=self.failure;self.failure=None;raise failure
+        if method=='getChat':
+            cid=params['chat_id']
+            return {'id':cid,'type':'channel' if cid in (-10011,-10033) else 'supergroup','title':str(cid),'linked_chat_id':-10022 if cid==-10011 else -10011}
+        if method=='getChatMember':return {'status':'administrator','can_post_messages':True,'can_edit_messages':True,'user':{'id':params['user_id']}}
+        self.mid+=1;return {'message_id':self.mid}
+    def document(self,uid,name,content):self.calls.append(('document',{'uid':uid,'content':content}))
 
-    def call(self, method, **params):
-        self.calls.append((method, params))
-        if method == 'getChatMember':
-            if self.error:
-                raise APIError(self.error)
-            return {'status': 'member', 'user': {'id': params['user_id'], 'first_name': '目标', 'username': 'target_a'}}
-        return {'message_id': len(self.calls)}
 
-
-def message(uid=2, text='', group=False, **extra):
-    return {'from': {'id': uid, 'first_name': '用户%s' % uid},
-            'chat': {'id': -100 if group else uid, 'type': 'supergroup' if group else 'private', 'title': '小群'},
-            'text': text, 'date': int(time.time()), 'message_id': 10, **extra}
+def message(uid=2,text='',cid=None,**extra):
+    return {'from':{'id':uid,'first_name':'客户','username':'customer'},'text':text,'message_id':20,'date':int(time.time()),
+            'chat':{'id':cid or uid,'type':'supergroup' if cid else 'private','title':'群'},**extra}
 
 
 class Tests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.path = str(Path(self.temp.name) / 'db.sqlite3')
-        self.store = Store(self.path, 1)
-        self.api = FakeAPI()
-        self.bot = Bot(self.store, self.api, 'review_bot')
-        self.store.password_set(1, 'test-password')
-
+        # Explicit paths, no recursive cleanup.
+        self.path=Path(tempfile.gettempdir())/('cpbot-test-%s.sqlite3'%time.time_ns())
+        self.s=Store(str(self.path),1);self.api=FakeAPI();self.bot=Bot(self.s,self.api,'review_bot',99)
+        self.tid=self.s.save_teacher(1,'老师甲',10)
+        self.bid=self.s.bind(1,'thread',{'id':-10011,'title':'专帖'},-10022)
+        self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('last_check',?)",(datetime.now(TZ).strftime('%Y-%m-%d'),))
     def tearDown(self):
-        self.store.db.close()
-        self.temp.cleanup()
-
-    def grant(self, uid=2):
-        self.store.unlock({'id': uid, 'first_name': '编辑者'}, 'test-password')
-
-    def click(self, label, uid=2, data=None):
+        self.s.db.close()
+        for suffix in ('','-wal','-shm'):
+            path=Path(str(self.path)+suffix)
+            if path.exists():path.unlink()
+    def draft(self,uid=2,code='abc',token='token',stamp='2026-10-01 10:00'):
+        d={'时间':stamp,'老师':self.tid,'留名':code,'人照':'符合','过程':'完整文字评价','匿名':True,**{f:8 for f in SCORES}}
+        self.s.save_draft(uid,d,token);return d
+    def submit(self,uid=2,code='abc',token='token',stamp='2026-10-01 10:00'):
+        self.draft(uid,code,token,stamp)
+        return self.s.submit({'id':uid,'username':'customer'},token)
+    def tick(self,n=1):
+        for _ in range(n):
+            self.bot.publisher.next_global=0;self.bot.publisher.next_chat={}
+            self.s.db.execute("UPDATE jobs SET due=0 WHERE state='pending'")
+            self.bot.publisher.tick()
+    def forward(self):
+        post=self.s.db.execute('SELECT * FROM posts').fetchone()
+        self.bot.handle({'message':message(cid=-10022,is_automatic_forward=True,
+            forward_origin={'type':'channel','chat':{'id':-10011},'message_id':post['message']})})
+    def click(self,label,uid=2,data=None):
         if data is None:
-            keyboard = [p['reply_markup'] for m, p in self.api.calls if m == 'sendMessage'][-1]['inline_keyboard']
-            data = next(b['callback_data'] for row in keyboard for b in row if b['text'] == label)
-        self.bot.handle({'callback_query': {'id': 'cb', 'from': {'id': uid, 'first_name': '编辑者'},
-                                          'message': {'chat': {'id': uid, 'type': 'private'}}, 'data': data}})
+            panels=[p for m,p in self.api.calls if m in ('sendMessage','editMessageText') and 'reply_markup' in p]
+            data=next(b['callback_data'] for row in panels[-1]['reply_markup']['inline_keyboard'] for b in row if b['text']==label)
+        self.bot.handle({'callback_query':{'id':'cb','from':{'id':uid},'message':{'chat':{'id':uid,'type':'private'},'message_id':100},'data':data}})
         return data
-
-    def test_private_password_edit_delete_history_flow(self):
-        self.bot.message(message(text='/start'))
-        self.click('🔎 查找人员')
-        self.bot.message(message(text='@target_a'))
-        self.click('编辑标签')
-        self.bot.message(message(text='test-password'))
-        self.assertTrue(self.store.allowed(2))
-        p = self.store.lookup(username='target_a')
-        self.bot.message(message(text='统一备注\n已记录'))
-        p = self.store.person(p['id'])
-        self.assertEqual((p['note'], p['tags']), ('统一备注', '已记录'))
-        self.click('删除标签')
-        self.click('确认删除')
-        p = self.store.person(p['id'])
-        self.assertEqual((p['note'], p['tags']), ('统一备注', ''))
-        self.click('修改记录')
-        self.click('查看记录 #2')
-        self.assertIn('已记录', self.api.calls[-2][1]['text'])
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM history').fetchone()[0], 2)
-
-    def test_public_group_query_and_shared_across_groups(self):
-        self.bot.message(message(text='@target_a', group=True))
-        self.assertIn('Telegram ID：待识别', self.api.calls[-1][1]['text'])
-        self.assertFalse(self.store.allowed(2))
-        self.grant()
-        self.bot.message(message(text='@target_a', group=True))
-        first = self.store.lookup(username='target_a')
-        self.store.save(first['id'], 0, {'id': 2}, '共同备注', '共同标签')
-        other = message(text='@target_a', group=True)
-        other['chat']['id'] = -200
-        self.bot.message(other)
-        sent = self.api.calls[-1][1]
-        self.assertIn('共同标签', sent['text'])
-        self.assertEqual([b['text'] for b in sent['reply_markup']['inline_keyboard'][0]], ['编辑标签', '删除标签'])
-        self.assertIn('start=delete_', sent['reply_markup']['inline_keyboard'][0][1]['url'])
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM people WHERE username=?', ('target_a',)).fetchone()[0], 1)
-
-    def test_forward_hidden_and_private_deep_links_require_auth(self):
-        self.bot.message(message(text='/start edit_1'))
-        self.assertFalse(self.store.allowed(2))
-        self.grant()
-        self.bot.message(message(group=True, forward_origin={'type': 'hidden_user', 'sender_user_name': '某人'}))
-        self.assertIn('隐藏', self.api.calls[-1][1]['text'])
-        self.bot.message(message(group=True, forward_origin={'type': 'user', 'date': 10,
-                                 'sender_user': {'id': 50, 'first_name': '旧名', 'username': 'target_a'}}))
-        p = self.store.lookup(user_id=50)
-        self.assertEqual(p['name'], '目标')
-        self.bot.message(message(text='/start delete_%s' % p['id']))
-        self.assertIn('确定删除', self.api.calls[-1][1]['text'])
-
-    def test_public_private_queries_and_password_only_on_edit(self):
-        self.bot.message(message(text='/start'))
-        self.click('📋 浏览车评')
-        self.bot.message(message(forward_origin={'type': 'user', 'date': 100,
-            'sender_user': {'id': 50, 'first_name': 'ya'}}))
-        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
-        self.assertFalse(self.store.allowed(2))
-        self.click('编辑标签')
-        self.assertIn('编辑密码', self.api.calls[-2][1]['text'])
-        self.bot.message(message(text='wrong'))
-        self.assertFalse(self.store.allowed(2))
-        self.assertEqual(self.store.person(1)['version'], 0)
-        self.bot.message(message(text='test-password'))
-        self.assertEqual(self.bot.sessions[2]['pending'][0], 'edit')
-        self.bot.message(message(text='备注\n标签'))
-        self.assertEqual(self.store.lookup(user_id=50)['tags'], '标签')
-        self.store.revoke(1, 2)
-        self.bot.message(message(text='/start delete_1'))
-        self.assertIn('编辑密码', self.api.calls[-1][1]['text'])
-        self.bot.message(message(text='test-password'))
-        self.assertIn('确定删除', self.api.calls[-1][1]['text'])
-        self.click('确认删除')
-        self.assertEqual(self.store.lookup(user_id=50)['tags'], '')
-        self.store.revoke(1, 2)
-        self.bot.message(message(text='50'))
-        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
-
-    def test_username_recycling_never_transfers_marks(self):
-        self.grant()
-        p = self.store.track('@target_a')
-        self.store.save(p['id'], 0, {'id': 2}, '原备注', '原标签')
-        self.store.observe({'id': 50, 'username': 'target_a', 'first_name': '原用户'}, 100, True)
-        other = self.store.observe({'id': 51, 'username': 'target_a', 'first_name': '新用户'}, 200, True)
-        self.assertEqual(other['tags'], '')
-        self.assertEqual(self.store.lookup(user_id=50)['tags'], '原标签')
-        self.assertIsNone(self.store.lookup(user_id=50)['username'])
-        self.store.observe({'id': 50, 'username': 'target_a'}, 50, True)
-        self.assertEqual(self.store.lookup(username='target_a')['user_id'], 51)
-
-    def test_no_username_forward_reply_and_text_mention(self):
-        self.grant()
-        user = {'id': 50, 'first_name': '没有用户名'}
-        fixtures = [
-            {'forward_origin': {'type': 'user', 'date': 100, 'sender_user': user}},
-            {'forward_from': user, 'forward_date': 100},
-            {'reply_to_message': {'from': user, 'date': 100, 'text': '你好'}},
-            {'entities': [{'type': 'text_mention', 'offset': 0, 'length': 2, 'user': user}]},
-            {'caption': '某人', 'caption_entities': [{'type': 'text_mention', 'offset': 0, 'length': 2, 'user': user}]},
-        ]
-        for fixture in fixtures:
-            with self.subTest(fixture=fixture):
-                self.bot.triggers.clear()
-                self.api.calls.clear()
-                # Return Telegram member data without supplying a fake username.
-                original_call = self.api.call
-                def call(method, **params):
-                    if method == 'getChatMember':
-                        return {'status': 'member', 'user': user}
-                    return original_call(method, **params)
-                self.api.call = call
-                try:
-                    self.bot.message(message(group=True, text='查询', **fixture))
-                finally:
-                    self.api.call = original_call
-                sent = self.api.calls[-1][1]
-                self.assertIn('Telegram ID：50', sent['text'])
-                self.assertIn('用户名：未知 / 未设置', sent['text'])
-                self.assertEqual(len(sent['reply_markup']['inline_keyboard'][0]), 2)
-        self.assertIsNone(self.store.lookup(user_id=50)['username'])
-
-    def test_public_reply_identity_dedup_and_anonymous_sender(self):
-        user = {'id': 50, 'first_name': '没有用户名'}
-        reply = {'from': user, 'date': 100}
-        self.bot.message(message(group=True, text='查询', reply_to_message=reply))
-        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
-        self.assertIsNotNone(self.store.lookup(user_id=50))
-        found = targets(message(reply_to_message=reply, forward_origin={'type': 'user', 'date': 100, 'sender_user': user}))
-        self.assertEqual(len(found), 1)
-        self.assertEqual(targets(message(reply_to_message={**reply, 'sender_chat': {'id': -100}})), [])
-        self.assertEqual(targets(message(reply_to_message={'from': {'id': 99, 'is_bot': True}})), [])
-
-    def test_hidden_name_unique_match_group_and_private_search(self):
-        self.grant()
-        p = self.store.observe({'id': 50, 'first_name': '情到深处'}, 100, True)
-        self.store.save(p['id'], 0, {'id': 2}, '已核实备注', '已有标签')
-        origin = {'type': 'hidden_user', 'sender_user_name': '情到深处'}
-        self.api.error = 403
-        self.bot.message(message(group=True, forward_origin=origin))
-        sent = self.api.calls[-1][1]
-        self.assertIn('按转发名称「情到深处」匹配', sent['text'])
-        self.assertIn('身份尚未确认', sent['text'])
-        self.assertIn('已有标签', sent['text'])
-        self.assertEqual(len(sent['reply_markup']['inline_keyboard'][0]), 2)
-        before = self.store.person(p['id'])
-        self.bot.message(message(forward_sender_name='情到深处'))
-        self.assertIn('按转发名称', self.api.calls[-1][1]['text'])
-        self.bot.action({'id': 2}, 'search')
-        self.bot.message(message(forward_origin=origin))
-        self.assertIn('按转发名称', self.api.calls[-1][1]['text'])
-        self.assertEqual(self.store.person(p['id']), before)
-
-    def test_hidden_duplicate_names_request_privacy_change_without_selecting(self):
-        self.grant()
-        for uid in (50, 51):
-            self.store.observe({'id': uid, 'first_name': '情到深处'}, 100, True)
-        before = self.store.db.total_changes
-        self.bot.message(message(forward_origin={'type': 'hidden_user', 'sender_user_name': '情到深处'}))
-        sent = self.api.calls[-1][1]
-        self.assertIn('多个名称', sent['text'])
-        self.assertIn('隐私与安全 → 转发消息', sent['text'])
-        self.assertEqual(sent['reply_markup']['inline_keyboard'], [])
-        self.assertEqual(self.store.db.total_changes, before)
-        # A visible numeric identity still wins when display names collide.
-        self.bot.message(message(forward_origin={'type': 'user', 'date': 100,
-            'sender_user': {'id': 50, 'first_name': '情到深处'}}))
-        self.assertIn('Telegram ID：50', self.api.calls[-1][1]['text'])
-
-    def test_hidden_name_exact_match_no_fabricated_identity_and_auth(self):
-        self.store.observe({'id': 50, 'first_name': '情到深处'}, 100, True)
-        for name in ('情到', '', '情到深处 '):
-            with self.assertRaisesRegex(ValueError, '未找到同名'):
-                self.bot.resolve(targets(message(forward_origin={'type': 'hidden_user', 'sender_user_name': name}))[0])
-        self.bot.message(message(group=True, forward_origin={'type': 'hidden_user', 'sender_user_name': '情到深处'}))
-        self.assertIn('按转发名称', self.api.calls[-1][1]['text'])
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM people WHERE user_id=50').fetchone()[0], 1)
-
-    def test_unresolved_and_confirmed_records_keep_separate_marks(self):
-        self.grant()
-        a, b = self.store.track('50'), self.store.track('@target_a')
-        self.store.save(a['id'], 0, {'id': 2}, '甲', 'A')
-        self.store.save(b['id'], 0, {'id': 2}, '乙', 'B')
-        self.store.observe({'id': 50, 'username': 'target_a'}, 100, True)
-        self.assertEqual(self.store.person(a['id'])['tags'], 'A')
-        self.assertEqual(self.store.person(b['id'])['tags'], 'B')
-        self.assertIsNone(self.store.person(b['id'])['username'])
-
-    def test_two_connections_concurrent_version_and_atomic_history(self):
-        self.grant()
-        p = self.store.track('50')
-        second = Store(self.path, 1)
-        try:
-            self.store.save(p['id'], 0, {'id': 2}, '先提交', '标签')
-            with self.assertRaisesRegex(ValueError, '别人修改'):
-                second.save(p['id'], 0, {'id': 2}, '后提交', '覆盖')
-            self.assertEqual(second.person(p['id'])['note'], '先提交')
-            self.assertEqual(second.db.execute('SELECT count(*) FROM history').fetchone()[0], 1)
-        finally:
-            second.db.close()
-
-    def test_revoke_old_button_expiry_and_replayed_confirmation(self):
-        self.grant()
-        p = self.store.track('50')
-        self.bot.show_person(2, p['id'])
-        self.click('编辑标签')
-        self.store.revoke(1, 2)
-        self.bot.message(message(text='不应写入\n不应写入'))
-        self.assertEqual(self.store.person(p['id'])['version'], 0)
-        self.grant()
-        self.bot.show_person(2, p['id'], 'delete')
-        data = self.click('确认删除')
-        self.click('', data=data)
-        self.assertEqual(self.store.person(p['id'])['version'], 1)
+    def test_normal_form_codes_publish_links_scores(self):
+        self.s.add_codes(10,self.tid,['abc'])
+        self.bot.message(message(text='/start review_1'))
+        self.assertEqual(self.s.draft(2)[0]['老师'],self.tid)
+        d=self.draft();self.bot.action({'id':2},'field:综合');self.click('10')
+        self.assertEqual(self.s.draft(2)[0]['综合'],10)
+        self.bot.action({'id':2},'submit')
+        r=self.s.db.execute('SELECT * FROM reviews').fetchone();self.assertEqual(r['status'],'accepted')
+        self.tick();self.forward();self.tick(3)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM publications').fetchone()[0],1)
+        self.assertIn('10.0 / 10',self.bot.publisher.summary(self.tid)[0])
+        self.bot.action({'id':2},'mine:0')
+        self.assertIn('https://t.me/c/22/',str(self.api.calls[-1]))
+        self.assertNotIn('customer',render_review(self.s,r))
+        data=self.click('返回主菜单');self.click('',data=data)
         self.assertTrue(self.api.calls[-1][1]['show_alert'])
-        self.bot.home(2)
-        self.bot.sessions[2]['until'] = 0
-        self.click('📋 浏览车评')
-        self.assertTrue(self.api.calls[-1][1]['show_alert'])
-
-    def test_password_rate_limit_rotation_persistence_and_admin_only(self):
-        for _ in range(5):
-            with self.assertRaisesRegex(ValueError, '不正确'):
-                self.store.unlock({'id': 3}, 'wrong')
-        with self.assertRaisesRegex(ValueError, '10 分钟'):
-            self.store.unlock({'id': 3}, 'test-password')
-        self.grant()
-        self.store.password_set(1, 'new-password')
-        second = Store(self.path, 1)
+    def test_concurrent_code_consumption_and_reuse(self):
+        self.s.add_codes(10,self.tid,['abc'])
+        with self.assertRaises(ValueError):self.s.add_codes(1,self.tid,['abc'])
+        self.draft();self.draft(3,token='other')
+        other=Store(str(self.path),1)
         try:
-            self.assertTrue(second.allowed(2))
-            self.assertTrue(second.allowed(1))
-            with self.assertRaises(ValueError):
-                second.password_set(2, 'hijacked-password')
-            with self.assertRaises(ValueError):
-                second.revoke(2, 1)
-            value = second.db.execute("SELECT value FROM settings WHERE key='password'").fetchone()[0]
-            self.assertNotIn('new-password', value)
-        finally:
-            second.db.close()
+            self.assertEqual(self.s.submit({'id':2},'token')[1],'accepted')
+            self.assertEqual(other.submit({'id':3},'other')[1],'pending')
+            self.assertEqual(self.s.submit({'id':2},'token')[0],1)
+        finally:other.db.close()
+        self.s.add_codes(1,self.tid,['abc'])
+        self.s.moderate(1,2,True)
+        self.assertEqual(self.s.db.execute("SELECT count(*) FROM codes WHERE state='open'").fetchone()[0],1)
+        with self.assertRaises(ValueError):self.s.moderate(1,2,True)
+    def test_permissions_global_tags_and_group_opt_in(self):
+        self.assertFalse(self.s.allowed(2))
+        # Old password grants do not confer superadmin rights.
+        self.s.db.execute("INSERT INTO grants VALUES(2,'old',0)");self.assertFalse(self.s.allowed(2))
+        p=self.s.track('50')
+        with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':2},'','bad')
+        self.s.set_admin(1,2);self.s.save(p['id'],0,{'id':2},'备注','鸽子')
+        self.bot.message(message(text='@target_a',cid=-10044));self.assertEqual(len(self.api.calls),0)
+        self.s.bind(1,'lookup',{'id':-10044,'title':'内群'})
+        self.bot.message(message(text='查询',cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
+        self.assertIn('鸽子',str(self.api.calls[-1]));self.assertIn('新增',str(self.api.calls[-1]))
+        self.s.set_admin(1,2,False)
+        with self.assertRaises(ValueError):self.bot.action({'id':2},'edit:%s'%p['id'])
+        with self.assertRaises(ValueError):self.s.set_admin(1,1,False)
+    def test_binding_conflicts_required_and_admin_checks(self):
+        for cid in (-10011,-10022):
+            with self.assertRaises(ValueError):self.s.bind(1,'lookup',{'id':cid,'title':'冲突'})
+        self.assertEqual(self.bot.publisher.validate('thread',-10011)[1],-10022)
+        self.bot.action({'id':1},'unbindyes:%s'%self.bid)
+        self.assertFalse(self.s.ready());self.bot.home(2)
+        self.assertIn('尚未配置',str(self.api.calls[-1]))
+        self.bot.home(1);self.assertIn('管理后台',str(self.api.calls[-1]))
+    def test_moderation_expiry_manual_and_export(self):
+        rid,_=self.submit();self.s.moderate(1,rid,True)
+        r=self.s.db.execute('SELECT * FROM reviews').fetchone()
+        self.assertIn('人工审核通过',render_review(self.s,r))
+        rid2,_=self.submit(3,token='three');self.s.db.execute('UPDATE reviews SET expires=? WHERE id=?',(time.time()-1,rid2))
+        with self.assertRaises(ValueError):self.s.moderate(1,rid2,True)
+        self.tick()
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM reviews').fetchone()[0],1)
+        backup=self.s.export();restored=sqlite3.connect(':memory:');restored.executescript(backup.decode())
+        self.assertEqual(restored.execute('SELECT count(*) FROM reviews').fetchone()[0],1);restored.close()
+        self.s.set_admin(1,3);self.bot.action({'id':3},'export');self.assertTrue(any(m=='document' for m,_ in self.api.calls))
+    def test_nightly_missing_rebuild_and_pacing(self):
+        self.s.add_codes(1,self.tid,['abc']);self.submit();self.tick();self.forward();self.tick(3)
+        self.s.db.execute("DELETE FROM settings WHERE key='last_check'")
+        stamp=datetime(2026,10,30,2,30,tzinfo=TZ).timestamp()
+        self.bot.publisher.nightly(stamp);count=self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='check'").fetchone()[0]
+        self.bot.publisher.nightly(stamp);self.assertEqual(count,self.s.db.execute("SELECT count(*) FROM jobs WHERE kind='check'").fetchone()[0])
+        self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('last_check',?)",(datetime.now(TZ).strftime('%Y-%m-%d'),))
+        self.tick()  # scheduled health check runs before message repair
+        self.api.failure=APIError(400,description='Bad Request: message to edit not found')
+        self.tick()
+        self.assertEqual(self.s.db.execute('SELECT generation FROM posts').fetchone()[0],2)
+        self.tick();self.forward();self.tick(3)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM publications WHERE generation=2').fetchone()[0],1)
+        calls=len(self.api.calls);self.bot.publisher.next_global=time.time()+100;self.bot.publisher.tick();self.assertEqual(calls,len(self.api.calls))
+    def test_rate_limit_uncertain_and_failed_send_keeps_code_used(self):
+        self.s.add_codes(1,self.tid,['abc']);self.submit()
+        self.api.failure=APIError(429,30);self.tick()
+        job=self.s.db.execute("SELECT * FROM jobs WHERE kind='post'").fetchone();self.assertEqual(job['state'],'pending');self.assertGreater(job['due'],time.time())
+        self.api.failure=APIError(0);self.tick();self.assertEqual(self.s.db.execute("SELECT state FROM jobs WHERE kind='post'").fetchone()[0],'uncertain')
+        self.assertEqual(self.s.db.execute('SELECT state FROM codes').fetchone()[0],'used')
+    def test_withdraw_and_edit_recompute_no_resurrection(self):
+        self.s.add_codes(1,self.tid,['abc']);rid,_=self.submit();self.tick();self.forward();self.tick(3)
+        self.bot.change_review(1,rid,{'综合':10});self.tick(3)
+        self.assertIn('10.0',self.bot.publisher.summary(self.tid)[0])
+        self.bot.change_review(1,rid,None);self.tick(3)
+        self.assertIn('暂无',self.bot.publisher.summary(self.tid)[0]);self.assertIn('撤下',str(self.api.calls))
+        self.assertEqual(self.s.db.execute('SELECT status FROM reviews').fetchone()[0],'withdrawn')
+    def test_identity_recycling_and_unknown_username(self):
+        p=self.s.track('@target_a');self.s.save(p['id'],0,{'id':1},'备注','标签')
+        self.s.observe({'id':50,'username':'target_a'},100,True)
+        self.s.observe({'id':51,'username':'target_a'},200,True)
+        self.assertEqual(self.s.lookup(user_id=50)['tags'],'标签');self.assertEqual(self.s.lookup(user_id=51)['tags'],'')
+        self.assertEqual(len(targets(message(reply_to_message={'from':{'id':60},'date':1}))),1)
+    def test_env_admin_additions_and_revocation_semantics(self):
+        self.assertEqual(admin_ids({'SUPERADMIN_ID':'1','SUPERADMIN_IDS':'2, 3 2，4'}),[1,2,3,4])
+        for value in ('', '0', '-1', 'abc', '1,,bad', str(2**63)):
+            with self.assertRaises(ValueError):admin_ids({'SUPERADMIN_IDS':value})
+        self.s.set_admin(1,5)
+        self.s.db.close();self.s=Store(str(self.path),1,[1,2,3])
+        self.assertTrue(all(self.s.admin(uid) for uid in (1,2,3,5)))
+        self.s.set_admin(1,2,False);self.assertFalse(self.s.admin(2))
+        self.s.db.close();self.s=Store(str(self.path),1,[1,2,3])
+        self.assertTrue(self.s.admin(2))
+        self.s.set_admin(1,2,False)
+        self.s.db.close();self.s=Store(str(self.path),1,[1])
+        self.assertFalse(self.s.admin(2));self.assertTrue(self.s.admin(3));self.assertTrue(self.s.admin(5))
 
-    def test_member_dates_promotions_restrictions_and_out_of_order(self):
-        event = {'chat': {'id': -100, 'type': 'supergroup', 'title': '小群'}, 'date': 100,
-                 'old_chat_member': {'status': 'left'},
-                 'new_chat_member': {'status': 'member', 'user': {'id': 50, 'first_name': '目标'}}}
-        self.bot.member_update(event)
-        event.update(date=200, old_chat_member={'status': 'member'},
-                     new_chat_member={'status': 'administrator', 'user': {'id': 50, 'first_name': '目标'}})
-        self.bot.member_update(event)
-        row = self.store.db.execute('SELECT * FROM memberships').fetchone()
-        self.assertEqual(row['joined'], 100)
-        event.update(date=300, new_chat_member={'status': 'restricted', 'is_member': False, 'user': {'id': 50}})
-        self.bot.member_update(event)
-        self.store.member(row['person'], event['chat'], True, 150, 150)
-        row = self.store.db.execute('SELECT * FROM memberships').fetchone()
-        self.assertEqual((row['present'], row['joined']), (0, 100))
+    def test_pause_and_bootstrap_not_readded(self):
+        self.s.set_admin(1,3);self.s.set_admin(3,1,False)
+        self.s.db.close();self.s=Store(str(self.path),1)
+        self.assertFalse(self.s.admin(1));self.assertTrue(self.s.admin(3))
+        self.bot=Bot(self.s,self.api,'review_bot',99)
+        self.bot.action({'id':3},'pausejobs');self.tick()
+        self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE state='done'").fetchone()[0],0)
+        self.bot.action({'id':3},'resumejobs');self.tick()
+        self.assertGreater(self.s.db.execute("SELECT count(*) FROM jobs WHERE state='done'").fetchone()[0],0)
 
-    def test_limits_invalid_input_and_api_failure(self):
-        self.grant()
-        for invalid in ('@ab', '-1', str(2**64)):
-            with self.assertRaises(ValueError):
-                self.store.track(invalid)
-        p = self.store.track('50')
-        with self.assertRaises(ValueError):
-            self.store.save(p['id'], 0, {'id': 2}, 'a' * 501, '')
-        self.api.error = 403
-        self.bot.message(message(text='x', group=True, forward_origin={'type': 'user', 'date': 10, 'sender_user': {'id': 50}}))
-        self.assertIn('是否在群：未知', self.api.calls[-1][1]['text'])
-        self.bot.show_person(2, p['id'])
-        self.click('编辑标签')
-        self.bot.message(message(text='只有一行'))
-        self.assertEqual(self.store.person(p['id'])['version'], 0)
-        self.assertEqual(len(targets(message(text='@target_a @target_a'))), 1)
+    def test_legacy_schema_migration_preserves_data(self):
+        p=self.s.track('80');self.s.save(p['id'],0,{'id':1},'旧备注','旧标签');self.s.db.close()
+        self.s=Store(str(self.path),1)
+        self.assertEqual(self.s.lookup(user_id=80)['tags'],'旧标签');self.assertTrue(self.s.admin(1))
 
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__=='__main__':unittest.main()

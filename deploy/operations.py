@@ -15,11 +15,11 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from cpbot.__main__ import load_env
+from cpbot.__main__ import load_env, admin_ids
 
 # Explicit inventory: upgrades cannot overwrite config, databases or unknown files.
 FILES = ('cpbot/__init__.py', 'cpbot/__main__.py', 'cpbot/api.py', 'cpbot/bot.py',
-         'cpbot/identity.py', 'cpbot/store.py', 'deploy/operations.py',
+         'cpbot/identity.py', 'cpbot/store.py', 'cpbot/reviews.py', 'cpbot/publishing.py', 'deploy/operations.py',
          'deploy/cpbot.service', 'manage.sh', '.env.example', '.gitignore', 'README.md')
 
 
@@ -32,9 +32,9 @@ def configuration():
 
 def check():
     configuration()
-    uid = os.environ.get('SUPERADMIN_ID', '')
-    if not os.environ.get('BOT_TOKEN') or not uid.isdigit() or not 0 < int(uid) < 2**63:
-        raise ValueError('请先创建 .env，填写 BOT_TOKEN 和有效的 SUPERADMIN_ID。')
+    if not os.environ.get('BOT_TOKEN'):
+        raise ValueError('请先创建 .env，填写 BOT_TOKEN。')
+    admin_ids(os.environ)
     if sys.version_info < (3, 9):
         raise ValueError('需要 Python 3.9 或更新版本。')
 

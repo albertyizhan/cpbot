@@ -1,16 +1,16 @@
 """Global identities, durable personal grants and transactional edit history."""
-import hashlib
-import hmac
 import json
-import os
 import re
 import sqlite3
 import time
 from contextlib import contextmanager
 
 
-class Store:
-    def __init__(self, path, owner):
+from .reviews import ReviewStore
+
+
+class Store(ReviewStore):
+    def __init__(self, path, owner, configured_admins=()):
         self.owner = owner
         self.db = sqlite3.connect(path, isolation_level=None, timeout=10)
         self.db.row_factory = sqlite3.Row
@@ -35,6 +35,13 @@ class Store:
             CREATE INDEX IF NOT EXISTS people_name ON people(name);
         ''')
 
+        self.setup_reviews()
+        with self.transaction():
+            for uid in configured_admins:
+                if not isinstance(uid, int) or not 0 < uid < 2**63:
+                    raise ValueError("无效的 superadmin ID。")
+                self.db.execute("INSERT OR IGNORE INTO admins VALUES(?)", (uid,))
+
     @contextmanager
     def transaction(self):
         self.db.execute('BEGIN IMMEDIATE')
@@ -46,44 +53,7 @@ class Store:
             raise
 
     def allowed(self, uid):
-        return uid == self.owner or bool(self.db.execute('SELECT 1 FROM grants WHERE user_id=?', (uid,)).fetchone())
-
-    def password_set(self, uid, password):
-        if uid != self.owner:
-            raise ValueError('仅总管理者可设置密码。')
-        if not 8 <= len(password) <= 128:
-            raise ValueError('密码需要 8～128 个字符。')
-        salt = os.urandom(16).hex()
-        value = salt + ':' + hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1).hex()
-        with self.transaction():
-            self.db.execute("INSERT OR REPLACE INTO settings VALUES('password',?)", (value,))
-
-    def unlock(self, user, password):
-        uid, now = user['id'], time.time()
-        row = self.db.execute('SELECT * FROM attempts WHERE user_id=?', (uid,)).fetchone()
-        if row and row['until'] > now:
-            raise ValueError('密码尝试过多，请 10 分钟后再试。')
-        saved = self.db.execute("SELECT value FROM settings WHERE key='password'").fetchone()
-        if not saved:
-            raise ValueError('总管理者尚未设置密码。')
-        salt, expected = saved[0].split(':')
-        valid = len(password) <= 128 and hmac.compare_digest(expected, hashlib.scrypt(
-            password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1).hex())
-        with self.transaction():
-            if valid:
-                self.db.execute('INSERT OR REPLACE INTO grants VALUES(?,?,?)', (uid, display_name(user), now))
-                self.db.execute('DELETE FROM attempts WHERE user_id=?', (uid,))
-            else:
-                failures = (row['failures'] if row and row['until'] > now - 600 else 0) + 1
-                self.db.execute('INSERT OR REPLACE INTO attempts VALUES(?,?,?)',
-                                (uid, failures, now + 600 if failures >= 5 else now))
-        if not valid:
-            raise ValueError('密码不正确。')
-
-    def revoke(self, actor, uid):
-        if actor != self.owner or uid == self.owner:
-            raise ValueError('无法执行此授权操作。')
-        self.db.execute('DELETE FROM grants WHERE user_id=?', (uid,))
+        return self.admin(uid)
 
     def person(self, pid):
         row = self.db.execute('SELECT * FROM people WHERE id=?', (pid,)).fetchone()
@@ -157,7 +127,7 @@ class Store:
             raise ValueError('备注最多 500 字，标签最多 300 字。')
         with self.transaction():
             if not self.allowed(user['id']):
-                raise ValueError('授权已失效，请重新输入密码。')
+                raise ValueError('仅 superadmin 可以修改标签。')
             p = self.person(pid)
             changed = self.db.execute('UPDATE people SET note=?,tags=?,version=version+1 WHERE id=? AND version=?',
                                       (note, tags, pid, version)).rowcount
