@@ -61,7 +61,7 @@ class Store(ReviewStore, BackupStore):
             raise
 
     def allowed(self, uid):
-        return self.admin(uid) or bool(self.db.execute('SELECT 1 FROM teachers WHERE user_id=?',(uid,)).fetchone())
+        return self.admin(uid) or bool(self.db.execute('SELECT 1 FROM teachers WHERE user_id=? AND deleted_at IS NULL',(uid,)).fetchone())
 
     def require_editor(self, uid):
         if not self.allowed(uid):raise ValueError('仅已绑定老师和 superadmin 可以修改学生标签。')

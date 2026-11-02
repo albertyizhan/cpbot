@@ -149,9 +149,9 @@ class Bot:
         search = search.strip()
         teachers = self.store.db.execute('''SELECT t.*,p.username FROM teachers t
             LEFT JOIN people p ON p.user_id=t.user_id
-            WHERE (? NOT LIKE '@%' AND instr(lower(t.name),lower(?))>0)
+            WHERE t.deleted_at IS NULL AND ((? NOT LIKE '@%' AND instr(lower(t.name),lower(?))>0)
                OR (t.user_id IS NOT NULL AND p.username=? COLLATE NOCASE)
-               OR (t.user_id IS NULL AND t.username=? COLLATE NOCASE)
+               OR (t.user_id IS NULL AND t.username=? COLLATE NOCASE))
             ORDER BY t.id LIMIT 9 OFFSET ?''',
             (search,search,search.lstrip('@'),search.lstrip('@'),max(0,page)*8)).fetchall()
         rows = [[('%s · #%s' % (t['name'], t['id']), '%s:%s' % (intent, t['id']))] for t in teachers[:8]]
@@ -195,10 +195,11 @@ class Bot:
 
     def admin_panel(self, uid):
         self.store.require_admin(uid)
-        counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers), (SELECT count(*) FROM bindings WHERE mode='thread' AND active=1), (SELECT count(*) FROM reviews WHERE status='accepted')", ).fetchone()
+        counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers WHERE deleted_at IS NULL), (SELECT count(*) FROM bindings WHERE mode='thread' AND active=1), (SELECT count(*) FROM reviews WHERE status='accepted')", ).fetchone()
         return self.panel(uid, '⚙️ 管理后台\n👩‍🏫 老师 %s 位 · 📣 可用专帖频道 %s 个\n📝 有效车评 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), [
             [('👩‍🏫 老师列表', 'teachersadmin'), ('➕ 添加老师', 'teachernew')],
             [('📥 批量导入老师', 'teacherbatch')],
+            [('🗑 老师回收站', 'teachertrash'), ('⏳ 设置保留天数', 'trashdays')],
 
             [('🎯 在群判定目标', 'membertarget')],
             [('📣 频道 / 群绑定', 'bindings'), ('👑 superadmin 名单', 'admins')],
@@ -209,7 +210,7 @@ class Bot:
     def action(self, user, action):
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
-        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','codesadmin','codefor','admins','adminadd','adminremove',
+        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset','codesadmin','codefor','admins','adminadd','adminremove',
                        'teacherbatch','teacherbatchpage','teacherbatchconfirm','teacherbatchcancel',
                        'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
                        'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','removeadmin','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
@@ -231,6 +232,22 @@ class Bot:
             return self.panel(uid,'🎯 在群判定目标\n'+('%s（%s）'%(value['title'],value['id']) if value else '尚未设置')+'\n查学生时实时查询此群，不使用当前查档群作为判定目标。机器人必须是目标群管理员。查询失败显示无法确认。',[[('设置 / 更换目标群','membertargetset')],[('取消指定目标','membertargetclear'),('返回','admin')]])
         if kind=='membertargetset':
             return self.prompt(uid,'发送判定目标群的数字 ID 或 @群用户名。请先将机器人设为该群管理员。',('membertargetset',),'membertarget')
+        if kind=='trashdays':
+            return self.prompt(uid,'当前保留 %s 天。发送新的保留天数（1～3650）。'%self.store.trash_days(),('trashdaysset',),'admin')
+        if kind=='teachertrash':
+            rows=[]
+            for t in self.store.db.execute('SELECT * FROM teachers WHERE deleted_at IS NOT NULL ORDER BY deleted_at'):
+                count=self.store.db.execute('SELECT count(*) FROM reviews WHERE teacher=?',(t['id'],)).fetchone()[0]
+                rows.append([('%s · #%s · %s 条评价'%(t['name'],t['id'],count),'teacherpurge:%s'%t['id'])])
+            return self.panel(uid,'🗑 老师回收站 · 保留 %s 天'%self.store.trash_days()+ ('\n点击可立即彻底删除。' if rows else '\n回收站为空。'),rows+[[('返回后台','admin')]])
+        if kind=='teacherpurge':
+            t=self.store.teacher(int(parts[1]))
+            if t.get('deleted_at') is None:raise ValueError('老师不在回收站。')
+            return self.panel(uid,'⚠️ 彻底删除「%s」及全部评价、发布记录和关联证明图？仍被其他评价或草稿使用的图片会保留。此操作不可恢复。'%t['name'],[[('彻底删除','teacherpurgeyes:%s'%t['id'])],[('取消','teachertrash')]])
+        if kind=='teacherpurgeyes':
+            self.store.purge_teacher(uid,int(parts[1]));self.success(uid,'老师及全部评价已彻底删除。');return self.action(user,'teachertrash')
+        if kind=='trashdaysset':
+            return self.prompt(uid,'发送新的保留天数（1～3650）。',('trashdaysset',),'admin')
         if kind=='membertargetclear':
             self.store.db.execute("DELETE FROM settings WHERE key='membership_target'")
             self.store.log(uid,'取消在群判定目标','')
@@ -354,8 +371,16 @@ class Bot:
             identity='✅ 已绑定本人账号：%s' % t['user_id'] if t['user_id'] else ('⏳ 等待识别 @'+t['username'] if t.get('username') else 'ℹ️ 未绑定本人账号，可按名称搜索。')
             rows=[[('修改名称','teacherrename:%s'%t['id'])],[('绑定本人账号（可选）' if not t['user_id'] else '更换本人账号','teacherbind:%s'%t['id'])]]
             if t['user_id']:rows.append([('解除本人绑定','teacherunbind:%s'%t['id'])])
+            if t.get('deleted_at') is None:rows.append([('🗑 删除老师','teacherdelete:%s'%t['id'])])
             rows += [[('返回老师列表','teachersadmin')]]
             return self.panel(uid,'👩‍🏫 %s · #%s\n%s\n未绑定不影响主帖、客户写评和查评。'%(t['name'],t['id'],identity),rows)
+        if kind=='teacherdelete':
+            t=self.store.teacher(int(parts[1]))
+            return self.panel(uid,'⚠️ 删除「%s」？\n老师和全部评价将进入回收站 %s 天。专帖里的评价正文和证明图会依次清除；到期后自动彻底删除。'%(t['name'],self.store.trash_days()),[[('确认删除','teacherdeleteyes:%s'%t['id'])],[('取消','teacherdetail:%s'%t['id'])]])
+        if kind=='teacherdeleteyes':
+            tid=int(parts[1]);count=self.store.delete_teacher(uid,tid)
+            self.success(uid,'老师已移入回收站，%s 条评价的公开内容正在清除。'%count)
+            return self.action(user,'teachertrash')
         if kind=='teacherrename':
             t=self.store.teacher(int(parts[1]))
             return self.prompt(uid,'当前名称：%s\n发送新名称（1～80 字），本人账号保持不变。'%t['name'],('teacherrename',t['id']),'teacherdetail:%s'%t['id'])
@@ -558,7 +583,7 @@ class Bot:
                 self.query(msg)
             return
         if chat['type']!='private' or not uid or edited:return
-        if self.store.db.execute('SELECT 1 FROM teachers WHERE user_id=? OR (user_id IS NULL AND username=? COLLATE NOCASE)',(uid,user.get('username'))).fetchone():
+        if self.store.db.execute('SELECT 1 FROM teachers WHERE deleted_at IS NULL AND (user_id=? OR (user_id IS NULL AND username=? COLLATE NOCASE))',(uid,user.get('username'))).fetchone():
             self.store.observe(user,msg.get('date',time.time()),create=True)
         pending = None
         try:
@@ -631,6 +656,11 @@ class Bot:
                 self.store.log(uid,'设置在群判定目标',chat['id'])
                 self.success(uid,'判定目标已保存，机器人管理员权限检查通过。')
                 return self.action(user,'membertarget')
+            if kind=='trashdaysset':
+                if not text.isascii() or not text.isdigit():raise ValueError('请发送 1～3650 的整数天数。')
+                self.store.set_trash_days(uid,int(text))
+                self.success(uid,'回收站保留天数已设为 %s 天。'%int(text))
+                return self.action(user,'admin')
             if kind=='teacherbatch':
                 entries=self.store.parse_teachers(uid,text)
                 self.teacher_imports[uid]={'entries':entries,'until':time.monotonic()+600}

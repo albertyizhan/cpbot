@@ -1,6 +1,7 @@
 """Single-owner paced durable outbox, discussion mapping and nightly reconciliation."""
 import html
 import json
+import logging
 import time
 from datetime import datetime
 
@@ -119,7 +120,7 @@ class Publisher:
         with self.s.transaction():
             for b in self.s.db.execute("SELECT * FROM bindings WHERE mode='thread' AND active=1"):
                 self.s.enqueue('health', b['id'], 0, generation=int(local.strftime('%Y%m%d')))
-                for t in self.s.db.execute('SELECT id FROM teachers'):
+                for t in self.s.db.execute('SELECT id FROM teachers WHERE deleted_at IS NULL'):
                     p = self.s.ensure_post(b['id'], t['id'])
                     publications = self.s.db.execute("""SELECT pub.message FROM publications pub JOIN reviews r ON r.id=pub.review
                         WHERE pub.binding=? AND pub.generation=? AND r.teacher=? AND r.status='accepted'
@@ -161,6 +162,7 @@ class Publisher:
         now = time.time()
         if time.monotonic() >= self.next_cleanup:
             self.s.db.execute("DELETE FROM reviews WHERE status IN ('pending','rejected') AND expires<=?", (now,))
+            self._purge_expired_teachers(now)
             self.next_cleanup = time.monotonic() + 60
         self.nightly(now)
         paused = self.s.db.execute("SELECT value FROM settings WHERE key='publishing_paused'").fetchone()
@@ -176,7 +178,7 @@ class Publisher:
         if not job:
             return
         j = dict(job)
-        target = j['discussion'] if j['mode']=='thread' and j['kind'] in ('comment', 'check', 'proof') else j['chat_id']
+        target = j['discussion'] if j['mode']=='thread' and j['kind'] in ('comment', 'check', 'proof', 'redact', 'redactproof') else j['chat_id']
         if self.next_chat.get(target, 0) > now:
             self.s.db.execute('UPDATE jobs SET due=? WHERE id=?', (self.next_chat[target], j['id']))
             return
@@ -199,7 +201,16 @@ class Publisher:
         self.s.db.execute("UPDATE jobs SET state='sending' WHERE id=?", (j['id'],))
         try:
             kind = j['kind']
-            if kind == 'proof':
+            if kind in ('redact', 'redactproof'):
+                table = 'publications' if kind == 'redact' else 'proof_publications'
+                publication = self.s.db.execute('SELECT * FROM %s WHERE binding=? AND review=? AND generation=?' % table,
+                                                (j['binding'], j['review'], j['generation'])).fetchone()
+                if publication:
+                    self.api.call('deleteMessage', chat_id=publication['chat_id'], message_id=publication['message'])
+            elif kind == 'redactpost':
+                if p and p['message']:
+                    self._edit(j['chat_id'], p['message'], '此老师已删除。历史评价已移入回收站。', parse_mode='HTML', reply_markup={'inline_keyboard': []})
+            elif kind == 'proof':
                 r=self.s.db.execute('SELECT * FROM reviews WHERE id=?',(j['review'],)).fetchone()
                 generation=p['generation'] if j['mode']=='thread' else 1
                 pub=self.s.db.execute('SELECT * FROM publications WHERE binding=? AND review=? AND generation=?',(j['binding'],j['review'],generation)).fetchone()
@@ -267,6 +278,25 @@ class Publisher:
                 self.s.db.execute("UPDATE jobs SET state='pending',due=?,error='Telegram 限流' WHERE id=?", (until, j['id']))
             elif error.code == 0 or error.code >= 500:
                 self.s.db.execute("UPDATE jobs SET state='uncertain',error='请求结果不明，请核对后处理' WHERE id=?", (j['id'],))
+            elif j['kind'] in ('redact','redactproof') and "message can't be deleted" in description:
+                table='publications' if j['kind']=='redact' else 'proof_publications'
+                pub=self.s.db.execute('SELECT * FROM %s WHERE binding=? AND review=? AND generation=?'%table,(j['binding'],j['review'],j['generation'])).fetchone()
+                if pub:
+                    try:
+                        if j['kind']=='redact':
+                            self._edit(pub['chat_id'],pub['message'],'此评价已删除。',parse_mode='HTML')
+                        else:
+                            import struct,zlib
+                            def chunk(kind,content):
+                                return struct.pack('!I',len(content))+kind+content+struct.pack('!I',zlib.crc32(kind+content))
+                            blank=(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!2I5B',320,180,8,2,0,0,0))
+                                   +chunk(b'IDAT',zlib.compress((b'\x00'+b'\xe8\xe8\xe8'*320)*180))+chunk(b'IEND',b''))
+                            self.api.photo(blank,_method='editMessageMedia',chat_id=pub['chat_id'],message_id=pub['message'],caption='此评价已删除。')
+                        self.s.db.execute("UPDATE jobs SET state='done',error='超过 Telegram 删除时限，已清除公开内容' WHERE id=?",(j['id'],))
+                    except APIError as edit_error:
+                        self.s.db.execute("UPDATE jobs SET state='blocked',error=? WHERE id=?",(edit_error.description[:200],j['id']))
+            elif j['kind'] in ('redact', 'redactproof', 'redactpost') and any(text in description for text in ('message to delete not found', 'message to edit not found', 'message_id_invalid')):
+                self.s.db.execute("UPDATE jobs SET state='done',error='远端消息已不存在' WHERE id=?", (j['id'],))
             elif any(text in description for text in ('message to edit not found', 'message_id_invalid', 'message to be replied not found', 'message to be replied to not found')):
                 # Rebuild the affected teacher replica to preserve chronological order.
                 if j['mode'] == 'thread':
@@ -280,3 +310,17 @@ class Publisher:
                 self.s.db.execute("UPDATE jobs SET state='blocked',error=? WHERE id=?", (error.description[:200], j['id']))
                 if error.code == 403:
                     self.s.db.execute("UPDATE bindings SET active=0,error='访问或管理员权限失效，请重新检查' WHERE id=?", (j['binding'],))
+
+    def _purge_expired_teachers(self, now):
+        days = self.s.trash_days()
+        cutoff = now - days * 86400
+        rows = self.s.db.execute('SELECT id FROM teachers WHERE deleted_at IS NOT NULL AND deleted_at<=?', (cutoff,)).fetchall()
+        for row in rows:
+            tid = row['id']
+            pending = self.s.db.execute("SELECT 1 FROM jobs WHERE teacher=? AND kind IN ('redact','redactproof','redactpost') AND state NOT IN ('done','superseded') LIMIT 1", (tid,)).fetchone()
+            if not pending:
+                try:
+                    with self.s.transaction():
+                        self.s._purge_teacher(tid)
+                except (OSError, ValueError) as error:
+                    logging.warning('回收站老师 #%s 清理失败，将稍后重试: %s', tid, error)

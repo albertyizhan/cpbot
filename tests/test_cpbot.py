@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 from pathlib import Path
 
@@ -112,6 +113,45 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):self.s.moderate(1,1,True)
         d=self.draft(4,token='four');d.pop('出击证明');self.s.save_draft(4,d,'four')
         with self.assertRaises(ValueError):self.s.submit({'id':4},'four')
+
+    def test_teacher_trash_redacts_posts_and_purges_after_retention(self):
+        rid,_=self.submit()
+        proof=self.s.proof_path(json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(rid,)).fetchone()[0])['出击证明'])
+        self.tick();self.forward();self.tick(3)
+        self.assertEqual(self.s.delete_teacher(1,self.tid),1)
+        self.assertEqual(self.s.db.execute('SELECT status FROM reviews WHERE id=?',(rid,)).fetchone()[0],'trashed')
+        with self.assertRaises(ValueError):self.s.active_teacher(self.tid)
+        self.s.set_trash_days(1,1)
+        validate_backup(self.s.export(99),99)
+        with self.assertRaises(ValueError):self.s.purge_teacher(1,self.tid)
+        self.bot.publisher.next_global=0
+        self.bot.publisher.next_chat={}
+        self.s.db.execute('UPDATE jobs SET due=0 WHERE state="pending"')
+        self.tick(3)
+        self.assertTrue(any(method=='deleteMessage' for method,_ in self.api.calls))
+        self.assertIsNotNone(self.s.teacher(self.tid)['deleted_at'])
+        self.bot.publisher.next_cleanup=0
+        self.bot.publisher._purge_expired_teachers(time.time()+86401)
+        with self.assertRaises(ValueError):self.s.teacher(self.tid)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM reviews').fetchone()[0],0)
+        self.assertFalse(proof.exists())
+
+    def test_teacher_purge_preserves_shared_proof_and_retries_file_error(self):
+        rid,_=self.submit()
+        data=json.loads(self.s.db.execute('SELECT data FROM reviews WHERE id=?',(rid,)).fetchone()[0])
+        proof=self.s.proof_path(data['出击证明'])
+        self.s.delete_teacher(1,self.tid)
+        self.s.db.execute("UPDATE jobs SET state='done' WHERE teacher=?",(self.tid,))
+        with patch.object(Path,'unlink',side_effect=PermissionError('denied')):
+            with self.assertRaisesRegex(ValueError,'证明图删除失败'):
+                self.s.purge_teacher(1,self.tid)
+        self.assertIsNotNone(self.s.teacher(self.tid)['deleted_at'])
+        self.assertTrue(proof.exists())
+        self.s.save_draft(3, data, 'shared')
+        self.s.purge_teacher(1,self.tid)
+        self.assertTrue(proof.exists())
+        self.assertNotIn('老师',self.s.draft(3)[0])
+        self.assertEqual(self.s.draft(3)[0]['出击证明'],data['出击证明'])
 
     def test_permissions_global_tags_and_group_opt_in(self):
         self.assertFalse(self.s.allowed(2))

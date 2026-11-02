@@ -92,6 +92,8 @@ class ReviewStore:
         ''')
         if 'username' not in {r['name'] for r in self.db.execute('PRAGMA table_info(teachers)')}:
             self.db.execute('ALTER TABLE teachers ADD COLUMN username TEXT COLLATE NOCASE')
+        if 'deleted_at' not in {r['name'] for r in self.db.execute('PRAGMA table_info(teachers)')}:
+            self.db.execute('ALTER TABLE teachers ADD COLUMN deleted_at REAL')
         self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS teachers_username ON teachers(username COLLATE NOCASE)')
         with self.transaction():
             if not self.db.execute("SELECT 1 FROM settings WHERE key='admins_initialized'").fetchone():
@@ -127,13 +129,91 @@ class ReviewStore:
             raise ValueError('老师不存在。')
         return dict(row)
 
+    def active_teacher(self, tid):
+        teacher = self.teacher(tid)
+        if teacher.get('deleted_at') is not None:
+            raise ValueError('这位老师已进入回收站，不能继续写评或发布。')
+        return teacher
+
+    def delete_teacher(self, actor, tid):
+        self.require_admin(actor)
+        with self.transaction():
+            teacher = self.teacher(tid)
+            if teacher.get('deleted_at') is not None:
+                raise ValueError('这位老师已在回收站。')
+            now = time.time()
+            self.db.execute('UPDATE teachers SET deleted_at=? WHERE id=?', (now, tid))
+            reviews = self.db.execute('SELECT id,data FROM reviews WHERE teacher=?', (tid,)).fetchall()
+            self.db.execute("UPDATE reviews SET status='trashed',expires=NULL WHERE teacher=?", (tid,))
+            self.db.execute("UPDATE jobs SET state='superseded' WHERE teacher=? AND state IN ('pending','blocked')", (tid,))
+            self.db.execute("UPDATE jobs SET state='uncertain',error='老师已删除，需清除公开评价' WHERE teacher=? AND state='sending'", (tid,))
+            for review in reviews:
+                for pub in self.db.execute('SELECT * FROM publications WHERE review=?', (review['id'],)):
+                    self.enqueue('redact', pub['binding'], tid, review['id'], pub['generation'])
+                for proof in self.db.execute('SELECT * FROM proof_publications WHERE review=?', (review['id'],)):
+                    self.enqueue('redactproof', proof['binding'], tid, review['id'], proof['generation'])
+            for post in self.db.execute("SELECT p.*,b.mode FROM posts p JOIN bindings b ON b.id=p.binding WHERE p.teacher=? AND b.mode='thread' AND p.message IS NOT NULL", (tid,)):
+                self.enqueue('redactpost', post['binding'], tid, generation=post['generation'])
+            self.log(actor, '删除老师（移入回收站）', '%s · %s 条评价' % (tid, len(reviews)))
+            return len(reviews)
+
+    def trash_days(self):
+        row = self.db.execute("SELECT value FROM settings WHERE key='teacher_trash_days'").fetchone()
+        return int(row[0]) if row else 30
+
+    def set_trash_days(self, actor, days):
+        self.require_admin(actor)
+        if type(days) is not int or not 1 <= days <= 3650:
+            raise ValueError('保留天数须为 1～3650 的整数。')
+        with self.transaction():
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('teacher_trash_days',?)", (str(days),))
+            self.log(actor, '设置老师回收站保留天数', days)
+
+    def purge_teacher(self, actor, tid):
+        self.require_admin(actor)
+        with self.transaction():
+            teacher = self.teacher(tid)
+            if teacher.get('deleted_at') is None:
+                raise ValueError('只能彻底删除回收站中的老师。')
+            pending = self.db.execute("SELECT 1 FROM jobs WHERE teacher=? AND kind IN ('redact','redactproof','redactpost') AND state NOT IN ('done','superseded') LIMIT 1", (tid,)).fetchone()
+            if pending:
+                raise ValueError('公开专帖内容仍在清除，请等待发布队列完成后再彻底删除。')
+            self._purge_teacher(tid)
+            self.log(actor, '彻底删除回收站老师', tid)
+
+    def _purge_teacher(self, tid):
+        reviews = self.db.execute('SELECT id,data FROM reviews WHERE teacher=?', (tid,)).fetchall()
+        names = {json.loads(review['data']).get('出击证明') for review in reviews}
+        names.discard(None)
+        for name in names:
+            referenced = self.db.execute('''SELECT 1 FROM reviews WHERE teacher<>? AND json_extract(data,'$.出击证明')=?
+                UNION ALL SELECT 1 FROM drafts WHERE json_extract(data,'$.出击证明')=? LIMIT 1''', (tid, name, name)).fetchone()
+            if not referenced:
+                try:
+                    self.proof_path(name).unlink(missing_ok=True)
+                except OSError as error:
+                    raise ValueError('证明图删除失败，请检查服务器文件权限后重试。') from error
+        for draft in self.db.execute("SELECT user_id,data,token FROM drafts WHERE json_extract(data,'$.老师')=?", (tid,)).fetchall():
+            data = json.loads(draft['data'])
+            data.pop('老师', None)
+            self.save_draft(draft['user_id'], data, draft['token'])
+        for review in reviews:
+            self.db.execute('DELETE FROM publications WHERE review=?', (review['id'],))
+            self.db.execute('DELETE FROM proof_publications WHERE review=?', (review['id'],))
+            self.db.execute('DELETE FROM jobs WHERE review=?', (review['id'],))
+        self.db.execute('DELETE FROM codes WHERE teacher=?', (tid,))
+        self.db.execute('DELETE FROM posts WHERE teacher=?', (tid,))
+        self.db.execute('DELETE FROM jobs WHERE teacher=?', (tid,))
+        self.db.execute('DELETE FROM reviews WHERE teacher=?', (tid,))
+        self.db.execute('DELETE FROM teachers WHERE id=?', (tid,))
+
     def save_teacher(self, actor, name, uid=None, tid=None):
         self.require_admin(actor)
         if not name.strip() or len(name) > 80 or (uid is not None and not 0 < uid < 2**63):
             raise ValueError('名称需要 1～80 字，身份 ID 必须是正整数。')
         with self.transaction():
             if tid:
-                self.teacher(tid)
+                self.active_teacher(tid)
                 self.db.execute('UPDATE teachers SET name=?,user_id=? WHERE id=?', (name.strip(), uid, tid))
             else:
                 tid = self.db.execute('INSERT INTO teachers(name,user_id) VALUES(?,?)', (name.strip(), uid)).lastrowid
@@ -149,7 +229,7 @@ class ReviewStore:
             raise ValueError('请输入有效的 Telegram 数字 ID。')
         try:
             with self.transaction():
-                self.teacher(tid)
+                self.active_teacher(tid)
                 self.db.execute('UPDATE teachers SET user_id=?,username=NULL WHERE id=?',(uid,tid))
                 self.log(actor,'绑定老师账号' if uid else '解绑老师账号',tid)
         except sqlite3.IntegrityError:
@@ -219,10 +299,10 @@ class ReviewStore:
         if not uid or user.get('is_bot') or not username:return
         # Most observed members are not pending teachers. Do not run an UPDATE
         # for every ordinary group message; the username index makes this cheap.
-        pending=self.db.execute('SELECT id FROM teachers WHERE username=? COLLATE NOCASE AND user_id IS NULL',
+        pending=self.db.execute('SELECT id FROM teachers WHERE username=? COLLATE NOCASE AND user_id IS NULL AND deleted_at IS NULL',
                                 (username,)).fetchone()
         if not pending:return
-        changed=self.db.execute("UPDATE teachers SET user_id=? WHERE user_id IS NULL AND username=? COLLATE NOCASE AND NOT EXISTS(SELECT 1 FROM teachers WHERE user_id=?)",(uid,username,uid)).rowcount
+        changed=self.db.execute("UPDATE teachers SET user_id=? WHERE user_id IS NULL AND username=? COLLATE NOCASE AND deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM teachers WHERE user_id=?)",(uid,username,uid)).rowcount
         if changed:self.log(uid,'用户名自动绑定老师账号',username)
 
     def rename_teacher(self, actor, tid, name):
@@ -230,7 +310,7 @@ class ReviewStore:
         if not name.strip() or len(name)>80 or '\n' in name:
             raise ValueError('老师名称需要一行，1～80 字。')
         with self.transaction():
-            self.teacher(tid)
+            self.active_teacher(tid)
             self.db.execute('UPDATE teachers SET name=? WHERE id=?',(name.strip(),tid))
             self.log(actor,'修改老师名称',tid)
             for b in self.db.execute("SELECT id FROM bindings WHERE mode='thread'"):
@@ -276,7 +356,7 @@ class ReviewStore:
                 raise ValueError('出击证明文件缺失，请重新上传图片。')
             data.pop('留名',None)
             data['综合'] = overall_score(data)
-            self.teacher(int(data['老师']))
+            self.active_teacher(int(data['老师']))
             try:
                 data['时间'] = review_date(data['时间'], legacy=True)
             except (ValueError, TypeError):
@@ -304,6 +384,7 @@ class ReviewStore:
                         (kind, bid, tid, rid, generation))
 
     def ensure_post(self, bid, tid, backfill=True):
+        self.active_teacher(tid)
         self.db.execute('INSERT OR IGNORE INTO posts(binding,teacher) VALUES(?,?)', (bid, tid))
         p = self.db.execute('SELECT * FROM posts WHERE binding=? AND teacher=?', (bid, tid)).fetchone()
         if not p['message']:
@@ -318,6 +399,7 @@ class ReviewStore:
 
     def enqueue_review(self, rid):
         r = self.db.execute('SELECT * FROM reviews WHERE id=?', (rid,)).fetchone()
+        self.active_teacher(r['teacher'])
         for b in self.db.execute("SELECT * FROM bindings WHERE mode IN ('thread','feed')"):
             if b['mode'] == 'thread':
                 # Binding/rebuild/nightly own historical reconciliation. New submissions
@@ -343,7 +425,7 @@ class ReviewStore:
             bid = self.db.execute('INSERT INTO bindings(mode,chat_id,discussion,title) VALUES(?,?,?,?)',
                                   (mode, chat['id'], discussion, chat.get('title', str(chat['id'])))).lastrowid
             if mode == 'thread':
-                for t in self.db.execute('SELECT id FROM teachers'):
+                for t in self.db.execute('SELECT id FROM teachers WHERE deleted_at IS NULL'):
                     self.ensure_post(bid, t['id'])
             self.log(actor, '绑定 ' + mode, chat['id'])
             return bid

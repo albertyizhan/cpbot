@@ -105,8 +105,11 @@ def validate_backup(content, bot_id=0, images=None):
                 if not isinstance(rows, list):
                     raise ValueError('数据表格式错误：' + table)
                 for row in rows:
-                    if table=='teachers' and isinstance(row,dict) and 'username' not in row:
-                        row['username']=None
+                    if table=='teachers' and isinstance(row,dict):
+                        if 'username' not in row:
+                            row['username']=None
+                        if 'deleted_at' not in row:
+                            row['deleted_at']=None
                     if not isinstance(row, dict) or set(row) != set(columns):
                         raise ValueError('数据字段不完整：' + table)
                     for column in info:
@@ -148,8 +151,9 @@ def check_relations(db):
     for t in db.execute('SELECT * FROM teachers'):
         require(t['id'] > 0 and 1 <= len(t['name']) <= 80 and (t['user_id'] is None or t['user_id'] > 0), '老师资料无效。')
         require(t['username'] is None or isinstance(t['username'],str) and re.fullmatch(r'[a-z][a-z0-9_]{3,31}',t['username']), '老师用户名无效。')
+        require(t['deleted_at'] is None or type(t['deleted_at']) in (int,float) and math.isfinite(t['deleted_at']) and t['deleted_at'] > 0, '老师回收站时间无效。')
     for r in reviews.values():
-        require(r['status'] in ('accepted','pending','rejected','withdrawn') and r['author'] > 0 and r['anonymous'] in (0,1) and r['manual'] in (0,1), '车评状态无效。')
+        require(r['status'] in ('accepted','pending','rejected','withdrawn','trashed') and r['author'] > 0 and r['anonymous'] in (0,1) and r['manual'] in (0,1), '车评状态无效。')
         require((r['status'] in ('pending','rejected')) == (r['expires'] is not None), '审核到期时间不一致。')
         try:
             d, identity = json.loads(r['data']), json.loads(r['identity'])
@@ -199,7 +203,7 @@ def check_relations(db):
         require(p['chat_id'] == (b['discussion'] if b['mode']=='thread' else b['chat_id']), '发布目标错误。')
     for j in db.execute('SELECT * FROM jobs'):
         require(j['binding'] in bindings and j['state'] in ('pending','sending','done','blocked','uncertain','superseded') and j['generation'] > 0, '任务状态无效。')
-        require(j['kind'] in ('post','comment','feed','summary','checkpost','check','health','proof'), '任务类型无效。')
+        require(j['kind'] in ('post','comment','feed','summary','checkpost','check','health','proof','redact','redactproof','redactpost'), '任务类型无效。')
         require(j['kind']=='health' or j['teacher'] in teacher_ids, '任务老师不存在。')
         require(not j['review'] or j['review'] in reviews and reviews[j['review']]['teacher']==j['teacher'], '任务评价不存在。')
 
