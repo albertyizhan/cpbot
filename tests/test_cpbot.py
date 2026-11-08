@@ -334,7 +334,8 @@ class Tests(unittest.TestCase):
         self.assertIn('入群时间：未知',self.api.calls[-1][1]['text'])
         self.s.bind(1,'lookup',{'id':-10044,'title':'查询群'})
         self.bot.message(message(text='查',cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
-        self.assertIn('判定群：-10055',self.api.calls[-1][1]['text'])
+        self.assertNotIn('判定群',self.api.calls[-1][1]['text'])
+        self.assertIn('是否在群：是',self.api.calls[-1][1]['text'])
         def failed(method,**params):
             if method=='getChatMember' and params['user_id']==50:raise APIError(429,10)
             return original(method,**params)

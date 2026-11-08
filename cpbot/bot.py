@@ -795,15 +795,15 @@ class Bot:
             text += '\n\n%s\n是否在群：%s\n入群时间：%s\n状态更新：%s' % (
                 m['title'][:100], {1: '是', 0: '否'}.get(m['present'], '未知'), date(m['joined']), date(m['observed']))
         return text
-    def target_membership(self, person):
+    def target_membership(self, person, group=False):
         saved=self.store.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
         if not saved:return ''
         target=json.loads(saved[0])
-        prefix='\n\n🎯 判定群：%s（%s）\n'%(target['title'],target['id'])
+        prefix='\n\n' if group else '\n\n🎯 判定群：%s（%s）\n'%(target['title'],target['id'])
         if not person['user_id']:
             return prefix+'是否在群：无法确认（尚未识别用户数字 ID）'
         try:
-            self.publisher._rights(target['id'],False,'判定群')
+            self.publisher._rights(target['id'],False,'目标群' if group else '判定群')
             member=self.api.call('getChatMember',chat_id=target['id'],user_id=person['user_id'])
             present=member_present(member)
             if present is None:return prefix+'是否在群：暂时无法确认（未知成员状态）'
@@ -914,5 +914,5 @@ class Bot:
             buttons = [[{'text': label, 'url': 'https://t.me/%s?start=%s_%s' % (self.username, intent, p['id'])}
                         for label, intent in (('新增标签', 'edit'), ('删除标签', 'delete'))]]
             notice = self.match_notice(target)
-            self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']) + self.target_membership(p) + '\n\n以上为查询时的资料，更新后请重新查询。', buttons,
+            self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']) + self.target_membership(p, group=True) + '\n\n以上为查询时的资料，更新后请重新查询。', buttons,
                       reply_parameters={'message_id': message['message_id'], 'allow_sending_without_reply': True})
