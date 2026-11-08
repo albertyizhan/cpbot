@@ -40,10 +40,23 @@ class Store(ReviewStore, BackupStore):
 
         self.setup_reviews()
         with self.transaction():
+            if not self.db.execute("SELECT 1 FROM settings WHERE key='notes_removed'").fetchone():
+                self.clear_notes()
+                self.db.execute("INSERT INTO settings VALUES('notes_removed','1')")
             for uid in configured_admins:
                 if not isinstance(uid, int) or not 0 < uid < 2**63:
                     raise ValueError("无效的 superadmin ID。")
                 self.db.execute("INSERT OR IGNORE INTO admins VALUES(?)", (uid,))
+
+    def clear_notes(self):
+        self.db.execute("UPDATE people SET note='' WHERE note<>''")
+        for row in self.db.execute('SELECT id,before_value,after_value FROM history').fetchall():
+            values = []
+            for raw in (row['before_value'], row['after_value']):
+                value = json.loads(raw)
+                values.append(json.dumps(['', value[1]], ensure_ascii=False))
+            if values != [row['before_value'], row['after_value']]:
+                self.db.execute('UPDATE history SET before_value=?,after_value=? WHERE id=?', (*values, row['id']))
 
     @contextmanager
     def transaction(self):
@@ -152,21 +165,21 @@ class Store(ReviewStore, BackupStore):
                 self.member(person['id'], chat, present, stamp, joined)
             return person
 
-    def save(self, pid, version, user, note, tags, action='编辑'):
-        if len(note) > 500 or len(tags) > 300:
-            raise ValueError('备注最多 500 字，标签最多 300 字。')
+    def save(self, pid, version, user, tags, action='编辑'):
+        if len(tags) > 300:
+            raise ValueError('标签最多 300 字。')
         with self.transaction():
             if not self.allowed(user['id']):
                 raise ValueError('仅已绑定老师和 superadmin 可以修改标签。')
             p = self.person(pid)
-            changed = self.db.execute('UPDATE people SET note=?,tags=?,version=version+1 WHERE id=? AND version=?',
-                                      (note, tags, pid, version)).rowcount
+            changed = self.db.execute('UPDATE people SET tags=?,version=version+1 WHERE id=? AND version=?',
+                                      (tags, pid, version)).rowcount
             if not changed:
                 raise ValueError('资料已被别人修改，请重新打开后编辑。')
             self.db.execute('INSERT INTO history(person,actor,actor_name,action,before_value,after_value,created) VALUES(?,?,?,?,?,?,?)',
                             (pid, user['id'], display_name(user), action,
-                             json.dumps([p['note'], p['tags']], ensure_ascii=False),
-                             json.dumps([note, tags], ensure_ascii=False), time.time()))
+                             json.dumps(['', p['tags']], ensure_ascii=False),
+                             json.dumps(['', tags], ensure_ascii=False), time.time()))
 
 
 def display_name(user):

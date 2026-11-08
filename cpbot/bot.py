@@ -106,7 +106,7 @@ class Bot:
         p = self.store.person(pid)
         if intent == 'delete':
             self.store.require_editor(uid)
-            return self.panel(uid, self.card(p) + '\n\n确定清空标签？保留身份、备注和修改记录。',
+            return self.panel(uid, self.card(p) + '\n\n确定清空标签？保留身份和修改记录。',
                 [[('确认删除', 'delete:%s:%s' % (pid, p['version']))], [('取消', 'person:%s' % pid)]])
         return self.panel(uid, (notice + '\n\n' if notice else '') + self.card(p) + self.target_membership(p),
                           [[('新增标签', 'edit:%s' % pid), ('删除标签', 'askdelete:%s' % pid)],
@@ -338,15 +338,15 @@ class Bot:
             self.store.require_editor(uid)
             p=self.store.person(int(parts[1]))
             if kind=='askdelete': return self.show_person(uid,p['id'],'delete')
-            if kind=='edit': return self.prompt(uid,'发送两行：新增备注、追加标签。某行不新增请填 -。',('addtags',p['id'],p['version']),'person:%s'%p['id'])
-            self.store.save(p['id'],int(parts[2]),user,p['note'],'','删除标签')
-            self.success(uid, '标签已清空，备注和身份资料保留。')
+            if kind=='edit': return self.prompt(uid,'发送要追加的标签。',('addtags',p['id'],p['version']),'person:%s'%p['id'])
+            self.store.save(p['id'],int(parts[2]),user,'','删除标签')
+            self.success(uid, '标签已清空，身份资料保留。')
             return self.show_person(uid,p['id'])
         if kind=='history': return self.history(uid,int(parts[1]),max(0,int(parts[2])))
         if kind=='entry':
             row=self.store.db.execute('SELECT * FROM history WHERE id=?',(int(parts[1]),)).fetchone()
             if not row: raise ValueError('记录不存在。')
-            return self.panel(uid,'操作人：%s（%s）\n时间：%s\n修改前：%s\n修改后：%s'%(row['actor_name'],row['actor'],date(row['created']),row['before_value'],row['after_value']),[[('返回主菜单','home')]])
+            return self.panel(uid,'操作人：%s（%s）\n时间：%s\n修改前：%s\n修改后：%s'%(row['actor_name'],row['actor'],date(row['created']),json.loads(row['before_value'])[1] or '无',json.loads(row['after_value'])[1] or '无'),[[('返回主菜单','home')]])
         if kind=='teachernew':
             return self.prompt(uid,'👩‍🏫 添加老师\n发送老师名称即可（1～80 字）。本人账号可在详情中另行绑定。',('teachernew',),'admin')
         if kind=='teacherbatch':
@@ -640,11 +640,9 @@ class Bot:
                 found=targets(msg);p=self.resolve(found[0]) if found else self.store.track(text)
                 return self.show_person(uid,p['id'],notice=self.match_notice(found[0]) if found else '')
             if kind=='addtags':
-                lines=text.splitlines()
-                if len(lines)!=2:raise ValueError('需要两行：备注、标签；不新增填 -。')
-                p=self.store.person(pending[1]);note,tags_=[x.strip() for x in lines]
-                note='\n'.join(filter(None,(p['note'],'' if note=='-' else note)));tags_='、'.join(filter(None,(p['tags'],'' if tags_=='-' else tags_)))
-                self.store.save(p['id'],pending[2],user,note,tags_,'新增标签')
+                if not text or '\n' in text:raise ValueError('请发送一行要追加的标签。')
+                p=self.store.person(pending[1]);tags_='、'.join(filter(None,(p['tags'],text)))
+                self.store.save(p['id'],pending[2],user,tags_,'新增标签')
                 self.success(uid, '新增内容已保存，下方显示最新资料。')
                 return self.show_person(uid,p['id'])
             self.store.require_admin(uid)
@@ -781,10 +779,11 @@ class Bot:
                 self.store.db.execute("UPDATE bindings SET active=0,error='机器人管理员权限已失效' WHERE chat_id=? OR discussion=?",(cid,cid))
 
     def card(self, p, chat_id=None):
-        text = '\n'.join(('👤 当前名称：' + (p['name'] or '未知'),
+        text = '\n'.join(('档案编号：' + str(p['id']),
+                          '👤 当前名称：' + (p['name'] or '未知'),
                           'Telegram ID：' + (str(p['user_id']) if p['user_id'] else '待识别'),
                           '用户名：' + ('@' + p['username'] if p['username'] else '未知 / 未设置'),
-                          '📝 群备注：' + (p['note'] or '无'), '🏷 群标签：' + (p['tags'] or '无')))
+                          '🏷 群标签：' + (p['tags'] or '无')))
         if self.store.db.execute("SELECT 1 FROM settings WHERE key='membership_target'").fetchone():
             return text
         memberships = self.store.db.execute('SELECT * FROM memberships WHERE person=?' +
@@ -915,5 +914,5 @@ class Bot:
             buttons = [[{'text': label, 'url': 'https://t.me/%s?start=%s_%s' % (self.username, intent, p['id'])}
                         for label, intent in (('新增标签', 'edit'), ('删除标签', 'delete'))]]
             notice = self.match_notice(target)
-            self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']) + self.target_membership(p), buttons,
+            self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']) + self.target_membership(p) + '\n\n以上为查询时的资料，更新后请重新查询。', buttons,
                       reply_parameters={'message_id': message['message_id'], 'allow_sending_without_reply': True})

@@ -158,8 +158,8 @@ class Tests(unittest.TestCase):
         # Old password grants do not confer superadmin rights.
         self.s.db.execute("INSERT INTO grants VALUES(2,'old',0)");self.assertFalse(self.s.allowed(2))
         p=self.s.track('50')
-        with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':2},'','bad')
-        self.s.set_admin(1,2);self.s.save(p['id'],0,{'id':2},'备注','鸽子')
+        with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':2},'bad')
+        self.s.set_admin(1,2);self.s.save(p['id'],0,{'id':2},'鸽子')
         self.bot.message(message(text='@target_a',cid=-10044));self.assertEqual(len(self.api.calls),0)
         self.s.bind(1,'lookup',{'id':-10044,'title':'内群'})
         self.bot.message(message(text='查询',cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
@@ -462,7 +462,7 @@ class Tests(unittest.TestCase):
         validate_backup(self.s.export(99),99)
 
     def test_identity_recycling_and_unknown_username(self):
-        p=self.s.track('@target_a');self.s.save(p['id'],0,{'id':1},'备注','标签')
+        p=self.s.track('@target_a');self.s.save(p['id'],0,{'id':1},'标签')
         self.s.observe({'id':50,'username':'target_a'},100,True)
         self.s.observe({'id':51,'username':'target_a'},200,True)
         self.assertEqual(self.s.lookup(user_id=50)['tags'],'标签');self.assertEqual(self.s.lookup(user_id=51)['tags'],'')
@@ -563,9 +563,11 @@ class Tests(unittest.TestCase):
 
     def test_json_import_end_to_end_permissions_preview_and_recovery(self):
         self.submit();self.tick();self.forward();self.tick(3)
-        p=self.s.track('50');self.s.save(p['id'],0,{'id':1},'旧备注','旧标签')
+        p=self.s.track('50');self.s.save(p['id'],0,{'id':1},'旧标签')
+        self.s.db.execute("UPDATE people SET note='旧备注' WHERE id=?",(p['id'],))
+        self.s.db.execute('UPDATE history SET after_value=? WHERE person=?',(json.dumps(['旧备注','旧标签'],ensure_ascii=False),p['id']))
         backup=self.s.export(99)
-        self.s.save(p['id'],1,{'id':1},'新备注','新标签')
+        self.s.save(p['id'],1,{'id':1},'新标签')
         self.s.set_admin(1,3)
         self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('offset','123')")
         self.api.upload=backup
@@ -575,6 +577,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.s.person(p['id'])['tags'],'新标签')
         self.click('确认覆盖并恢复',uid=3)
         self.assertEqual(self.s.person(p['id'])['tags'],'旧标签')
+        self.assertEqual(self.s.person(p['id'])['note'],'')
+        self.assertEqual(json.loads(self.s.db.execute('SELECT after_value FROM history WHERE person=?',(p['id'],)).fetchone()[0]),['','旧标签'])
         self.assertTrue(self.s.admin(3));self.assertFalse(self.s.ready());self.assertTrue(self.bot.paused())
         self.assertEqual(self.s.db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()[0],'123')
         recovery=self.s.db.execute("SELECT detail FROM audit WHERE action='导入备份' ORDER BY id DESC LIMIT 1").fetchone()[0]
@@ -673,12 +677,12 @@ class Tests(unittest.TestCase):
         self.assertIsNone(self.s.teacher(ids[0])['user_id'])
         self.assertFalse(self.s.allowed(70))
         p=self.s.track('100')
-        with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':70},'','x')
+        with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':70},'x')
         self.bot.message(message(uid=70,text='/start') | {'from':{'id':70,'username':'Teacher_B'}})
         self.assertEqual(self.s.teacher(ids[0])['user_id'],70)
         self.assertTrue(self.s.allowed(70))
         self.bot.action({'id':70},'edit:%s'%p['id'])
-        self.bot.message(message(uid=70,text='备注\n标签') | {'from':{'id':70,'username':'Teacher_B'}})
+        self.bot.message(message(uid=70,text='标签') | {'from':{'id':70,'username':'Teacher_B'}})
         self.assertEqual(self.s.person(p['id'])['tags'],'标签')
         with self.assertRaises(ValueError):self.bot.action({'id':70},'admin')
         with self.assertRaises(ValueError):self.s.set_admin(70,100)
@@ -693,6 +697,24 @@ class Tests(unittest.TestCase):
         self.assertFalse(self.s.allowed(70))
         self.assertIsNone(self.s.teacher(ids[0])['user_id'])
         validate_backup(self.s.export(99),99)
+
+    def test_teacher_edit_is_visible_to_admin_and_revoked_edit_is_rejected(self):
+        person=self.s.observe({'id':50,'username':'student_a'},time.time(),True)
+        self.bot.action({'id':10},'edit:%s'%person['id'])
+        self.bot.message(message(uid=10,text='新标签'))
+        self.assertIn('新增内容已保存',self.api.calls[-1][1]['text'])
+        self.bot.message(message(uid=1,text='50'))
+        self.assertIn('新标签',self.api.calls[-1][1]['text'])
+        self.bot.history(1,person['id'],0)
+        self.assertIn('新增标签',self.api.calls[-1][1]['text'])
+        self.assertEqual(self.s.db.execute('SELECT actor FROM history WHERE person=?',(person['id'],)).fetchone()[0],10)
+
+        self.bot.action({'id':10},'edit:%s'%person['id'])
+        self.s.set_teacher_account(1,self.tid,None)
+        self.bot.message(message(uid=10,text='不应保存'))
+        self.assertNotIn('新增内容已保存',self.api.calls[-1][1]['text'])
+        self.assertEqual(self.s.person(person['id'])['tags'],'新标签')
+        self.assertEqual(self.s.db.execute('SELECT COUNT(*) FROM history WHERE person=?',(person['id'],)).fetchone()[0],1)
 
     def test_teacher_auto_binding_target_group_and_conflicts(self):
         ids=self.s.import_teachers(1,self.s.parse_teachers(1,'乙 | @pending_a\n丙 | @pending_b'))
@@ -872,9 +894,15 @@ class Tests(unittest.TestCase):
         self.assertGreater(self.s.db.execute("SELECT count(*) FROM jobs WHERE state='done'").fetchone()[0],0)
 
     def test_legacy_schema_migration_preserves_data(self):
-        p=self.s.track('80');self.s.save(p['id'],0,{'id':1},'旧备注','旧标签');self.s.db.close()
+        p=self.s.track('80');self.s.save(p['id'],0,{'id':1},'旧标签')
+        self.s.db.execute("UPDATE people SET note='旧备注' WHERE id=?",(p['id'],))
+        self.s.db.execute('UPDATE history SET after_value=? WHERE person=?',(json.dumps(['旧备注','旧标签'],ensure_ascii=False),p['id']))
+        self.s.db.execute("DELETE FROM settings WHERE key='notes_removed'")
+        self.s.db.close()
         self.s=Store(str(self.path),1)
         self.assertEqual(self.s.lookup(user_id=80)['tags'],'旧标签');self.assertTrue(self.s.admin(1))
+        self.assertEqual(self.s.person(p['id'])['note'],'')
+        self.assertEqual(json.loads(self.s.db.execute('SELECT after_value FROM history WHERE person=?',(p['id'],)).fetchone()[0]),['','旧标签'])
 
 
 if __name__=='__main__':unittest.main()

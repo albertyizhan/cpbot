@@ -293,6 +293,7 @@ class BackupStore:
                 columns = [r['name'] for r in self.db.execute('PRAGMA table_info('+table+')')]
                 self.db.executemany('INSERT INTO '+table+' ('+','.join(columns)+') VALUES ('+','.join('?' for _ in columns)+')',
                                     ([row[c] for c in columns] for row in data['tables'][table]))
+            self.clear_notes()
             for uid in {actor, *self.configured_admins}:
                 self.db.execute('INSERT OR IGNORE INTO admins VALUES(?)',(uid,))
             if 'membership_target' in data:
