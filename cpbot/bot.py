@@ -1,5 +1,6 @@
 import html
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -18,10 +19,11 @@ def date(stamp):
 
 
 class Bot:
-    def __init__(self, store, api, username, bot_id=0):
+    def __init__(self, store, api, username, bot_id=0, router=None):
         self.store, self.api, self.username = store, api, username
+        self.router = router
         self.sessions, self.triggers = {}, {}
-        self.publisher = Publisher(store, api, username, bot_id)
+        self.publisher = Publisher(store, api, username, bot_id, router.pacing if router else None)
         self.edit_target = None
         self.notices = {}
         self.imports = {}
@@ -97,6 +99,9 @@ class Bot:
         text = '🏠 车评主菜单\n🟢 当前可查询、填写车评。' if self.store.ready() else '⚠️ 机器人尚未配置完成或专帖绑定已失效。\n普通业务暂不可用，请联系管理员检查老师专帖频道。'
         if self.paused():
             text += '\n⏸ 发布队列已暂停，已提交的车评会等待管理员恢复发布。'
+        if self.router and len(self.store.clusters.names) > 1:
+            text += '\n当前集群：' + self.store.clusters.names[self.store.cluster_id]
+            rows.append([('选择集群', 'clusters:home:0')])
         return self.panel(uid, text, rows)
 
     def prompt(self, uid, text, pending, back='home'):
@@ -196,7 +201,12 @@ class Bot:
     def admin_panel(self, uid):
         self.store.require_admin(uid)
         counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers WHERE deleted_at IS NULL), (SELECT count(*) FROM bindings WHERE mode='thread' AND active=1), (SELECT count(*) FROM reviews WHERE status='accepted')", ).fetchone()
-        return self.panel(uid, '⚙️ 管理后台\n👩‍🏫 老师 %s 位 · 📣 可用专帖频道 %s 个\n📝 有效车评 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), [
+        heading = '⚙️ 管理后台'
+        cluster_rows = []
+        if self.router:
+            heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
+            cluster_rows = [[('选择集群', 'clusters:admin:0'), ('修改名称', 'clusterrename')]]
+        return self.panel(uid, heading + '\n👩‍🏫 老师 %s 位 · 📣 可用专帖频道 %s 个\n📝 有效车评 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), cluster_rows + [
             [('👩‍🏫 老师列表', 'teachersadmin'), ('➕ 添加老师', 'teachernew')],
             [('📥 批量导入老师', 'teacherbatch')],
             [('🗑 老师回收站', 'teachertrash'), ('⏳ 设置保留天数', 'trashdays')],
@@ -207,9 +217,46 @@ class Bot:
             [('💾 导出数据备份', 'export'), ('📥 导入数据备份', 'import')],
             [('返回主菜单', 'home')]])
 
+    def cluster_panel(self, uid, destination, page):
+        is_admin = self.store.admin(uid)
+        choices = [(cluster_id, name) for cluster_id, name in self.store.clusters.names.items()
+                   if is_admin or self.router.bots[cluster_id].store.ready()]
+        rows = [[(('✓ ' if cluster_id == self.store.cluster_id else '') +
+                  (name if name == str(cluster_id) else '%s · #%s' % (name, cluster_id)),
+                  'clusterselect:%s:%s' % (destination, cluster_id))]
+                for cluster_id, name in choices[page * 8:(page + 1) * 8]]
+        nav = []
+        if page:
+            nav.append(('上一页', 'clusters:%s:%s' % (destination, page - 1)))
+        if len(choices) > (page + 1) * 8:
+            nav.append(('下一页', 'clusters:%s:%s' % (destination, page + 1)))
+        if nav:
+            rows.append(nav)
+        if destination != 'home':
+            rows.append([('＋ 新建集群', 'clusternew')])
+        return self.panel(uid, '选择集群' if choices else '暂无可用集群。', rows + [[('返回', destination)]])
+
     def action(self, user, action):
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
+        if self.router and kind in ('clusters', 'clusterselect', 'clusternew', 'clusterrename'):
+            if kind == 'clusternew':
+                self.store.require_admin(uid)
+                return self.router.switch(self, uid, self.router.create(uid), 'admin')
+            if kind == 'clusterrename':
+                self.store.require_admin(uid)
+                destination = 'bindings' if parts[1:] == ['bindings'] else 'admin'
+                return self.prompt(uid, '当前名称：%s\n发送新名称（1～40 字）。' %
+                                   self.store.clusters.names[self.store.cluster_id], ('clusterrename', destination),
+                                   destination)
+            destination = parts[1]
+            if destination not in ('home', 'admin', 'bindings'):
+                raise ValueError('请从主菜单重新选择集群。')
+            if destination != 'home':
+                self.store.require_admin(uid)
+            if kind == 'clusters':
+                return self.cluster_panel(uid, destination, int(parts[2]))
+            return self.router.switch(self, uid, int(parts[2]), destination)
         admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset','codesadmin','codefor','admins','adminadd','adminremove',
                        'teacherbatch','teacherbatchpage','teacherbatchconfirm','teacherbatchcancel',
                        'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
@@ -249,8 +296,7 @@ class Bot:
         if kind=='trashdaysset':
             return self.prompt(uid,'发送新的保留天数（1～3650）。',('trashdaysset',),'admin')
         if kind=='membertargetclear':
-            self.store.db.execute("DELETE FROM settings WHERE key='membership_target'")
-            self.store.log(uid,'取消在群判定目标','')
+            self.store.set_membership_target(uid, None)
             self.success(uid,'已取消指定判定群。')
             return self.action(user,'membertarget')
         if kind == 'write':
@@ -397,7 +443,7 @@ class Bot:
             return self.action(user,'teacherdetail:%s'%tid)
         if kind=='teachersadmin': return self.teachers(uid,'teacherdetail')
         if kind=='admins':
-            rows=[[('移除 %s'%r[0],'adminremove:%s'%r[0])] for r in self.store.db.execute('SELECT user_id FROM admins ORDER BY user_id')]
+            rows=[[('移除 %s'%admin,'adminremove:%s'%admin)] for admin in self.store.admin_ids()]
             return self.panel(uid,'👑 superadmin 名单\n下列账号拥有同等管理权限。添加后立即生效。',rows+[[('添加','adminadd'),('返回','admin')]])
         if kind=='adminadd': return self.prompt(uid,'发送要添加的 Telegram 数字 ID。',('adminadd',),'admins')
         if kind=='adminremove':
@@ -407,9 +453,22 @@ class Bot:
             self.success(uid, '已移除管理员 %s。如该 ID 仍在 .env 中，重启后会重新添加。' % parts[1])
             return self.home(uid)
         if kind=='bindings':
-            rows=[[('%s · %s%s'%(MODES[b['mode']],b['title'],'（暂停）' if not b['active'] else ''),'binding:%s'%b['id'])] for b in self.store.db.execute('SELECT * FROM bindings')]
+            page = max(0, int(parts[1])) if len(parts) > 1 else 0
+            bindings = self.store.db.execute('SELECT * FROM bindings ORDER BY id LIMIT 13 OFFSET ?', (page * 12,)).fetchall()
+            rows=[[('%s · %s%s'%(MODES[b['mode']],b['title'],'（暂停）' if not b['active'] else ''),'binding:%s'%b['id'])] for b in bindings[:12]]
+            nav = []
+            if page:
+                nav.append(('上一页', 'bindings:%s' % (page - 1)))
+            if len(bindings) > 12:
+                nav.append(('下一页', 'bindings:%s' % (page + 1)))
+            if nav:
+                rows.append(nav)
             rows += [[('添加'+name,'bind:'+mode)] for mode,name in MODES.items()]
-            return self.panel(uid,'📣 模式绑定\n✅ 已启用 %s 个 · ⏸ 已暂停 %s 个\n频道和群不可重复占用。选择绑定可查看状态、同步进度。' % (self.store.db.execute('SELECT count(*) FROM bindings WHERE active=1').fetchone()[0], self.store.db.execute('SELECT count(*) FROM bindings WHERE active=0').fetchone()[0]),rows+[[('返回','admin')]])
+            heading = '📣 模式绑定'
+            if self.router:
+                heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
+                rows.insert(0, [('选择集群', 'clusters:bindings:0'), ('修改名称', 'clusterrename:bindings')])
+            return self.panel(uid,heading + '\n✅ 已启用 %s 个 · ⏸ 已暂停 %s 个\n频道和群不可重复占用。选择绑定可查看状态、同步进度。' % (self.store.db.execute('SELECT count(*) FROM bindings WHERE active=1').fetchone()[0], self.store.db.execute('SELECT count(*) FROM bindings WHERE active=0').fetchone()[0]),rows+[[('返回','admin')]])
         if kind=='bind': return self.prompt(uid,'发送目标频道/群的数字 ID 或 @用户名。先把机器人设为管理员；专帖频道必须关联讨论组。',('bind',parts[1]),'bindings')
         if kind=='binding':
             b=self.store.db.execute('SELECT * FROM bindings WHERE id=?',(int(parts[1]),)).fetchone()
@@ -420,7 +479,7 @@ class Bot:
             detail = '\n'.join(('%s · %s' % (MODES[b['mode']], b['title']), status,
                 '频道/群：%s' % b['chat_id'], '讨论组：%s' % (b['discussion'] or '不需要'), progress))
             if self.paused() and b['mode'] != 'lookup':
-                detail += '\n⏸ 全局发布已暂停，请到发布任务中继续。'
+                detail += '\n⏸ %s发布已暂停，请到发布任务中继续。' % ('本集群' if self.router else '全局')
             waiting = self.store.db.execute('SELECT count(*) FROM posts WHERE binding=? AND message IS NOT NULL AND root IS NULL',(b['id'],)).fetchone()[0]
             if waiting:
                 detail += '\n⏳ %s 位老师正在等待讨论串关联。长时间不变请检查讨论组权限或登记根消息。' % waiting
@@ -447,21 +506,28 @@ class Bot:
             with self.store.transaction():
                 bid=int(parts[1]); self.store.db.execute("UPDATE jobs SET state='superseded' WHERE binding=?",(bid,))
                 self.store.db.execute('DELETE FROM publications WHERE binding=?',(bid,))
+                self.store.db.execute('DELETE FROM proof_publications WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM jobs WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM posts WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM bindings WHERE id=?',(bid,));self.store.log(uid,'解除绑定',bid)
+            if self.store.clusters:
+                self.store.clusters.refresh_routes(self.store)
             self.success(uid, '绑定已解除，后续不再向此目标发布；远端消息保留。')
             return self.action(user,'bindings')
         if kind=='export':
             text,images=self.store.export(self.publisher.bot_id,split=True)
-            name='cpbot-%s'%datetime.now(TZ).strftime('%Y%m%d-%H%M%S')
+            name='cpbot-%s-%s' % (self.store.cluster_id, datetime.now(TZ).strftime('%Y%m%d-%H%M%S'))
             self.api.document(uid,name+'.json',text)
             self.api.document(uid,name+'-images.zip',images)
             self.success(uid, 'JSON 数据和 ZIP 图片集已发送，请将这两个配套文件一起保存。')
             return self.admin_panel(uid)
         if kind=='import':
             self.imports.pop(uid, None)
-            return self.prompt(uid,'📥 导入数据备份\n请依次上传同一批备份的 JSON 数据（最大 15 MB）和 ZIP 图片集（最大 19 MB），顺序不限。\n将按备份整体恢复，不合并；覆盖当前老师、标签、车评、管理员名单和发布记录。\n上传后先校验和预览，确认后才写入；当前操作者和 .env 管理员保留。',('importfile',),'admin')
+            scope = '当前集群'
+            if self.router:
+                scope = '集群「%s」' % self.store.clusters.names[self.store.cluster_id]
+            admins = ' 集群 1 的备份同时恢复 superadmin 名单，保留当前操作者和 .env 管理员。' if self.store.cluster_id == 1 else ''
+            return self.prompt(uid,'📥 导入数据备份\n请上传同一批 JSON（最大 15 MB）和 ZIP（最大 19 MB），顺序不限。\n确认后覆盖%s的业务数据。%s\n上传后可先预览。' % (scope, admins),('importfile',),'admin')
         if kind=='importcancel':
             self.imports.pop(uid, None)
             self.success(uid,'已取消导入，当前数据未改变。')
@@ -476,7 +542,6 @@ class Bot:
             self.sessions.clear()
             self.imports.clear()
             self.triggers.clear()
-            self.publisher.next_chat.clear()
             self.success(uid,'数据已恢复，导入前数据已保存。所有绑定和发布队列已暂停：请逐个检查频道权限、核对消息位置，再继续发布。')
             self.admin_panel(uid)
             try:
@@ -646,12 +711,15 @@ class Bot:
                 self.success(uid, '新增内容已保存，下方显示最新资料。')
                 return self.show_person(uid,p['id'])
             self.store.require_admin(uid)
+            if kind=='clusterrename':
+                self.store.clusters.rename(uid, self.store.cluster_id, text)
+                self.success(uid, '集群名称已更新。')
+                return self.action(user, pending[1])
             if kind=='membertargetset':
                 cid=int(text) if text.lstrip('-').isdigit() else text
                 chat,_=self.publisher.validate('lookup',cid)
                 value={'id':chat['id'],'title':chat.get('title',str(chat['id']))}
-                self.store.db.execute("INSERT OR REPLACE INTO settings VALUES('membership_target',?)",(json.dumps(value,ensure_ascii=False),))
-                self.store.log(uid,'设置在群判定目标',chat['id'])
+                self.store.set_membership_target(uid, value)
                 self.success(uid,'判定目标已保存，机器人管理员权限检查通过。')
                 return self.action(user,'membertarget')
             if kind=='trashdaysset':
@@ -686,7 +754,11 @@ class Bot:
                         return self.prompt(uid,'📥 JSON 数据已收到，尚未导入。请继续上传配套 ZIP 图片集。',('importfile',),'importcancel')
                     raise
                 tables=data['tables']
-                summary='📥 备份校验通过，尚未导入\n导出时间：%s\n老师：%s · 客户：%s · 车评：%s\n证明图：%s · 绑定：%s · superadmin：%s\n\n⚠️ 确认后整体覆盖当前数据，不合并。预览期间的新数据也将被覆盖。\n✅ 恢复前自动保存原数据；保留当前操作者及 .env 管理员。\n⏸ 恢复后绑定及发布全部暂停，须重新检查，防止旧备份重复发帖。' % (date(data['created']),len(tables['teachers']),len(tables['people']),len(tables['reviews']),len(data.get('media',{})),len(tables['bindings']),len(tables['admins']))
+                self.store.check_backup_scope(data)
+                scope = self.store.clusters.names[self.store.cluster_id] if self.router else '1'
+                summary='📥 备份校验通过，尚未导入\n目标集群：%s\n导出时间：%s\n老师：%s · 客户：%s · 车评：%s\n证明图：%s · 绑定：%s\n\n⚠️ 确认后覆盖此集群的数据，包括预览期间的新数据。\n恢复前自动保存原数据。恢复后，此集群的绑定和队列暂停，请核对后恢复发布。' % (scope,date(data['created']),len(tables['teachers']),len(tables['people']),len(tables['reviews']),len(data.get('media',{})),len(tables['bindings']))
+                if self.store.cluster_id == 1:
+                    summary += '\n同时恢复 superadmin 名单，保留当前操作者和 .env 管理员。'
                 return self.panel(uid,summary,[[('确认覆盖并恢复','importconfirm')],[('取消，不改数据','importcancel')]],('importfile',))
             if kind in ('teachernew','teacherrename'):
                 if len(text.splitlines())!=1:
@@ -772,8 +844,8 @@ class Bot:
                     notice='⚠️ 专帖频道检查未通过。\n'+str(error)
                 except APIError as error:
                     notice=self.api_hint(error)
-                for admin in self.store.db.execute('SELECT user_id FROM admins'):
-                    try:self.send(admin[0],notice+'\n频道 ID：'+str(cid))
+                for admin in self.store.admin_ids():
+                    try:self.send(admin,notice+'\n频道 ID：'+str(cid))
                     except APIError:pass
             if e['new_chat_member']['status'] not in ('administrator','creator'):
                 self.store.db.execute("UPDATE bindings SET active=0,error='机器人管理员权限已失效' WHERE chat_id=? OR discussion=?",(cid,cid))
@@ -911,8 +983,92 @@ class Bot:
                         raise
                     # Existing state is explicitly dated in the card.
                     pass
-            buttons = [[{'text': label, 'url': 'https://t.me/%s?start=%s_%s' % (self.username, intent, p['id'])}
+            buttons = [[{'text': label, 'url': 'https://t.me/%s?start=%s' %
+                        (self.username, self.store.start_payload(intent, p['id']))}
                         for label, intent in (('新增标签', 'edit'), ('删除标签', 'delete'))]]
             notice = self.match_notice(target)
             self.send(chat['id'], (notice + '\n\n' if notice else '') + self.card(p, chat['id']) + self.target_membership(p, group=True) + '\n\n以上为查询时的资料，更新后请重新查询。', buttons,
                       reply_parameters={'message_id': message['message_id'], 'allow_sending_without_reply': True})
+
+
+class ClusterBot:
+    """One polling identity, with a private menu context and a group route."""
+
+    def __init__(self, stores, api, username, bot_id):
+        self.stores, self.api, self.username, self.bot_id = stores, api, username, bot_id
+        self.pacing = [0, {}]
+        self.bots = {cid: self.make_bot(store) for cid, store in stores.stores.items()}
+        self.selected = {}
+        self.next_publisher = 0
+
+    def make_bot(self, store):
+        return Bot(store, self.api, self.username, self.bot_id, self)
+
+    def create(self, uid):
+        store = self.stores.create(uid)
+        self.bots[store.cluster_id] = self.make_bot(store)
+        return store.cluster_id
+
+    def select(self, source, target, uid):
+        if target is source:
+            return
+        source.sessions.pop(uid, None)
+        source.teacher_imports.pop(uid, None)
+        source.imports.pop(uid, None)
+        self.selected[uid] = target.store.cluster_id
+
+    def switch(self, source, uid, cluster_id, destination):
+        target = self.bots.get(cluster_id)
+        if not target or (not self.stores.primary.admin(uid) and not target.store.ready()):
+            raise ValueError('此集群暂不可用。')
+        target.edit_target = source.edit_target
+        try:
+            result = target.action({'id': uid}, destination)
+        finally:
+            target.edit_target = None
+        self.select(source, target, uid)
+        return result
+
+    def handle(self, update):
+        if 'callback_query' in update:
+            uid = update['callback_query']['from']['id']
+            return self.bots[self.selected.get(uid, 1)].handle(update)
+        event = next((update[key] for key in ('message', 'edited_message', 'chat_member', 'my_chat_member')
+                      if key in update), None)
+        if not event:
+            return
+        chat = event['chat']
+        if chat['type'] != 'private':
+            cluster_id = self.stores.routes.get(chat['id'])
+            if cluster_id is not None or 'my_chat_member' in update:
+                return self.bots[cluster_id or 1].handle(update)
+            return
+        uid = chat['id']
+        source = self.bots[self.selected.get(uid, 1)]
+        if 'message' in update:
+            match = re.fullmatch(r'(/start(?:@\w+)?)\s+(?:c([1-9]\d{0,18})_)?((?:review|edit|delete)_[0-9]{1,19})',
+                                 event.get('text', '').strip(), flags=re.ASCII)
+            if match:
+                cluster_id = int(match[2] or 1)
+                target = self.bots.get(cluster_id)
+                if not target:
+                    return source.send(uid, '该链接对应的集群不存在。')
+                self.select(source, target, uid)
+                try:
+                    return target.message({**event, 'text': match[1] + ' ' + match[3]})
+                except ValueError as error:
+                    return target.send(uid, str(error))
+        return source.handle(update)
+
+    def tick(self):
+        publishers = [bot.publisher for bot in self.bots.values()]
+        start = self.next_publisher
+        for i in range(len(publishers)):
+            index = (start + i) % len(publishers)
+            before = self.pacing[0]
+            publishers[index].tick()
+            if self.pacing[0] != before:
+                self.next_publisher = (index + 1) % len(publishers)
+
+    def poll_timeout(self):
+        return min(bot.publisher.poll_timeout() for bot in self.bots.values())

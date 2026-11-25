@@ -50,6 +50,9 @@ def validate_backup(content, bot_id=0, images=None):
         raise ValueError('备份的机器人身份信息无效。')
     if source and bot_id and source != bot_id:
         raise ValueError('这是其他机器人的备份，消息映射不能直接恢复到当前机器人。')
+    cluster_id = data.get('cluster_id', 1)
+    if type(cluster_id) is not int or not 0 < cluster_id < 2**63:
+        raise ValueError('备份集群编号无效。')
     if type(data.get('created')) not in (int, float) or not math.isfinite(data['created']) or data['created'] <= 0:
         raise ValueError('备份导出时间无效。')
     if data.get('image_bundle') is not None:
@@ -209,12 +212,23 @@ def check_relations(db):
 
 
 class BackupStore:
+    def check_backup_scope(self, data):
+        if data.get('cluster_id', 1) != self.cluster_id:
+            raise ValueError('这份备份属于集群 #%s，请切换到对应集群后再恢复。' % data.get('cluster_id', 1))
+        ids = [value for row in data['tables']['bindings']
+               for value in (row['chat_id'], row['discussion']) if value is not None]
+        if data.get('membership_target'):
+            ids.append(data['membership_target']['id'])
+        self.check_chat_ownership(ids)
+
     def export(self, source_bot=0, split=False):
         target = sqlite3.connect(':memory:')
         target.row_factory = sqlite3.Row
         try:
             self.db.backup(target)
             data=json.loads(encode_backup(target, source_bot))
+            data['cluster_id'] = self.cluster_id
+            data['tables']['admins'] = [{'user_id': uid} for uid in self.admin_ids()]
             names=set()
             for table in ('reviews','drafts'):
                 for row in data['tables'][table]:
@@ -272,6 +286,7 @@ class BackupStore:
     def import_backup(self, actor, content, source_bot=0, images=None):
         self.require_admin(actor)
         data = validate_backup(content, source_bot, images)
+        self.check_backup_scope(data)
         recovery = self.recovery_backup(source_bot)
         # Materialize immutable random-named files before switching database references.
         for name,encoded in data.get('media',{}).items():
@@ -305,4 +320,6 @@ class BackupStore:
             self.db.execute("INSERT OR REPLACE INTO settings VALUES('publishing_paused','1')")
             self.db.execute("DELETE FROM settings WHERE key='last_check'")
             self.log(actor,'导入备份',str(recovery))
+        if self.clusters:
+            self.clusters.refresh_routes(self)
         return recovery

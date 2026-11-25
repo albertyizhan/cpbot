@@ -16,6 +16,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from cpbot.__main__ import load_env, admin_ids
+from cpbot.store import cluster_directory
 
 # Explicit inventory: upgrades cannot overwrite config, databases or unknown files.
 FILES = ('cpbot/__init__.py', 'cpbot/__main__.py', 'cpbot/api.py', 'cpbot/bot.py',
@@ -47,13 +48,25 @@ def backup():
     descriptor, temporary = tempfile.mkstemp(prefix='cpbot-snapshot-', suffix='.sqlite3')
     os.close(descriptor)
     snapshot = Path(temporary)
+    def copy_database(source_path):
+        with sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True, timeout=10) as source:
+            with sqlite3.connect(snapshot) as dest:
+                source.backup(dest)
+                if dest.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise ValueError('数据库备份完整性检查失败：%s' % source_path)
+                if dest.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='clusters'").fetchone():
+                    return [row[0] for row in dest.execute('SELECT id FROM clusters WHERE id>1 ORDER BY id')]
+        return []
+
+    def archive_proofs(archive, parent, prefix):
+        proofs = parent / 'proofs'
+        if proofs.is_dir():
+            for image in proofs.iterdir():
+                if image.is_file() and image.suffix == '.jpg':
+                    archive.add(image, arcname=prefix + 'proofs/' + image.name, recursive=False)
+
     try:
-        if db.exists():
-            with sqlite3.connect(db.as_uri() + '?mode=ro', uri=True, timeout=10) as source:
-                with sqlite3.connect(snapshot) as dest:
-                    source.backup(dest)
-                    if dest.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-                        raise ValueError('数据库备份完整性检查失败。')
+        cluster_ids = copy_database(db) if db.exists() else []
         with tarfile.open(target, 'x:gz') as archive:
             for name in FILES:
                 path = ROOT / name
@@ -63,11 +76,13 @@ def backup():
                 archive.add(env, arcname='config.env', recursive=False)
             if db.exists():
                 archive.add(snapshot, arcname='database.sqlite3', recursive=False)
-            proofs=db.parent/'proofs'
-            if proofs.is_dir():
-                for image in proofs.iterdir():
-                    if image.is_file() and image.suffix=='.jpg':
-                        archive.add(image,arcname='proofs/'+image.name,recursive=False)
+            archive_proofs(archive, db.parent, '')
+            for cluster_id in cluster_ids:
+                folder = cluster_directory(db) / str(cluster_id)
+                copy_database(folder / 'database.sqlite3')
+                prefix = 'clusters/%s/' % cluster_id
+                archive.add(snapshot, arcname=prefix + 'database.sqlite3', recursive=False)
+                archive_proofs(archive, folder, prefix)
             manifest = json.dumps({'database_path': str(db), 'env_path': str(env),
                                     'created': time.time()}, ensure_ascii=False).encode()
             info = tarfile.TarInfo('manifest.json')

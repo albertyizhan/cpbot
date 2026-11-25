@@ -35,10 +35,10 @@ def render_review(store, row):
 
 
 class Publisher:
-    def __init__(self, store, api, username, bot_id):
+    def __init__(self, store, api, username, bot_id, pacing=None):
         self.s, self.api, self.username, self.bot_id = store, api, username, bot_id
-        self.next_global = 0
-        self.next_chat = {}
+        self.pacing = pacing if pacing is not None else [0, {}]
+        self.next_chat = self.pacing[1]
         self.next_cleanup = 0
         migration = 'summary_body_link_v1'
         if not self.s.db.execute('SELECT 1 FROM settings WHERE key=?', (migration,)).fetchone():
@@ -46,6 +46,14 @@ class Publisher:
                 for post in self.s.db.execute('SELECT * FROM posts WHERE message IS NOT NULL'):
                     self.s.enqueue('summary',post['binding'],post['teacher'],generation=100000000000000001)
                 self.s.db.execute('INSERT INTO settings VALUES(?,?)',(migration,'1'))
+
+    @property
+    def next_global(self):
+        return self.pacing[0]
+
+    @next_global.setter
+    def next_global(self, value):
+        self.pacing[0] = value
 
     def _chat(self, cid, label):
         try:
@@ -96,7 +104,8 @@ class Publisher:
         stats = self.s.db.execute("SELECT count(*),avg(CAST(json_extract(data,'$.综合') AS REAL)) FROM reviews WHERE teacher=? AND status='accepted'", (tid,)).fetchone()
         text = '【老师】：%s\n【综合评分】：%s\n【有效评价】：%s\n\n历史评价请查看本帖评论区。' % (
             html.escape(t['name']), '%.1f / 10' % stats[1] if stats[0] else '暂无', stats[0])
-        text += '\n\n✍️ <a href="https://t.me/%s?start=review_%s">给这位老师写评价</a>' % (self.username, tid)
+        text += '\n\n✍️ <a href="https://t.me/%s?start=%s">给这位老师写评价</a>' % (
+            self.username, self.s.start_payload('review', tid))
         return text, {'inline_keyboard': []}
 
     def automatic_forward(self, msg):

@@ -14,6 +14,8 @@ class Store(ReviewStore, BackupStore):
     def __init__(self, path, owner, configured_admins=()):
         self.owner = owner
         self.configured_admins = tuple(configured_admins)
+        self.cluster_id = 1
+        self.clusters = None
         self.db = sqlite3.connect(path, isolation_level=None, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
@@ -47,6 +49,48 @@ class Store(ReviewStore, BackupStore):
                 if not isinstance(uid, int) or not 0 < uid < 2**63:
                     raise ValueError("无效的 superadmin ID。")
                 self.db.execute("INSERT OR IGNORE INTO admins VALUES(?)", (uid,))
+
+    def admin_ids(self):
+        authority = self.clusters.primary if self.clusters else self
+        return [row[0] for row in authority.db.execute('SELECT user_id FROM admins ORDER BY user_id')]
+
+    def admin(self, uid):
+        authority = self.clusters.primary if self.clusters else self
+        return ReviewStore.admin(authority, uid)
+
+    def set_admin(self, actor, uid, add=True):
+        authority = self.clusters.primary if self.clusters else self
+        return ReviewStore.set_admin(authority, actor, uid, add)
+
+    def membership_target(self):
+        row = self.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
+        return json.loads(row[0]) if row else None
+
+    def start_payload(self, action, record_id):
+        payload = '%s_%s' % (action, record_id)
+        return payload if self.cluster_id == 1 else 'c%s_%s' % (self.cluster_id, payload)
+
+    def check_chat_ownership(self, chat_ids):
+        if self.clusters:
+            for chat_id in chat_ids:
+                owner = self.clusters.routes.get(chat_id)
+                if owner is not None and owner != self.cluster_id:
+                    raise ValueError('群或频道 %s 已归属集群「%s」。' % (chat_id, self.clusters.names[owner]))
+
+    def set_membership_target(self, actor, target):
+        self.require_admin(actor)
+        if target:
+            self.check_chat_ownership([target['id']])
+        with self.transaction():
+            if target:
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('membership_target',?)",
+                                (json.dumps(target, ensure_ascii=False),))
+                self.log(actor, '设置在群判定目标', target['id'])
+            else:
+                self.db.execute("DELETE FROM settings WHERE key='membership_target'")
+                self.log(actor, '取消在群判定目标', '')
+        if self.clusters:
+            self.clusters.refresh_routes(self)
 
     def clear_notes(self):
         self.db.execute("UPDATE people SET note='' WHERE note<>''")
@@ -184,3 +228,84 @@ class Store(ReviewStore, BackupStore):
 
 def display_name(user):
     return ' '.join(filter(None, (user.get('first_name'), user.get('last_name'))))[:160] or str(user['id'])
+
+
+def cluster_directory(database):
+    return database.with_name(database.name + '.clusters')
+
+
+class ClusterStores:
+    """The original database holds cluster 1, the registry and global administrators."""
+
+    def __init__(self, path, primary):
+        self.directory = cluster_directory(path)
+        self.primary = primary
+        self.stores = {1: primary}
+        self.routes = {}
+        with primary.transaction():
+            primary.db.execute('''CREATE TABLE IF NOT EXISTS clusters(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)''')
+            primary.db.execute("INSERT OR IGNORE INTO clusters VALUES(1,'1')")
+        self.names = dict(primary.db.execute('SELECT id,name FROM clusters ORDER BY id').fetchall())
+        primary.clusters = self
+        for cluster_id in self.names:
+            if cluster_id != 1:
+                self.stores[cluster_id] = self.open_store(cluster_id, existing=True)
+        for store in self.stores.values():
+            self.refresh_routes(store)
+
+    def open_store(self, cluster_id, existing=False):
+        directory = self.directory / str(cluster_id)
+        path = directory / 'database.sqlite3'
+        if existing:
+            if not path.is_file():
+                raise ValueError('缺少集群 %s 的数据库：%s' % (cluster_id, path))
+        else:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        store = Store(str(path), self.primary.owner)
+        store.cluster_id, store.clusters = cluster_id, self
+        return store
+
+    def refresh_routes(self, store):
+        cluster_id = store.cluster_id
+        ids = {value for row in store.db.execute('SELECT chat_id,discussion FROM bindings')
+               for value in row if value is not None}
+        target = store.membership_target()
+        if target:
+            ids.add(target['id'])
+        store.check_chat_ownership(ids)
+        for chat_id, owner in list(self.routes.items()):
+            if owner == cluster_id and chat_id not in ids:
+                del self.routes[chat_id]
+        self.routes.update(dict.fromkeys(ids, cluster_id))
+
+    def create(self, actor):
+        self.primary.require_admin(actor)
+        store = None
+        try:
+            with self.primary.transaction():
+                cluster_id = self.primary.db.execute("INSERT INTO clusters(name) VALUES('')").lastrowid
+                name = str(cluster_id)
+                self.primary.db.execute('UPDATE clusters SET name=? WHERE id=?', (name, cluster_id))
+                store = self.open_store(cluster_id)
+                self.primary.log(actor, '新建集群', cluster_id)
+        except BaseException:
+            if store:
+                store.db.close()
+            raise
+        self.stores[cluster_id], self.names[cluster_id] = store, name
+        return store
+
+    def rename(self, actor, cluster_id, name):
+        self.primary.require_admin(actor)
+        if not 1 <= len(name) <= 40 or not name.isprintable():
+            raise ValueError('请发送 1～40 个可显示字符作为集群名称。')
+        with self.primary.transaction():
+            self.primary.db.execute('UPDATE clusters SET name=? WHERE id=?', (name, cluster_id))
+            self.primary.log(actor, '集群改名', '%s · %s' % (cluster_id, name))
+        self.names[cluster_id] = name
+
+    def close(self):
+        for store in self.stores.values():
+            if store is not self.primary:
+                store.db.close()

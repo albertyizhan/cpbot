@@ -418,6 +418,7 @@ class ReviewStore:
         if mode not in MODES:
             raise ValueError('未知模式。')
         ids = [chat['id']] + ([discussion] if discussion else [])
+        self.check_chat_ownership(ids)
         with self.transaction():
             for cid in ids:
                 if self.db.execute('SELECT 1 FROM bindings WHERE chat_id=? OR discussion=?', (cid, cid)).fetchone():
@@ -428,4 +429,6 @@ class ReviewStore:
                 for t in self.db.execute('SELECT id FROM teachers WHERE deleted_at IS NULL'):
                     self.ensure_post(bid, t['id'])
             self.log(actor, '绑定 ' + mode, chat['id'])
-            return bid
+        if self.clusters:
+            self.clusters.refresh_routes(self)
+        return bid

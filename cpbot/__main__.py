@@ -8,8 +8,8 @@ import threading
 import time
 
 from .api import API, APIError
-from .bot import Bot
-from .store import Store
+from .bot import ClusterBot
+from .store import ClusterStores, Store
 
 
 def load_env(path):
@@ -56,20 +56,24 @@ def main():
         signal.signal(sig, lambda *_: stop.set())
     store, api = Store(str(path), configured_admins[0], configured_admins), API(token)
     os.chmod(path, 0o600)
+    clusters = None
     try:
+        clusters = ClusterStores(path, store)
         me = api.call('getMe')
-        bot = Bot(store, api, me['username'].lower(), me['id'])
+        bot = ClusterBot(clusters, api, me['username'].lower(), me['id'])
         # Validate saved bindings again on startup; do not trust stale administrator rights.
-        for binding in store.db.execute('SELECT * FROM bindings WHERE active=1').fetchall():
-            try:
-                _, discussion = bot.publisher.validate(binding['mode'], binding['chat_id'])
-                if discussion != binding['discussion']:
-                    raise ValueError('讨论组关联已变化，请重新绑定。')
-            except (ValueError, APIError) as error:
-                if isinstance(error, APIError) and (error.code == 0 or error.code >= 500 or error.code == 429):
-                    raise SystemExit('启动时无法确认频道权限，请稍后重启；未修改绑定。') from None
-                store.db.execute('UPDATE bindings SET active=0,error=? WHERE id=?',
-                                 (str(error), binding['id']))
+        for cluster_bot in bot.bots.values():
+            db = cluster_bot.store.db
+            for binding in db.execute('SELECT * FROM bindings WHERE active=1').fetchall():
+                try:
+                    _, discussion = cluster_bot.publisher.validate(binding['mode'], binding['chat_id'])
+                    if discussion != binding['discussion']:
+                        raise ValueError('讨论组关联已变化，请重新绑定。')
+                except (ValueError, APIError) as error:
+                    if isinstance(error, APIError) and (error.code == 0 or error.code >= 500 or error.code == 429):
+                        raise SystemExit('启动时无法确认频道权限，请稍后重启。') from None
+                    db.execute('UPDATE bindings SET active=0,error=? WHERE id=?',
+                               (str(error), binding['id']))
         api.call('setMyCommands', commands=[{'command': 'start', 'description': '打开主菜单'},
                                            {'command': 'cancel', 'description': '取消当前操作'}])
         saved = store.db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()
@@ -80,8 +84,8 @@ def main():
         update_count = poll_count = 0
         while not stop.is_set():
             try:
-                bot.publisher.tick()
-                updates = api.call('getUpdates', offset=offset, timeout=bot.publisher.poll_timeout(), limit=20,
+                bot.tick()
+                updates = api.call('getUpdates', offset=offset, timeout=bot.poll_timeout(), limit=20,
                                    allowed_updates=['message', 'edited_message', 'callback_query', 'chat_member', 'my_chat_member'])
                 poll_count += 1
                 for update in updates:
@@ -112,6 +116,8 @@ def main():
                 logging.warning('Polling failed: API code %s', error.code)
                 stop.wait(max(3, error.retry_after))
     finally:
+        if clusters:
+            clusters.close()
         store.db.close()
         lock.close()
 
