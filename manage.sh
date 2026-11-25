@@ -41,8 +41,10 @@ run_action() {
             [[ -n "${2:-}" ]] || { echo '用法：bash manage.sh upgrade /opt/cpbot-new'; return 1; }
             "$PYTHON" deploy/operations.py upgrade "$2"
             ;;
-        run) "$PYTHON" -m cpbot ;;
-        *) echo '用法：bash manage.sh [install|start|stop|restart|status|logs|backup|update|upgrade 新版目录|run]'; return 1 ;;
+        build-go) bash deploy/build-go.sh ;;
+        run) "$PYTHON" deploy/operations.py run ;;
+        migrate-sqlite) shift; exec .runtime/cpbot-go migrate-sqlite "$@" ;;
+        *) echo '用法：bash manage.sh [install|start|stop|restart|status|logs|backup|update|upgrade 新版目录|build-go|migrate-sqlite|run]'; return 1 ;;
     esac
 }
 

@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 backups/
 .maintenance.lock
+.runtime/

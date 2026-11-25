@@ -1,6 +1,8 @@
 # cpbot · 车评与客户查档
 
-独立 Telegram 机器人，使用自己的 Token、SQLite 数据库和服务。与 xcbot 无数据库、接口或运行时连接。Python 3.9+，仅使用标准库。
+独立 Telegram 机器人，使用自己的 Token、数据库和服务。与 xcbot 无数据库、接口或运行时连接。
+
+现有部署默认使用 Python 3.9+ 和 SQLite。计划切换到 Go + PostgreSQL 的部署请先完成[迁移演练](docs/GO_MIGRATION.md)。
 
 ## 开始使用
 
