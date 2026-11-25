@@ -386,7 +386,7 @@ class ClusterStores:
         return store
 
     def rename(self, actor, cluster_id, name):
-        self.primary.require_superadmin(actor)
+        self.stores[cluster_id].require_admin(actor)
         if not 1 <= len(name) <= 40 or not name.isprintable():
             raise ValueError('请发送 1～40 个可显示字符作为集群名称。')
         with self.primary.transaction():

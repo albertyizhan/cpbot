@@ -7,7 +7,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .comment_buttons import (MAX_COMMENT_COLUMNS, MAX_COMMENT_ROWS, comment_layout,
-                              default_comment_layout, validate_comment_layout, visible_comment_rows)
+                              default_comment_layout, hidden_comment_positions, validate_comment_layout,
+                              visible_comment_rows)
 
 TZ = ZoneInfo('Asia/Shanghai')
 FIELDS = ('时间', '老师', '出击证明', '人照', '颜值', '身材', '服务', '态度', '环境', '综合', '过程')
@@ -385,38 +386,34 @@ class ReviewStore:
         row = self.db.execute("SELECT value FROM settings WHERE key='comment_buttons'").fetchone()
         return comment_layout(json.loads(row[0])) if row else default_comment_layout()
 
-    def resize_comment_buttons(self, actor, axis, size):
-        self.require_admin(actor)
-        limits = {'rows': MAX_COMMENT_ROWS, 'columns': MAX_COMMENT_COLUMNS}
-        if axis not in limits or not 1 <= size <= limits[axis]:
-            raise ValueError('评论按钮的行列设置无效。')
-        with self.transaction():
-            layout = self.comment_buttons()
-            if layout[axis] == size:
-                return False
-            before = visible_comment_rows(layout)
-            layout[axis] = size
-            self._save_comment_buttons(layout, before)
-            self.log(actor, '调整评论按钮布局', f"{layout['rows']}×{layout['columns']}")
-            return True
-
-    def set_comment_button(self, actor, row, column, changes):
+    def set_comment_button(self, actor, row, column, changes, *, show=False):
         self.require_admin(actor)
         with self.transaction():
             layout = self.comment_buttons()
-            if not (1 <= row <= layout['rows'] and 1 <= column <= layout['columns']):
-                raise ValueError('这个位置已超出当前布局，请返回后重新选择。')
+            if not (1 <= row <= MAX_COMMENT_ROWS and 1 <= column <= MAX_COMMENT_COLUMNS):
+                raise ValueError('按钮位置无效，请返回后重新选择。')
             before = visible_comment_rows(layout)
+            hidden = hidden_comment_positions(layout)
             key = f'{row}:{column}'
             buttons = layout['buttons']
             old = buttons.get(key)
+            if show and old is None:
+                return False
             updated = {**(old or {}), **changes} if changes is not None else None
-            if old == updated:
+            if old == updated and not (show and key in hidden):
                 return False
             if updated is None:
                 buttons.pop(key)
             else:
                 buttons[key] = updated
+            if updated is None or show:
+                hidden.discard(key)
+            # Old dimensions no longer constrain editing. Keep previously hidden buttons hidden.
+            layout.update(rows=MAX_COMMENT_ROWS, columns=MAX_COMMENT_COLUMNS)
+            if hidden:
+                layout['hidden'] = sorted(hidden)
+            else:
+                layout.pop('hidden', None)
             self._save_comment_buttons(layout, before)
             self.log(actor, '设置评论按钮', key)
             return True

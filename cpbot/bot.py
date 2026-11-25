@@ -11,7 +11,8 @@ from itertools import islice, repeat
 
 from .api import APIError
 from .comment_buttons import (COMMENT_COLORS, MAX_COMMENT_COLUMNS, MAX_COMMENT_ROWS,
-                              REVIEW_ACTION, REVIEW_TEMPLATE, parse_comment_color)
+                              REVIEW_ACTION, REVIEW_TEMPLATE, hidden_comment_positions,
+                              parse_comment_color)
 from .identity import targets, member_present
 from .store import display_name
 from .reviews import FIELDS, INPUT_FIELDS, SCORES, valid_score, overall_score, missing_fields, valid_proof, MODES, TZ, now_text, review_date
@@ -19,8 +20,8 @@ from .publishing import Publisher, render_review
 from .backup import MAX_BACKUP_BYTES, MAX_IMAGE_ZIP_BYTES
 
 MEMBER_ACTIONS = {'write': '写车评', 'findteacher': '找老师', 'search': '查学生', 'lookup': '查学生'}
-COMMENT_EDITOR_ACTIONS = {'commentbuttons', 'cbsize', 'cbcell', 'cbedit', 'cbtemplate',
-                          'cbcontent', 'cbcolor', 'cbclear'}
+COMMENT_EDITOR_ACTIONS = {'commentbuttons', 'cbcell', 'cbedit', 'cbtemplate', 'cbcontent',
+                          'cbcolor', 'cbclear', 'cbshow'}
 COMMENT_LINK_HINT = '链接可用 {cluster_id}、{teacher_id}、{review_id}，分别带上集群、老师和车评编号。'
 
 def date(stamp):
@@ -237,11 +238,13 @@ class Bot:
         cluster_rows = []
         if self.router:
             heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
-            cluster_rows = [[('选择集群', 'clusters:admin:0'), ('成员资格来源', 'msources:0')]]
+            cluster_rows = [[('修改集群名称', 'clusterrename'), ('选择集群', 'clusters:admin:0')],
+                            [('成员资格来源', 'msources:0')]]
             group = self.store.management_group()
             if group:
                 heading += '\n管理群：' + group['title']
-            if self.store.service_authorized() and not self.router.legacy_access(self) and not self.store.member_source_ids():
+            if (self.store.service_authorized() and not self.router.legacy_access(self)
+                    and not (self.store.membership_target() or self.store.member_source_ids())):
                 heading += '\n请设置成员资格来源，开放普通成员访问。'
         backups = [('💾 导出数据备份', 'export')]
         if self.store.superadmin(uid):
@@ -263,64 +266,60 @@ class Bot:
         status = '已激活' if self.store.service_authorized() else '未激活'
         return self.panel(uid, '👑 Superadmin 后台\n当前集群：' + name,
                           [[('选择集群', 'clusters:superadmin:0'), ('＋ 新建集群', 'clusternew')],
-                           [('修改名称', 'clusterrename'), ('集群授权 · ' + status, 'activation')],
+                           [('管理后台', 'admin'), ('集群授权 · ' + status, 'activation')],
                            [('返回主菜单', 'home')]])
 
     def comment_buttons_panel(self, uid):
         layout = self.store.comment_buttons()
-        rows = [[(f"{'✓ ' if size == layout[axis] else ''}{size} {unit}", f'cbsize:{axis}:{size}')
-                 for size in range(1, limit + 1)]
-                for axis, unit, limit in (('rows', '行', MAX_COMMENT_ROWS), ('columns', '列', MAX_COMMENT_COLUMNS))]
+        buttons = layout['buttons']
+        positions = [tuple(map(int, position.split(':'))) for position in buttons]
+        row_count = min(MAX_COMMENT_ROWS, max((row for row, _ in positions), default=1) + 1)
+        column_count = min(MAX_COMMENT_COLUMNS, max((column for _, column in positions), default=1) + 1)
+        hidden = hidden_comment_positions(layout)
+        rows = []
         styles = {}
-        visible_positions = set()
-        for row in range(1, layout['rows'] + 1):
+        for row in range(1, row_count + 1):
             cells = []
-            for column in range(1, layout['columns'] + 1):
+            for column in range(1, column_count + 1):
                 position = f'{row}:{column}'
-                visible_positions.add(position)
                 action = f'cbcell:{position}'
-                button = layout['buttons'].get(position)
-                cells.append((button['text'] if button else f'＋ {row}-{column}', action))
+                button = buttons.get(position)
+                label = '＋'
                 if button:
+                    label = ('✓ 隐藏 · ' if position in hidden else '✓ ') + button['text']
                     styles[action] = button['style']
+                cells.append((label, action))
             rows.append(cells)
-        text = '评论按钮 · 编辑布局\n先选最大行数和列数，再点击对应位置。公开评论会跳过空位和空行。'
-        hidden = len(layout['buttons'].keys() - visible_positions)
-        if hidden:
-            text += f'\n布局外保留了 {hidden} 个按钮。增大行列后可重新显示。'
-        return self.panel(uid, self.scoped(text), rows + [[('返回管理后台', 'admin')]], styles=styles)
+        rows.append([('返回管理后台', 'admin')])
+        return self.panel(uid, self.scoped('评论按钮\n点击格子编辑。'), rows, styles=styles)
 
     def comment_button_panel(self, uid, row, column):
         layout = self.store.comment_buttons()
-        if row > layout['rows'] or column > layout['columns']:
-            return self.comment_buttons_panel(uid)
         position = f'{row}:{column}'
         button = layout['buttons'].get(position)
-        header = f'评论按钮 · 第 {row} 行第 {column} 列'
-        if not button:
-            return self.panel(uid, self.scoped(header + '\n此位置为空。'),
-                              [[('套用「评价当前老师」', f'cbtemplate:{position}')],
-                               [('自行填写', f'cbedit:{position}:new')],
-                               [('返回布局', 'commentbuttons')]])
-        content = '评价当前老师（动态入口）' if button['content'] == REVIEW_ACTION else button['content']
-        detail = (f"显示名称　{button['text']}\n内部内容　{content}\n颜色　{COMMENT_COLORS[button['style']]}")
-        rows = [[('更改显示名称', f'cbedit:{position}:text'), ('更改内容', f'cbedit:{position}:content')],
-                [('更改颜色', f'cbedit:{position}:style'), ('清空此位置', f'cbclear:{position}')]]
+        hidden = position in hidden_comment_positions(layout)
+        rows = []
+        text = '新增评论按钮'
+        if button:
+            content = '评价当前老师（动态入口）' if button['content'] == REVIEW_ACTION else button['content']
+            status = '（已隐藏）' if hidden else ''
+            text = f"{button['text']}{status}\n{content}"
+            rows = [[('更改名称', f'cbedit:{position}:text'), ('更改链接', f'cbedit:{position}:content')],
+                    [('更改颜色', f'cbedit:{position}:style'), ('清空此位置', f'cbclear:{position}')]]
+        if hidden:
+            rows.append([('显示到评论', f'cbshow:{position}')])
         if button != REVIEW_TEMPLATE:
-            rows.append([('重置为「评价当前老师」模板', f'cbtemplate:{position}')])
-        return self.panel(uid, self.scoped(header + '\n' + detail),
-                          rows + [[('返回布局', 'commentbuttons')]],
+            rows.append([('套用「评价当前老师」', f'cbtemplate:{position}')])
+        rows.append([('返回评论按钮', 'commentbuttons')])
+        text += '\n\n发送按钮名称和链接，每项一行。'
+        return self.panel(uid, self.scoped(text), rows, ('commentbuttoninput', row, column, 'full'),
                           link_preview_options={'is_disabled': True})
 
     def edit_comment_button(self, uid, row, column, field):
         position = f'{row}:{column}'
         back = f'cbcell:{position}'
         pending = ('commentbuttoninput', row, column, field)
-        if field == 'new':
-            text = ('按顺序发送以下内容，每项一行。\n'
-                    '第 1 行：显示名称\n第 2 行：内部内容（HTTP 或 HTTPS 链接）\n'
-                    '第 3 行（可省略）：蓝色、绿色、红色或无颜色\n\n' + COMMENT_LINK_HINT)
-        elif field == 'text':
+        if field == 'text':
             text = '发送新的显示名称，限一行，1～40 字。'
         elif field == 'content':
             text = self.scoped('发送新的 HTTP 或 HTTPS 链接。\n' + COMMENT_LINK_HINT)
@@ -395,8 +394,11 @@ class Bot:
         return self.panel(uid, self.scoped(text), rows + [[('返回 Superadmin 后台', 'superadmin')]])
 
     def member_sources_panel(self, uid, page):
-        sources = list(self.store.member_sources().items())
+        target = self.store.membership_target()
+        target_id = target['id'] if target else None
+        sources = [(cid, title) for cid, title in self.store.member_sources().items() if cid != target_id]
         selected = self.store.member_source_ids() or set()
+        page = min(max(0, page), max(0, (len(sources) - 1) // 8))
         rows = [[('%s %s' % ('☑️' if cid in selected else '⬜', title[:60]),
                   'msource:%s:%s' % (cid, page))]
                 for cid, title in sources[page * 8:(page + 1) * 8]]
@@ -407,12 +409,18 @@ class Bot:
             navigation.append(('下一页', 'msources:%s' % (page + 1)))
         if navigation:
             rows.append(navigation)
-        text = '成员资格来源\n成员加入任意一个已勾选的群或频道，即可使用这个集群。'
-        if not sources:
-            text += '\n请先绑定频道或群。'
-        elif not selected.intersection(cid for cid, _ in sources):
-            text += ('\n当前沿用单集群的公开访问。勾选后开始验证成员身份。'
-                     if self.router.legacy_access(self) else '\n请选择至少一个来源，才能向普通成员开放。')
+        text = '成员资格来源\n加入在群判定目标或任一已勾选的群或频道，即可使用本集群。'
+        if target:
+            text += '\n在群判定目标：%s（自动计入）' % target['title']
+        if self.router.legacy_access(self):
+            if target or sources:
+                text += '\n当前沿用单集群的公开访问。选择来源后开始核验成员身份。'
+            if target:
+                rows.insert(0, [('按判定目标核验成员', 'msource:%s:%s' % (target_id, page))])
+        elif not target and not selected.intersection(cid for cid, _ in sources):
+            text += '\n请选择至少一个来源，才能向普通成员开放。'
+        if not sources and not target:
+            text += '\n请先绑定频道或群，或设置在群判定目标。'
         return self.panel(uid, self.scoped(text), rows + [[('返回管理后台', 'admin')]])
 
     def review_items(self, uid, limit, offset=0):
@@ -451,17 +459,12 @@ class Bot:
         parts = action.split(':'); kind = parts[0]
         if self.router and kind == 'manage':
             return self.router.manage(self, uid)
-        if self.router and kind in ('clusters', 'clusterselect', 'clusternew', 'clusterrename'):
+        if self.router and kind in ('clusters', 'clusterselect', 'clusternew'):
             if kind == 'clusternew':
                 self.store.require_superadmin(uid)
                 return self.router.switch(self, uid, self.router.create(uid), 'superadmin')
-            if kind == 'clusterrename':
-                self.store.require_superadmin(uid)
-                return self.prompt(uid, '当前名称：%s\n发送新名称（1～40 字）。' %
-                                   self.store.clusters.names[self.store.cluster_id], ('clusterrename',),
-                                   'superadmin')
             destination = parts[1]
-            if destination not in ('admin', 'bindings', 'superadmin'):
+            if destination not in ('admin', 'superadmin'):
                 raise ValueError('请从主菜单重新选择集群。')
             if destination == 'superadmin':
                 self.store.require_superadmin(uid)
@@ -480,7 +483,7 @@ class Bot:
             return self.router.mine(self, uid, max(0, int(parts[1])))
         superadmin_kinds = {'superadmin', 'activation', 'activationissue', 'activationinput', 'activationrevoke',
                             'activationrevokeyes', 'import', 'importconfirm', 'importcancel'}
-        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset',
+        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','clusterrename','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset',
                        'teacherbatch','teacherbatchpage','teacherbatchconfirm','teacherbatchcancel',
                        'msources','msource','bindings','bind','binding','recheck','unbind','unbindyes',
                        'setroot','pausejobs','resumejobs','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
@@ -503,24 +506,25 @@ class Bot:
             return self.home(uid)
         if kind == 'admin':
             return self.admin_panel(uid)
+        if self.router and kind == 'clusterrename':
+            return self.prompt(uid, '当前集群名称：%s\n发送新名称（1～40 字）。' %
+                               self.store.clusters.names[self.store.cluster_id], ('clusterrename',), 'admin')
         if self.router and kind == 'superadmin':
             return self.superadmin_panel(uid)
         if kind == 'commentbuttons':
             return self.comment_buttons_panel(uid)
-        if kind == 'cbsize':
-            if self.store.resize_comment_buttons(uid, parts[1], int(parts[2])):
-                self.success(uid, '布局已保存。')
-            return self.comment_buttons_panel(uid)
         if kind in COMMENT_EDITOR_ACTIONS:
             row, column = map(int, parts[1:3])
+            if kind == 'cbcell':
+                return self.comment_button_panel(uid, row, column)
             if kind == 'cbedit':
                 return self.edit_comment_button(uid, row, column, parts[3])
-            if kind != 'cbcell':
-                changes = {'cbtemplate': REVIEW_TEMPLATE, 'cbcontent': {'content': REVIEW_ACTION}, 'cbclear': None}
-                change = {'style': None if parts[3] == 'none' else parts[3]} if kind == 'cbcolor' else changes[kind]
-                if self.store.set_comment_button(uid, row, column, change):
-                    self.success(uid, '已保存，历史评论将依次更新。')
-            return self.comment_button_panel(uid, row, column)
+            changes = {'cbtemplate': REVIEW_TEMPLATE, 'cbcontent': {'content': REVIEW_ACTION},
+                       'cbclear': None, 'cbshow': {}}
+            change = {'style': None if parts[3] == 'none' else parts[3]} if kind == 'cbcolor' else changes[kind]
+            if self.store.set_comment_button(uid, row, column, change, show=kind == 'cbshow'):
+                self.success(uid, '已保存。')
+            return self.comment_buttons_panel(uid)
         if self.router and kind.startswith('activation'):
             clusters = self.store.clusters
             cid = self.store.cluster_id
@@ -548,9 +552,13 @@ class Bot:
                 self.router.invalidate_chat(cid)
             return self.member_sources_panel(uid, page)
         if kind=='membertarget':
-            target=self.store.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
-            value=json.loads(target[0]) if target else None
-            return self.panel(uid,'🎯 在群判定目标\n'+('%s（%s）'%(value['title'],value['id']) if value else '尚未设置')+'\n查学生时实时查询此群，不使用当前查档群作为判定目标。机器人必须是目标群管理员。查询失败显示无法确认。',[[('设置 / 更换目标群','membertargetset')],[('取消指定目标','membertargetclear'),('返回','admin')]])
+            target = self.store.membership_target()
+            text = '🎯 在群判定目标\n' + ('%s（%s）' % (target['title'], target['id']) if target else '尚未设置')
+            text += '\n查学生时实时查询此群。机器人必须是目标群管理员。'
+            if self.router:
+                text += '\n目标群成员可使用本集群的私聊业务。'
+            return self.panel(uid, text, [[('设置 / 更换目标群','membertargetset')],
+                                         [('取消指定目标','membertargetclear'),('返回','admin')]])
         if kind=='membertargetset':
             return self.prompt(uid,'发送判定目标群的数字 ID 或 @群用户名。请先将机器人设为该群管理员。',('membertargetset',),'membertarget')
         if kind=='trashdays':
@@ -735,7 +743,6 @@ class Bot:
             heading = '📣 模式绑定'
             if self.router:
                 heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
-                rows.insert(0, [('选择集群', 'clusters:bindings:0')])
             return self.panel(uid,heading + '\n✅ 已启用 %s 个 · ⏸ 已暂停 %s 个\n频道和群不可重复占用。选择绑定可查看状态、同步进度。' % (self.store.db.execute('SELECT count(*) FROM bindings WHERE active=1').fetchone()[0], self.store.db.execute('SELECT count(*) FROM bindings WHERE active=0').fetchone()[0]),rows+[[('返回','admin')]])
         if kind=='bind': return self.prompt(uid,'发送目标频道/群的数字 ID 或 @用户名。先把机器人设为管理员；专帖频道必须关联讨论组。',('bind',parts[1]),'bindings')
         if kind=='binding':
@@ -1011,26 +1018,28 @@ class Bot:
             self.store.require_admin(uid)
             if kind == 'commentbuttoninput':
                 row, column, field = pending[1:]
-                if field == 'new':
+                if field == 'full':
                     lines = text.splitlines()
                     if len(lines) not in (2, 3):
-                        raise ValueError('请用两到三行填写，依次发送显示名称、链接和可省略的颜色。')
-                    label, content, color = (lines + [''])[:3]
-                    changes = {'text': label.strip(), 'content': content.strip(), 'style': parse_comment_color(color)}
+                        raise ValueError('请发送按钮名称和链接，每项一行。')
+                    changes = {'text': lines[0].strip(), 'content': lines[1].strip()}
+                    existing = self.store.comment_buttons()['buttons'].get(f'{row}:{column}')
+                    if len(lines) == 3 or not existing:
+                        changes['style'] = parse_comment_color(lines[2]) if len(lines) == 3 else None
                 else:
                     changes = {field: text}
                 if changes.get('content') == REVIEW_ACTION:
                     raise ValueError('请填写 HTTP 或 HTTPS 链接，或点击按钮选用模板入口。')
                 changed = self.store.set_comment_button(uid, row, column, changes)
-                self.success(uid, '已保存，历史评论将依次更新。' if changed else '按钮设置未变更。')
-                return self.comment_button_panel(uid, row, column)
+                self.success(uid, '已保存。' if changed else '按钮设置未变更。')
+                return self.comment_buttons_panel(uid)
             if self.router and kind == 'activationinput':
                 self.store.clusters.redeem_activation(uid, self.store.cluster_id, text)
                 return self.activation_panel(uid)
             if kind=='clusterrename':
                 self.store.clusters.rename(uid, self.store.cluster_id, text)
                 self.success(uid, '集群名称已更新。')
-                return self.superadmin_panel(uid)
+                return self.admin_panel(uid)
             if kind=='membertargetset':
                 cid=int(text) if text.lstrip('-').isdigit() else text
                 chat,_=self.publisher.validate('lookup',cid)
@@ -1406,12 +1415,15 @@ class ClusterBot:
     def member_access(self, bot, uid, is_admin):
         if not bot.store.service_authorized():
             return False
+        selected = bot.store.member_source_ids() or set()
+        target = bot.store.membership_target()
+        if target:
+            selected.add(target['id'])
         if not bot.store.ready():
             # Temporarily unavailable bindings cannot prove membership.
-            return None if bot.store.member_source_ids() else False
+            return None if selected else False
         if is_admin or self.legacy_access(bot):
             return True
-        selected = bot.store.member_source_ids() or set()
         sources = selected.intersection(bot.store.member_sources())
         unknown = bool(selected - sources)
         for chat_id in sorted(sources):

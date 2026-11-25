@@ -39,12 +39,22 @@ def default_comment_layout():
     return {'rows': 1, 'columns': 2, 'buttons': {'1:1': dict(REVIEW_TEMPLATE)}}
 
 
+def hidden_comment_positions(layout):
+    hidden = set(layout.get('hidden', ()))
+    for position in layout['buttons']:
+        row, column = map(int, position.split(':'))
+        if row > layout['rows'] or column > layout['columns']:
+            hidden.add(position)
+    return hidden
+
+
 def visible_comment_rows(layout):
     buttons = layout['buttons']
+    hidden = hidden_comment_positions(layout)
     rows = []
     for row in range(1, layout['rows'] + 1):
         visible = [buttons[key] for col in range(1, layout['columns'] + 1)
-                   if (key := f'{row}:{col}') in buttons]
+                   if (key := f'{row}:{col}') in buttons and key not in hidden]
         if visible:
             rows.append(visible)
     return rows
@@ -88,7 +98,8 @@ def validate_comment_button(button):
 
 
 def validate_comment_layout(layout):
-    if (not isinstance(layout, dict) or set(layout) != {'rows', 'columns', 'buttons'}
+    required = {'rows', 'columns', 'buttons'}
+    if (not isinstance(layout, dict) or not required <= layout.keys() <= required | {'hidden'}
             or type(layout['rows']) is not int or not 1 <= layout['rows'] <= MAX_COMMENT_ROWS
             or type(layout['columns']) is not int or not 1 <= layout['columns'] <= MAX_COMMENT_COLUMNS
             or not isinstance(layout['buttons'], dict)):
@@ -96,5 +107,9 @@ def validate_comment_layout(layout):
     positions = {f'{r}:{c}' for r in range(1, MAX_COMMENT_ROWS + 1) for c in range(1, MAX_COMMENT_COLUMNS + 1)}
     if not layout['buttons'].keys() <= positions:
         raise ValueError('评论按钮的位置无效。')
+    hidden = layout.get('hidden', [])
+    if (not isinstance(hidden, list) or any(not isinstance(key, str) or key not in layout['buttons'] for key in hidden)
+            or len(set(hidden)) != len(hidden)):
+        raise ValueError('隐藏的评论按钮位置无效。')
     for button in layout['buttons'].values():
         validate_comment_button(button)
