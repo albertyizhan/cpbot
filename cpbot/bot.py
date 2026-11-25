@@ -118,7 +118,10 @@ class Bot:
         if self.store.admin(uid):
             rows += [[('⚙️ 管理后台', 'admin')]]
         text = '🏠 车评主菜单' if ready else '⚠️ 尚未配置可用的集群绑定，请联系管理员。'
-        if self.paused() and (not self.router or len(self.router.bots) == 1):
+        if self.router and len(stores) > 1:
+            if any(bot.store.can_publish() and bot.paused() for bot in self.router.bots.values()):
+                text += '\n⏸ 有集群暂停发布，写车评时可查看所选集群的状态。'
+        elif self.paused():
             text += '\n⏸ 发布队列已暂停，已提交的车评会等待管理员恢复发布。'
         return self.panel(uid, text, rows)
 
@@ -149,6 +152,8 @@ class Bot:
         lines = ['📝 车评草稿 · 已填写 %s/%s 项' % (filled, len(INPUT_FIELDS)),
                  '点击字段逐项填写，提交前可修改。草稿已保存。',
                  '🔒 匿名发布：不显示作者信息。证明图将公开，请先遮挡个人信息。' if d.get('匿名', True) else '👤 实名发布：公开 Telegram ID、身份链接及已有用户名。']
+        if self.paused():
+            lines.insert(1, '⏸ 本集群已暂停发布。你仍可提交，恢复后会自动发布。')
         rows = []
         for field in FIELDS:
             value = d.get(field)
@@ -875,8 +880,8 @@ class Bot:
                 self.query(msg)
             return
         if chat['type']!='private' or not uid or edited:return
-        if self.store.db.execute('SELECT 1 FROM teachers WHERE deleted_at IS NULL AND (user_id=? OR (user_id IS NULL AND username=? COLLATE NOCASE))',(uid,user.get('username'))).fetchone():
-            self.store.observe(user,msg.get('date',time.time()),create=True)
+        if not self.router:
+            self.store.observe_private_teacher(user, msg.get('date', time.time()))
         pending = None
         try:
             if text.split(' ',1)[0].split('@')[0] in ('/start','/cancel'):
@@ -1352,8 +1357,12 @@ class ClusterBot:
             return source.panel(uid, text, [[('重试', 'memberpage:%s:0' % operation)], [('返回主菜单', 'home')]],
                                 ('memberpick', operation, message))
         page = min(max(0, page), (len(choices) - 1) // 8)
-        rows = [[(self.stores.names[cid], 'memberpick:%s:%s' % (operation, cid))]
-                for cid in choices[page * 8:(page + 1) * 8]]
+        rows = []
+        for cid in choices[page * 8:(page + 1) * 8]:
+            label = self.stores.names[cid]
+            if operation == 'write' and self.bots[cid].paused():
+                label += '（暂停发布）'
+            rows.append([(label, 'memberpick:%s:%s' % (operation, cid))])
         nav = []
         if page:
             nav.append(('上一页', 'memberpage:%s:%s' % (operation, page - 1)))
@@ -1434,6 +1443,9 @@ class ClusterBot:
         uid = chat['id']
         source = self.bots[self.selected.get(uid, 1)]
         if 'message' in update:
+            for store in self.stores.stores.values():
+                if store.service_authorized():
+                    store.observe_private_teacher(event.get('from', {}), event.get('date', time.time()))
             match = re.fullmatch(r'(/start(?:@\w+)?)\s+(?:c([1-9]\d{0,18})_)?((?:review|edit|delete)_[0-9]{1,19})',
                                  event.get('text', '').strip(), flags=re.ASCII)
             if match:

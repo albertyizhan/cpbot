@@ -195,6 +195,13 @@ class Store(ReviewStore, BackupStore):
         return [dict(row) for row in self.db.execute(
             'SELECT * FROM people WHERE name=? ORDER BY id LIMIT 2', (name,))]
 
+    def observe_private_teacher(self, user, stamp):
+        teacher = self.db.execute('''SELECT 1 FROM teachers WHERE deleted_at IS NULL
+            AND (user_id=? OR (user_id IS NULL AND username=? COLLATE NOCASE)) LIMIT 1''',
+            (user.get('id'), user.get('username'))).fetchone()
+        if teacher:
+            self.observe(user, stamp, create=True)
+
     def observe(self, user, stamp, create=False):
         uid = user.get('id')
         if not uid or user.get('is_bot'):
