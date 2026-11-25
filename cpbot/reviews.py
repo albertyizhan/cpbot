@@ -102,7 +102,7 @@ class ReviewStore:
 
     def require_admin(self, uid):
         if not self.admin(uid):
-            raise ValueError('仅 superadmin 可以操作。')
+            raise ValueError('仅当前集群管理员或 superadmin 可以操作。')
 
     def log(self, uid, action, detail):
         self.db.execute('INSERT INTO audit(actor,action,detail,created) VALUES(?,?,?,?)',

@@ -581,8 +581,6 @@ class Tests(unittest.TestCase):
         self.bot.message(message(uid=1,text='新增老师'))
         self.assertIn('已保存',self.api.calls[-1][1]['text'])
         with self.assertRaises(ValueError):self.bot.action({'id':1},'codefor:1')
-        self.bot.action({'id':1},'admins')
-        self.assertIn('修改 .env 后重启生效',self.api.calls[-1][1]['text'])
         self.assertFalse(self.s.admin(3))
         rid,_=self.submit(code='not-found')
         self.assertEqual(self.s.db.execute('SELECT status FROM reviews WHERE id=?',(rid,)).fetchone()[0],'accepted')

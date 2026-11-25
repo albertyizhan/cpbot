@@ -74,8 +74,12 @@ def main():
                         raise SystemExit('启动时无法确认频道权限，请稍后重启。') from None
                     db.execute('UPDATE bindings SET active=0,error=? WHERE id=?',
                                (str(error), binding['id']))
-        api.call('setMyCommands', commands=[{'command': 'start', 'description': '打开主菜单'},
-                                           {'command': 'cancel', 'description': '取消当前操作'}])
+        commands = [{'command': 'start', 'description': '打开主菜单'},
+                    {'command': 'cancel', 'description': '取消当前操作'}]
+        api.call('setMyCommands', commands=commands)
+        api.call('setMyCommands', scope={'type': 'all_private_chats'},
+                 commands=[commands[0], {'command': 'register', 'description': '使用激活码注册集群'},
+                           {'command': 'admin', 'description': '打开集群管理后台'}, commands[1]])
         saved = store.db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()
         offset = int(saved[0]) if saved else 0
         logging.info('cpbot started as @%s', me['username'])

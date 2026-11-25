@@ -29,7 +29,7 @@ def encode_backup(db, source_bot=0):
                       allow_nan=False, separators=(',', ':')).encode('utf-8')
 
 
-def validate_backup(content, bot_id=0, images=None):
+def validate_backup(content, bot_id=0, images=None, management_group_id=None):
     """Validate into an isolated database with application-owned schema/constraints."""
     if len(content) > MAX_BACKUP_BYTES:
         raise ValueError('备份不能超过 15 MB。')
@@ -145,6 +145,8 @@ def validate_backup(content, bot_id=0, images=None):
         owned = {cid for row in stage.db.execute('SELECT chat_id,discussion FROM bindings') for cid in row if cid}
         if target:
             owned.add(target['id'])
+        if management_group_id is not None:
+            owned.add(management_group_id)
         if set(data.get('cluster_member_sources') or ()) - owned:
             raise ValueError('备份中的成员资格来源不属于此集群。')
         for table in ('reviews','drafts'):
@@ -165,7 +167,6 @@ def check_relations(db):
     teacher_ids = {r['id'] for r in db.execute('SELECT id FROM teachers')}
     reviews = {r['id']: dict(r) for r in db.execute('SELECT * FROM reviews')}
     bindings = {r['id']: dict(r) for r in db.execute('SELECT * FROM bindings')}
-    require(bool(db.execute('SELECT 1 FROM admins').fetchone()), '管理员名单为空。')
     for r in db.execute('SELECT * FROM admins'):
         require(r['user_id'] > 0, '管理员 ID 无效。')
     for t in db.execute('SELECT * FROM teachers'):
@@ -231,6 +232,10 @@ def check_relations(db):
 
 
 class BackupStore:
+    def read_backup(self, content, source_bot=0, images=None):
+        group = self.management_group()
+        return validate_backup(content, source_bot, images, group['chat_id'] if group else None)
+
     def check_backup_scope(self, data):
         if data.get('cluster_id', 1) != self.cluster_id:
             raise ValueError('这份备份属于集群 #%s，请切换到对应集群后再恢复。' % data.get('cluster_id', 1))
@@ -240,14 +245,14 @@ class BackupStore:
             ids.append(data['membership_target']['id'])
         self.check_chat_ownership(ids)
 
-    def export(self, source_bot=0, split=False):
+    def export(self, source_bot=0, split=False, include_admins=True):
         target = sqlite3.connect(':memory:')
         target.row_factory = sqlite3.Row
         try:
             self.db.backup(target)
             data=json.loads(encode_backup(target, source_bot))
             data['cluster_id'] = self.cluster_id
-            data['tables']['admins'] = [{'user_id': uid} for uid in self.admin_ids()]
+            data['tables']['admins'] = [{'user_id': uid} for uid in self.admin_ids()] if include_admins else []
             settings = dict(target.execute("SELECT key,value FROM settings WHERE key IN (?,?,?)",
                                            ('membership_target', 'cluster_member_sources', 'comment_buttons')))
             data['membership_target'] = json.loads(settings.get('membership_target', 'null'))
@@ -307,8 +312,8 @@ class BackupStore:
         return path
 
     def import_backup(self, actor, content, source_bot=0, images=None):
-        self.require_admin(actor)
-        data = validate_backup(content, source_bot, images)
+        self.require_superadmin(actor)
+        data = self.read_backup(content, source_bot, images)
         self.check_backup_scope(data)
         recovery = self.recovery_backup(source_bot)
         # Materialize immutable random-named files before switching database references.
@@ -323,7 +328,7 @@ class BackupStore:
                     file.write(content);file.flush();os.fsync(file.fileno())
         # Polling offset, deployment configuration and existing schema stay local.
         with self.transaction():
-            self.require_admin(actor)
+            self.require_superadmin(actor)
             self.db.execute('PRAGMA defer_foreign_keys=ON')
             tables = [table for table in TABLES if table != 'admins']
             for table in reversed(tables):

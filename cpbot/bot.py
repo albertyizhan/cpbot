@@ -16,7 +16,7 @@ from .identity import targets, member_present
 from .store import display_name
 from .reviews import FIELDS, INPUT_FIELDS, SCORES, valid_score, overall_score, missing_fields, valid_proof, MODES, TZ, now_text, review_date
 from .publishing import Publisher, render_review
-from .backup import validate_backup, MAX_BACKUP_BYTES, MAX_IMAGE_ZIP_BYTES
+from .backup import MAX_BACKUP_BYTES, MAX_IMAGE_ZIP_BYTES
 
 MEMBER_ACTIONS = {'write': '写车评', 'findteacher': '找老师', 'search': '查学生', 'lookup': '查学生'}
 COMMENT_EDITOR_ACTIONS = {'commentbuttons', 'cbsize', 'cbcell', 'cbedit', 'cbtemplate',
@@ -115,8 +115,12 @@ class Bot:
                          for label, action in row] for row in rows]
         elif self.router:
             rows = [[('📋 我的车评', 'mine:0')]]
-        if self.store.admin(uid):
-            rows += [[('⚙️ 管理后台', 'admin')]]
+        superadmin = self.store.superadmin(uid)
+        if superadmin or (self.router and self.router.manageable(uid)):
+            admin_row = [('⚙️ 管理后台', 'admin' if superadmin else 'manage')]
+            if self.router and superadmin:
+                admin_row.append(('👑 Superadmin 后台', 'superadmin'))
+            rows.append(admin_row)
         text = '🏠 车评主菜单' if ready else '⚠️ 尚未配置可用的集群绑定，请联系管理员。'
         if self.router and len(stores) > 1:
             if any(bot.store.can_publish() and bot.paused() for bot in self.router.bots.values()):
@@ -233,22 +237,34 @@ class Bot:
         cluster_rows = []
         if self.router:
             heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
-            cluster_rows = [[('选择集群', 'clusters:admin:0'), ('修改名称', 'clusterrename')]]
-            cluster_rows += [[('成员资格来源', 'msources:0')]]
-            cluster_rows += [[('集群授权 · ' + ('已激活' if self.store.service_authorized() else '未激活'), 'activation')]]
+            cluster_rows = [[('选择集群', 'clusters:admin:0'), ('成员资格来源', 'msources:0')]]
+            group = self.store.management_group()
+            if group:
+                heading += '\n管理群：' + group['title']
             if self.store.service_authorized() and not self.router.legacy_access(self) and not self.store.member_source_ids():
                 heading += '\n请设置成员资格来源，开放普通成员访问。'
+        backups = [('💾 导出数据备份', 'export')]
+        if self.store.superadmin(uid):
+            backups.append(('📥 导入数据备份', 'import'))
         return self.panel(uid, heading + '\n👩‍🏫 老师 %s 位 · 📣 可用发布频道 %s 个\n📝 有效车评 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), cluster_rows + [
             [('👩‍🏫 老师列表', 'teachersadmin'), ('➕ 添加老师', 'teachernew')],
             [('📥 批量导入老师', 'teacherbatch')],
             [('🗑 老师回收站', 'teachertrash'), ('⏳ 设置保留天数', 'trashdays')],
 
             [('🎯 在群判定目标', 'membertarget')],
-            [('📣 频道 / 群绑定', 'bindings'), ('👑 superadmin 名单', 'admins')],
+            [('📣 频道 / 群绑定', 'bindings')],
             [('评论按钮', 'commentbuttons')],
             [('📤 发布任务', 'jobs:0'), ('🛠 车评处理', 'reviewmanage')],
-            [('💾 导出数据备份', 'export'), ('📥 导入数据备份', 'import')],
+            backups,
             [('返回主菜单', 'home')]])
+
+    def superadmin_panel(self, uid):
+        name = self.store.clusters.names[self.store.cluster_id]
+        status = '已激活' if self.store.service_authorized() else '未激活'
+        return self.panel(uid, '👑 Superadmin 后台\n当前集群：' + name,
+                          [[('选择集群', 'clusters:superadmin:0'), ('＋ 新建集群', 'clusternew')],
+                           [('修改名称', 'clusterrename'), ('集群授权 · ' + status, 'activation')],
+                           [('返回主菜单', 'home')]])
 
     def comment_buttons_panel(self, uid):
         layout = self.store.comment_buttons()
@@ -321,13 +337,17 @@ class Bot:
                               [options, [('取消 / 返回', back)]], styles=styles)
         return self.prompt(uid, self.scoped(text), pending, back)
 
-    def cluster_panel(self, uid, destination, page):
-        choices = list(self.store.clusters.names.items())
-        rows = [[(('✓ ' if cluster_id == self.store.cluster_id else '') +
-                  ('%s%s' % (name if name == str(cluster_id) else '%s · #%s' % (name, cluster_id),
-                             '' if cluster_id in self.store.clusters.authorized else '（未激活）')),
-                  'clusterselect:%s:%s' % (destination, cluster_id))]
-                for cluster_id, name in choices[page * 8:(page + 1) * 8]]
+    def cluster_panel(self, uid, destination, page, choices):
+        page = min(max(0, page), max(0, (len(choices) - 1) // 8))
+        rows = []
+        for cluster_id in choices[page * 8:(page + 1) * 8]:
+            name = self.store.clusters.names[cluster_id]
+            label = name if name == str(cluster_id) else '%s · #%s' % (name, cluster_id)
+            if cluster_id == self.store.cluster_id:
+                label = '✓ ' + label
+            if cluster_id not in self.store.clusters.authorized:
+                label += '（未激活）'
+            rows.append([(label, 'clusterselect:%s:%s' % (destination, cluster_id))])
         nav = []
         if page:
             nav.append(('上一页', 'clusters:%s:%s' % (destination, page - 1)))
@@ -335,9 +355,23 @@ class Bot:
             nav.append(('下一页', 'clusters:%s:%s' % (destination, page + 1)))
         if nav:
             rows.append(nav)
-        if destination != 'home':
-            rows.append([('＋ 新建集群', 'clusternew')])
-        return self.panel(uid, '选择集群' if choices else '暂无可用集群。', rows + [[('返回', destination)]])
+        back = destination if self.store.admin(uid) else 'home'
+        return self.panel(uid, '选择集群' if choices else '暂无可管理的集群。', rows + [[('返回', back)]])
+
+    def register_prompt(self, uid):
+        return self.prompt(uid, '注册集群\n请发送激活码。', ('registercode',))
+
+    def register_group(self, user, digest, text):
+        uid = user['id']
+        self.store.clusters.registration_cluster(digest)
+        cid = int(text) if text.lstrip('-').isdigit() else text
+        group, _ = self.publisher.validate('lookup', cid)
+        self.router.admin_checks[group['id'], self.router.bot_id] = True
+        self.router.require_chat_admin(group['id'], uid)
+        cluster_id = self.store.clusters.register(uid, digest, group)
+        target = self.router.bots[cluster_id]
+        target.success(uid, '集群已激活。请在管理后台配置频道 / 群绑定和成员资格来源。')
+        return self.router.switch(self, uid, cluster_id, 'admin')
 
     def activation_panel(self, uid, issued=None):
         clusters = self.store.clusters
@@ -351,13 +385,14 @@ class Bot:
             if issued:
                 code, expires = issued
                 text += '\n\n%s\n有效至 %s。此码只显示一次，仅用于当前集群。' % (code, date(expires))
+                text += '\n请把码私下交给群管理员，由对方私聊发送 /register 后使用。'
             elif pending:
                 text += '\n授权码有效至 %s。重新生成会使旧码失效。' % date(pending)
             rows = [[('重新生成授权码' if pending else '生成授权码', 'activationissue'),
                      ('输入授权码', 'activationinput')]]
             if pending:
                 rows.append([('作废未使用的授权码', 'activationrevoke')])
-        return self.panel(uid, self.scoped(text), rows + [[('返回管理后台', 'admin')]])
+        return self.panel(uid, self.scoped(text), rows + [[('返回 Superadmin 后台', 'superadmin')]])
 
     def member_sources_panel(self, uid, page):
         sources = list(self.store.member_sources().items())
@@ -414,20 +449,24 @@ class Bot:
     def action(self, user, action):
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
+        if self.router and kind == 'manage':
+            return self.router.manage(self, uid)
         if self.router and kind in ('clusters', 'clusterselect', 'clusternew', 'clusterrename'):
-            self.store.require_admin(uid)
             if kind == 'clusternew':
-                return self.router.switch(self, uid, self.router.create(uid), 'admin')
+                self.store.require_superadmin(uid)
+                return self.router.switch(self, uid, self.router.create(uid), 'superadmin')
             if kind == 'clusterrename':
-                destination = 'bindings' if parts[1:] == ['bindings'] else 'admin'
+                self.store.require_superadmin(uid)
                 return self.prompt(uid, '当前名称：%s\n发送新名称（1～40 字）。' %
-                                   self.store.clusters.names[self.store.cluster_id], ('clusterrename', destination),
-                                   destination)
+                                   self.store.clusters.names[self.store.cluster_id], ('clusterrename',),
+                                   'superadmin')
             destination = parts[1]
-            if destination not in ('admin', 'bindings'):
+            if destination not in ('admin', 'bindings', 'superadmin'):
                 raise ValueError('请从主菜单重新选择集群。')
+            if destination == 'superadmin':
+                self.store.require_superadmin(uid)
             if kind == 'clusters':
-                return self.cluster_panel(uid, destination, int(parts[2]))
+                return self.cluster_panel(uid, destination, int(parts[2]), self.router.manageable(uid))
             return self.router.switch(self, uid, int(parts[2]), destination)
         if self.router and kind in ('member', 'memberpage', 'memberpick'):
             if kind == 'memberpick':
@@ -439,20 +478,22 @@ class Bot:
             return self.router.member_menu(self, user, parts[1], int(parts[2]) if kind == 'memberpage' else 0, message)
         if self.router and kind == 'mine':
             return self.router.mine(self, uid, max(0, int(parts[1])))
-        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset','codesadmin','codefor','admins',
+        superadmin_kinds = {'superadmin', 'activation', 'activationissue', 'activationinput', 'activationrevoke',
+                            'activationrevokeyes', 'import', 'importconfirm', 'importcancel'}
+        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset',
                        'teacherbatch','teacherbatchpage','teacherbatchconfirm','teacherbatchcancel',
-                       'msources','msource',
-                       'activation','activationissue','activationinput','activationrevoke','activationrevokeyes',
-                       'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
-                       'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
+                       'msources','msource','bindings','bind','binding','recheck','unbind','unbindyes',
+                       'setroot','pausejobs','resumejobs','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
         if kind in ('mycodes','codes','codefor','codesadmin','queue','moderate','approve','reject'):
             raise ValueError('留名及审核机制已取消，请上传出击证明后直接提交车评。')
         admin_kinds |= COMMENT_EDITOR_ACTIONS
-        if kind in admin_kinds:
+        if kind in superadmin_kinds:
+            self.store.require_superadmin(uid)
+        elif kind in admin_kinds:
             self.store.require_admin(uid)
         elif self.router and kind not in ('home', 'cancel'):
             self.router.require_member(self, uid)
-        if kind not in admin_kinds and kind not in ('home','cancel') and not self.store.ready():
+        if kind not in admin_kinds | superadmin_kinds and kind not in ('home','cancel') and not self.store.ready():
             raise ValueError('当前集群没有可用绑定。')
         if kind in ('write','choose','field','score','anon','preview','submit') and not self.store.can_publish():
             raise ValueError('写评需要一个可用的车评直发或老师专帖频道。')
@@ -462,6 +503,8 @@ class Bot:
             return self.home(uid)
         if kind == 'admin':
             return self.admin_panel(uid)
+        if self.router and kind == 'superadmin':
+            return self.superadmin_panel(uid)
         if kind == 'commentbuttons':
             return self.comment_buttons_panel(uid)
         if kind == 'cbsize':
@@ -677,10 +720,6 @@ class Bot:
             self.success(uid,'本人账号已解绑，历史评价保留。')
             return self.action(user,'teacherdetail:%s'%tid)
         if kind=='teachersadmin': return self.teachers(uid,'teacherdetail')
-        if kind=='admins':
-            ids = '\n'.join(str(admin) for admin in self.store.admin_ids())
-            return self.panel(uid,'👑 superadmin 名单\n修改 .env 后重启生效。\n\n' + ids,
-                              [[('返回','admin')]])
         if kind=='bindings':
             page = max(0, int(parts[1])) if len(parts) > 1 else 0
             bindings = self.store.db.execute('SELECT * FROM bindings ORDER BY id LIMIT 13 OFFSET ?', (page * 12,)).fetchall()
@@ -696,7 +735,7 @@ class Bot:
             heading = '📣 模式绑定'
             if self.router:
                 heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
-                rows.insert(0, [('选择集群', 'clusters:bindings:0'), ('修改名称', 'clusterrename:bindings')])
+                rows.insert(0, [('选择集群', 'clusters:bindings:0')])
             return self.panel(uid,heading + '\n✅ 已启用 %s 个 · ⏸ 已暂停 %s 个\n频道和群不可重复占用。选择绑定可查看状态、同步进度。' % (self.store.db.execute('SELECT count(*) FROM bindings WHERE active=1').fetchone()[0], self.store.db.execute('SELECT count(*) FROM bindings WHERE active=0').fetchone()[0]),rows+[[('返回','admin')]])
         if kind=='bind': return self.prompt(uid,'发送目标频道/群的数字 ID 或 @用户名。先把机器人设为管理员；专帖频道必须关联讨论组。',('bind',parts[1]),'bindings')
         if kind=='binding':
@@ -745,7 +784,7 @@ class Bot:
             self.success(uid, '绑定已解除，后续不再向此目标发布；远端消息保留。')
             return self.action(user,'bindings')
         if kind=='export':
-            text,images=self.store.export(self.publisher.bot_id,split=True)
+            text,images=self.store.export(self.publisher.bot_id,split=True,include_admins=self.store.superadmin(uid))
             name='cpbot-%s-%s' % (self.store.cluster_id, datetime.now(TZ).strftime('%Y%m%d-%H%M%S'))
             self.api.document(uid,name+'.json',text)
             self.api.document(uid,name+'-images.zip',images)
@@ -884,7 +923,15 @@ class Bot:
             self.store.observe_private_teacher(user, msg.get('date', time.time()))
         pending = None
         try:
-            if text.split(' ',1)[0].split('@')[0] in ('/start','/cancel'):
+            command = text.split(' ', 1)[0].split('@', 1)[0]
+            if self.router and command in ('/register', '/admin'):
+                self.imports.pop(uid, None)
+                self.teacher_imports.pop(uid, None)
+                self.sessions.pop(uid, None)
+                if command == '/register':
+                    return self.register_prompt(uid)
+                return self.router.manage(self, uid)
+            if command in ('/start','/cancel'):
                 self.imports.pop(uid, None)
                 self.teacher_imports.pop(uid, None)
                 self.sessions.pop(uid,None);payload=text.partition(' ')[2]
@@ -906,12 +953,23 @@ class Bot:
                     return self.private_lookup(msg)
                 return self.home(uid)
             kind=pending[0]
+            if self.router and kind == 'registercode':
+                digest = self.store.clusters.activation_digest(text)
+                cluster_id = self.store.clusters.registration_cluster(digest)
+                group = self.store.clusters.management_group(cluster_id)
+                requirement = ('请使用原管理群「%s」。' % group['title'] if group else
+                               '请选择一个由你管理的群。该群的群主和管理员都可管理此集群。')
+                return self.prompt(uid, '设置管理群\n%s 将机器人设为群管理员后，发送群数字 ID 或 @公开群用户名。' %
+                                   requirement, ('registergroup', digest))
+            if self.router and kind == 'registergroup':
+                return self.register_group(user, pending[1], text)
             if self.router and kind == 'memberpick':
                 return self.send(uid, '请点击上方按钮选择集群。')
-            if self.router and not self.store.admin(uid):
-                self.router.require_member(self, uid)
-            if not self.store.ready() and not self.store.admin(uid):
-                return self.home(uid)
+            if kind in ('proof', 'field', 'findteacher', 'teachersearch', 'teacherlist', 'search', 'addtags'):
+                if self.router:
+                    self.router.require_member(self, uid)
+                if not self.store.ready() and not self.store.admin(uid):
+                    return self.home(uid)
             if kind=='proof':
                 photos=msg.get('photo')
                 if not photos:raise ValueError('请以照片方式上传一张图片，不接受文字、文件或视频。')
@@ -972,10 +1030,12 @@ class Bot:
             if kind=='clusterrename':
                 self.store.clusters.rename(uid, self.store.cluster_id, text)
                 self.success(uid, '集群名称已更新。')
-                return self.action(user, pending[1])
+                return self.superadmin_panel(uid)
             if kind=='membertargetset':
                 cid=int(text) if text.lstrip('-').isdigit() else text
                 chat,_=self.publisher.validate('lookup',cid)
+                if self.router and not self.store.superadmin(uid):
+                    self.router.require_chat_admin(chat['id'], uid)
                 value={'id':chat['id'],'title':chat.get('title',str(chat['id']))}
                 self.store.set_membership_target(uid, value)
                 self.success(uid,'判定目标已保存，机器人管理员权限检查通过。')
@@ -990,6 +1050,7 @@ class Bot:
                 self.teacher_imports[uid]={'entries':entries,'until':time.monotonic()+600}
                 return self.teacher_batch_preview(uid)
             if kind=='importfile':
+                self.store.require_superadmin(uid)
                 document=msg.get('document')
                 if not document:
                     raise ValueError('请以文件形式上传 JSON 备份，不是粘贴文字或截图。')
@@ -1006,7 +1067,7 @@ class Bot:
                 if 'content' not in saved:
                     return self.prompt(uid,'📥 ZIP 图片集已收到，尚未导入。请继续上传配套 JSON 数据文件。',('importfile',),'importcancel')
                 try:
-                    data=validate_backup(saved['content'],self.publisher.bot_id,saved.get('images'))
+                    data=self.store.read_backup(saved['content'],self.publisher.bot_id,saved.get('images'))
                 except ValueError as error:
                     if '需要配套的 ZIP' in str(error):
                         return self.prompt(uid,'📥 JSON 数据已收到，尚未导入。请继续上传配套 ZIP 图片集。',('importfile',),'importcancel')
@@ -1035,6 +1096,10 @@ class Bot:
             if kind=='bind':
                 cid=int(text) if text.lstrip('-').isdigit() else text
                 c,d=self.publisher.validate(pending[1],cid)
+                if self.router and not self.store.superadmin(uid):
+                    self.router.require_chat_admin(c['id'], uid)
+                    if d:
+                        self.router.require_chat_admin(d, uid)
                 bid=self.store.bind(uid,pending[1],c,d)
                 effect={'thread':'将限速创建老师主帖，并从旧到新补发历史评价。','feed':'之后的新车评会发布到此频道，不补发历史。','lookup':'此群已允许转发、回复和 @用户名查档。'}[pending[1]]
                 if self.paused() and pending[1] != 'lookup':
@@ -1259,6 +1324,8 @@ class ClusterBot:
         self.bots = {cid: self.make_bot(store) for cid, store in stores.stores.items()}
         self.selected = {}
         self.member_cache = OrderedDict()
+        self.admin_checks = {}
+        self.stores.check_admin = self.check_admin
         self.membership_retry_at = 0
         self.next_publisher = 0
 
@@ -1272,6 +1339,38 @@ class ClusterBot:
 
     def legacy_access(self, bot):
         return len(self.bots) == 1 and bot.store.member_source_ids() is None
+
+    def chat_admin(self, chat_id, uid):
+        key = chat_id, uid
+        if key not in self.admin_checks:
+            try:
+                member = self.api.call('getChatMember', chat_id=chat_id, user_id=uid)
+                self.admin_checks[key] = member.get('status') in ('administrator', 'creator')
+            except APIError as error:
+                self.admin_checks[key] = False if error.code in (400, 403) else None
+        return self.admin_checks[key]
+
+    def require_chat_admin(self, chat_id, uid):
+        allowed = self.chat_admin(chat_id, uid)
+        if allowed is None:
+            raise ValueError('暂时无法核验目标的管理员身份，请稍后重试。')
+        if not allowed:
+            raise ValueError('你必须是该群或频道的当前群主或管理员。')
+
+    def check_admin(self, store, uid):
+        return any(self.chat_admin(chat_id, uid) and self.chat_admin(chat_id, self.bot_id)
+                   for chat_id in store.admin_chats())
+
+    def manageable(self, uid):
+        return [cid for cid, bot in self.bots.items() if bot.store.admin(uid)]
+
+    def manage(self, source, uid):
+        if source.store.superadmin(uid):
+            return source.admin_panel(uid)
+        choices = self.manageable(uid)
+        if len(choices) == 1:
+            return self.switch(source, uid, choices[0], 'admin')
+        return source.cluster_panel(uid, 'admin', 0, choices)
 
     def invalidate_chat(self, chat_id, uid=None):
         if uid is not None:
@@ -1325,7 +1424,7 @@ class ClusterBot:
     def require_member(self, bot, uid):
         if not bot.store.service_authorized():
             raise ValueError('该集群尚未激活，请联系管理员。')
-        if self.stores.primary.admin(uid):
+        if bot.store.admin(uid):
             return
         result = self.member_access(bot, uid, False)
         if result is None:
@@ -1337,13 +1436,12 @@ class ClusterBot:
         uid = user['id']
         if operation not in MEMBER_ACTIONS:
             raise ValueError('请从主菜单选择要使用的功能。')
-        is_admin = self.stores.primary.admin(uid)
         choices = []
         unknown = False
         for cid, bot in self.bots.items():
             if operation == 'write' and not bot.store.can_publish():
                 continue
-            result = self.member_access(bot, uid, is_admin)
+            result = self.member_access(bot, uid, bot.store.admin(uid))
             if result and bot.store.ready():
                 choices.append(cid)
             unknown |= result is None
@@ -1410,7 +1508,7 @@ class ClusterBot:
 
     def switch(self, source, uid, cluster_id, destination):
         target = self.bots.get(cluster_id)
-        if not target or (not self.stores.primary.admin(uid) and not target.store.ready()):
+        if not target or not target.store.admin(uid):
             raise ValueError('此集群暂不可用。')
         target.edit_target = source.edit_target
         try:
@@ -1421,6 +1519,12 @@ class ClusterBot:
         return result
 
     def handle(self, update):
+        try:
+            return self.handle_update(update)
+        finally:
+            self.admin_checks.clear()
+
+    def handle_update(self, update):
         if 'callback_query' in update:
             uid = update['callback_query']['from']['id']
             return self.bots[self.selected.get(uid, 1)].handle(update)
