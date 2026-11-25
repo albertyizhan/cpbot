@@ -6,11 +6,13 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from .comment_buttons import (MAX_COMMENT_COLUMNS, MAX_COMMENT_ROWS, comment_layout,
+                              default_comment_layout, validate_comment_layout, visible_comment_rows)
+
 TZ = ZoneInfo('Asia/Shanghai')
 FIELDS = ('时间', '老师', '出击证明', '人照', '颜值', '身材', '服务', '态度', '环境', '综合', '过程')
 INPUT_FIELDS = tuple(f for f in FIELDS if f != '综合')
 LEGACY_FIELDS = tuple('留名' if f == '出击证明' else f for f in FIELDS)
-
 def valid_proof(value):
     import re
     return isinstance(value, str) and re.fullmatch(r'[a-f0-9]{32}\.jpg', value) is not None
@@ -95,15 +97,8 @@ class ReviewStore:
         if 'deleted_at' not in {r['name'] for r in self.db.execute('PRAGMA table_info(teachers)')}:
             self.db.execute('ALTER TABLE teachers ADD COLUMN deleted_at REAL')
         self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS teachers_username ON teachers(username COLLATE NOCASE)')
-        with self.transaction():
-            if not self.db.execute("SELECT 1 FROM settings WHERE key='admins_initialized'").fetchone():
-                self.db.execute('INSERT OR IGNORE INTO admins VALUES(?)', (self.owner,))
-                self.db.execute("INSERT INTO settings VALUES('admins_initialized','1')")
         # A crashed send may have succeeded remotely: never blindly resend it.
         self.db.execute("UPDATE jobs SET state='uncertain',error='进程在请求期间中断，请核对远端消息' WHERE state='sending'")
-
-    def admin(self, uid):
-        return bool(self.db.execute('SELECT 1 FROM admins WHERE user_id=?', (uid,)).fetchone())
 
     def require_admin(self, uid):
         if not self.admin(uid):
@@ -112,16 +107,6 @@ class ReviewStore:
     def log(self, uid, action, detail):
         self.db.execute('INSERT INTO audit(actor,action,detail,created) VALUES(?,?,?,?)',
                         (uid, action, str(detail), time.time()))
-
-    def set_admin(self, actor, uid, add=True):
-        self.require_admin(actor)
-        if not 0 < uid < 2**63:
-            raise ValueError('无效的 Telegram ID。')
-        with self.transaction():
-            if not add and self.db.execute('SELECT count(*) FROM admins').fetchone()[0] == 1 and self.admin(uid):
-                raise ValueError('不能移除最后一位 superadmin。')
-            self.db.execute('INSERT OR IGNORE INTO admins VALUES(?)' if add else 'DELETE FROM admins WHERE user_id=?', (uid,))
-            self.log(actor, '添加管理员' if add else '移除管理员', uid)
 
     def teacher(self, tid):
         row = self.db.execute('SELECT * FROM teachers WHERE id=?', (tid,)).fetchone()
@@ -337,11 +322,24 @@ class ReviewStore:
         self.db.execute('INSERT OR REPLACE INTO drafts VALUES(?,?,?)', (uid, json.dumps(data, ensure_ascii=False), token))
 
     def ready(self):
-        return bool(self.db.execute("SELECT 1 FROM bindings WHERE mode='thread' AND active=1").fetchone())
+        return self.service_authorized() and bool(
+            self.db.execute("SELECT 1 FROM bindings WHERE active=1 LIMIT 1").fetchone())
+
+    def can_publish(self):
+        return self.service_authorized() and bool(self.db.execute(
+            "SELECT 1 FROM bindings WHERE active=1 AND mode IN ('thread','feed') LIMIT 1").fetchone())
+
+    def publication_link(self, review):
+        row = self.db.execute('''SELECT p.chat_id,p.message FROM publications p JOIN bindings b ON b.id=p.binding
+            LEFT JOIN posts t ON t.binding=p.binding AND t.teacher=? WHERE p.review=? AND b.active=1
+            AND (b.mode='feed' OR (b.mode='thread' AND p.generation=t.generation))
+            ORDER BY CASE b.mode WHEN 'thread' THEN 0 ELSE 1 END,b.id LIMIT 1''',
+            (review['teacher'], review['id'])).fetchone()
+        return link(*row) if row else None
 
     def submit(self, user, token):
-        if not self.ready():
-            raise ValueError('尚无可用的老师专帖频道。')
+        if not self.can_publish():
+            raise ValueError('写评需要一个可用的车评直发或老师专帖频道。')
         with self.transaction():
             existing = self.db.execute('SELECT id,status FROM reviews WHERE submission=?', (token,)).fetchone()
             if existing:
@@ -382,6 +380,64 @@ class ReviewStore:
     def enqueue(self, kind, bid, tid, rid=0, generation=1):
         self.db.execute('INSERT OR IGNORE INTO jobs(kind,binding,teacher,review,generation) VALUES(?,?,?,?,?)',
                         (kind, bid, tid, rid, generation))
+
+    def comment_buttons(self):
+        row = self.db.execute("SELECT value FROM settings WHERE key='comment_buttons'").fetchone()
+        return comment_layout(json.loads(row[0])) if row else default_comment_layout()
+
+    def resize_comment_buttons(self, actor, axis, size):
+        self.require_admin(actor)
+        limits = {'rows': MAX_COMMENT_ROWS, 'columns': MAX_COMMENT_COLUMNS}
+        if axis not in limits or not 1 <= size <= limits[axis]:
+            raise ValueError('评论按钮的行列设置无效。')
+        with self.transaction():
+            layout = self.comment_buttons()
+            if layout[axis] == size:
+                return False
+            before = visible_comment_rows(layout)
+            layout[axis] = size
+            self._save_comment_buttons(layout, before)
+            self.log(actor, '调整评论按钮布局', f"{layout['rows']}×{layout['columns']}")
+            return True
+
+    def set_comment_button(self, actor, row, column, changes):
+        self.require_admin(actor)
+        with self.transaction():
+            layout = self.comment_buttons()
+            if not (1 <= row <= layout['rows'] and 1 <= column <= layout['columns']):
+                raise ValueError('这个位置已超出当前布局，请返回后重新选择。')
+            before = visible_comment_rows(layout)
+            key = f'{row}:{column}'
+            buttons = layout['buttons']
+            old = buttons.get(key)
+            updated = {**(old or {}), **changes} if changes is not None else None
+            if old == updated:
+                return False
+            if updated is None:
+                buttons.pop(key)
+            else:
+                buttons[key] = updated
+            self._save_comment_buttons(layout, before)
+            self.log(actor, '设置评论按钮', key)
+            return True
+
+    def _save_comment_buttons(self, layout, before):
+        validate_comment_layout(layout)
+        self.db.execute("INSERT OR REPLACE INTO settings VALUES('comment_buttons',?)",
+                        (json.dumps(layout, ensure_ascii=False),))
+        if before != visible_comment_rows(layout):
+            self.queue_comment_buttons()
+
+    def queue_comment_buttons(self):
+        # Refresh only the existing current replica, at most once per config change.
+        self.db.execute("""INSERT INTO jobs(kind,binding,teacher,review,generation)
+            SELECT 'commentbuttons',pub.binding,r.teacher,r.id,pub.generation
+            FROM publications pub JOIN bindings b ON b.id=pub.binding
+            JOIN reviews r ON r.id=pub.review
+            JOIN posts p ON p.binding=b.id AND p.teacher=r.teacher AND p.generation=pub.generation
+            WHERE b.mode='thread' AND r.status='accepted'
+            ON CONFLICT(kind,binding,teacher,review,generation)
+            DO UPDATE SET state='pending',due=0,error='' WHERE jobs.state<>'pending'""")
 
     def ensure_post(self, bid, tid, backfill=True):
         self.active_teacher(tid)

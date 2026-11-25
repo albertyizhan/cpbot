@@ -4,15 +4,24 @@ import re
 import secrets
 import sqlite3
 import time
+from collections import OrderedDict
 from datetime import datetime
+from heapq import merge
+from itertools import islice, repeat
 
 from .api import APIError
+from .comment_buttons import (COMMENT_COLORS, MAX_COMMENT_COLUMNS, MAX_COMMENT_ROWS,
+                              REVIEW_ACTION, REVIEW_TEMPLATE, parse_comment_color)
 from .identity import targets, member_present
 from .store import display_name
-from .reviews import FIELDS, INPUT_FIELDS, SCORES, valid_score, overall_score, missing_fields, valid_proof, MODES, TZ, now_text, link, review_date
+from .reviews import FIELDS, INPUT_FIELDS, SCORES, valid_score, overall_score, missing_fields, valid_proof, MODES, TZ, now_text, review_date
 from .publishing import Publisher, render_review
 from .backup import validate_backup, MAX_BACKUP_BYTES, MAX_IMAGE_ZIP_BYTES
 
+MEMBER_ACTIONS = {'write': '写车评', 'findteacher': '找老师', 'search': '查学生', 'lookup': '查学生'}
+COMMENT_EDITOR_ACTIONS = {'commentbuttons', 'cbsize', 'cbcell', 'cbedit', 'cbtemplate',
+                          'cbcontent', 'cbcolor', 'cbclear'}
+COMMENT_LINK_HINT = '链接可用 {cluster_id}、{teacher_id}、{review_id}，分别带上集群、老师和车评编号。'
 
 def date(stamp):
     return now_text(stamp) if stamp else '未知'
@@ -33,14 +42,18 @@ class Bot:
         return self.api.call('sendMessage', chat_id=chat, text=text,
                              reply_markup={'inline_keyboard': rows or []}, **extra)
 
-    def panel(self, uid, text, rows, pending=None, urls=None, **extra):
+    def panel(self, uid, text, rows, pending=None, urls=None, styles=None, **extra):
         notice = self.notices.pop(uid, None)
         if notice:
             text = (html.escape(notice) if extra.get('parse_mode') == 'HTML' else notice) + "\n\n" + text
         nonce = secrets.token_hex(5)
-        keyboard = [[{'text': label, 'callback_data': nonce + '|' + action} for label, action in row] for row in rows]
+        styles = styles or {}
+        keyboard = [[{'text': label, 'callback_data': nonce + '|' + action,
+                      **({'style': styles[action]} if styles.get(action) else {})}
+                     for label, action in row] for row in rows]
         keyboard += urls or []
-        session = {'nonce': nonce, 'until': time.monotonic() + 600, 'pending': pending}
+        session = {'nonce': nonce, 'until': time.monotonic() + 600, 'pending': pending,
+                   'actions': {action for row in rows for _, action in row}}
         self.sessions[uid] = session
         if self.edit_target:
             mid = self.edit_target
@@ -90,19 +103,29 @@ class Bot:
 
     def home(self, uid):
         rows = []
-        if self.store.ready():
-            rows = [[('🌷 写车评', 'write'), ('🔎 找老师', 'findteacher')],
-                    [('👤 查学生', 'search'), ('📋 我的车评', 'mine:0')]]
-
+        stores = [bot.store for bot in self.router.bots.values()] if self.router else [self.store]
+        ready = any(store.ready() for store in stores)
+        if ready:
+            row = [('🔎 找老师', 'findteacher')]
+            if any(store.can_publish() for store in stores):
+                row.insert(0, ('🌷 写车评', 'write'))
+            rows = [row, [('👤 查学生', 'search'), ('📋 我的车评', 'mine:0')]]
+            if self.router:
+                rows = [[(label, 'member:' + action if action in MEMBER_ACTIONS else action)
+                         for label, action in row] for row in rows]
+        elif self.router:
+            rows = [[('📋 我的车评', 'mine:0')]]
         if self.store.admin(uid):
             rows += [[('⚙️ 管理后台', 'admin')]]
-        text = '🏠 车评主菜单\n🟢 当前可查询、填写车评。' if self.store.ready() else '⚠️ 机器人尚未配置完成或专帖绑定已失效。\n普通业务暂不可用，请联系管理员检查老师专帖频道。'
-        if self.paused():
+        text = '🏠 车评主菜单' if ready else '⚠️ 尚未配置可用的集群绑定，请联系管理员。'
+        if self.paused() and (not self.router or len(self.router.bots) == 1):
             text += '\n⏸ 发布队列已暂停，已提交的车评会等待管理员恢复发布。'
-        if self.router and len(self.store.clusters.names) > 1:
-            text += '\n当前集群：' + self.store.clusters.names[self.store.cluster_id]
-            rows.append([('选择集群', 'clusters:home:0')])
         return self.panel(uid, text, rows)
+
+    def scoped(self, text):
+        if self.router:
+            return '集群：%s\n\n%s' % (self.store.clusters.names[self.store.cluster_id], text)
+        return text
 
     def prompt(self, uid, text, pending, back='home'):
         return self.panel(uid, text + '\n\n✉️ 请直接发送内容，或点击下方取消。', [[('取消 / 返回', back)]], pending)
@@ -111,9 +134,9 @@ class Bot:
         p = self.store.person(pid)
         if intent == 'delete':
             self.store.require_editor(uid)
-            return self.panel(uid, self.card(p) + '\n\n确定清空标签？保留身份和修改记录。',
+            return self.panel(uid, self.scoped(self.card(p) + '\n\n确定清空标签？保留身份和修改记录。'),
                 [[('确认删除', 'delete:%s:%s' % (pid, p['version']))], [('取消', 'person:%s' % pid)]])
-        return self.panel(uid, (notice + '\n\n' if notice else '') + self.card(p) + self.target_membership(p),
+        return self.panel(uid, self.scoped((notice + '\n\n' if notice else '') + self.card(p) + self.target_membership(p)),
                           [[('新增标签', 'edit:%s' % pid), ('删除标签', 'askdelete:%s' % pid)],
                            [('修改记录', 'history:%s:0' % pid)], [('返回主菜单', 'home')]])
 
@@ -144,7 +167,7 @@ class Bot:
             rows.append([(f + (' ✅' if f not in missing_fields(d) else ''), 'field:' + f) for f in INPUT_FIELDS[i:i+2]])
         rows += [[('✅ 匿名' if d.get('匿名', True) else '✅ 实名', 'anon'), ('预览', 'preview')],
                  [('提交', 'submit'), ('返回主菜单', 'home')]]
-        return self.panel(uid, '\n'.join(lines), rows)
+        return self.panel(uid, self.scoped('\n'.join(lines)), rows)
 
     def teachers(self, uid, intent='choose', search='', page=0):
         if intent not in ('choose','teacherlink','teacherdetail','codefor'):
@@ -168,7 +191,7 @@ class Bot:
             rows.append([('下一页', 'teacherspage:%s:%s' % (intent, page+1))])
         if page:
             rows.append([('上一页', 'teacherspage:%s:%s' % (intent, page-1))])
-        return self.panel(uid, '👩‍🏫 选择老师 · 第 %s 页' % (page+1) + ('\n搜索：'+search if search else '') + ('\n点击下方老师继续，也可直接发送姓名或 @用户名搜索。' if teachers else '\n📭 没有匹配的老师，请换个姓名或用户名。用户名需老师绑定本人账号并私聊机器人后才能识别。'), rows + [[('返回草稿','write')] if intent=='choose' else [('返回主菜单','home')]], ('teacherlist',intent,search))
+        return self.panel(uid, self.scoped('👩‍🏫 选择老师 · 第 %s 页' % (page+1) + ('\n搜索：'+search if search else '') + ('\n点击下方老师继续，也可直接发送姓名或 @用户名搜索。' if teachers else '\n📭 没有匹配的老师，请换个姓名或用户名。用户名需老师绑定本人账号并私聊机器人后才能识别。')), rows + [[('返回草稿','write')] if intent=='choose' else [('返回主菜单','home')]], ('teacherlist',intent,search))
 
     def teacher_batch_preview(self, uid, page=0):
         self.store.require_admin(uid)
@@ -200,29 +223,104 @@ class Bot:
 
     def admin_panel(self, uid):
         self.store.require_admin(uid)
-        counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers WHERE deleted_at IS NULL), (SELECT count(*) FROM bindings WHERE mode='thread' AND active=1), (SELECT count(*) FROM reviews WHERE status='accepted')", ).fetchone()
+        counts = self.store.db.execute("SELECT (SELECT count(*) FROM teachers WHERE deleted_at IS NULL), (SELECT count(*) FROM bindings WHERE mode IN ('thread','feed') AND active=1), (SELECT count(*) FROM reviews WHERE status='accepted')", ).fetchone()
         heading = '⚙️ 管理后台'
         cluster_rows = []
         if self.router:
             heading += ' · 集群 ' + self.store.clusters.names[self.store.cluster_id]
             cluster_rows = [[('选择集群', 'clusters:admin:0'), ('修改名称', 'clusterrename')]]
-        return self.panel(uid, heading + '\n👩‍🏫 老师 %s 位 · 📣 可用专帖频道 %s 个\n📝 有效车评 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), cluster_rows + [
+            cluster_rows += [[('成员资格来源', 'msources:0')]]
+            cluster_rows += [[('集群授权 · ' + ('已激活' if self.store.service_authorized() else '未激活'), 'activation')]]
+            if self.store.service_authorized() and not self.router.legacy_access(self) and not self.store.member_source_ids():
+                heading += '\n请设置成员资格来源，开放普通成员访问。'
+        return self.panel(uid, heading + '\n👩‍🏫 老师 %s 位 · 📣 可用发布频道 %s 个\n📝 有效车评 %s 条 · %s' % (*counts, '⏸ 发布已暂停' if self.paused() else '▶️ 发布队列运行中'), cluster_rows + [
             [('👩‍🏫 老师列表', 'teachersadmin'), ('➕ 添加老师', 'teachernew')],
             [('📥 批量导入老师', 'teacherbatch')],
             [('🗑 老师回收站', 'teachertrash'), ('⏳ 设置保留天数', 'trashdays')],
 
             [('🎯 在群判定目标', 'membertarget')],
             [('📣 频道 / 群绑定', 'bindings'), ('👑 superadmin 名单', 'admins')],
+            [('评论按钮', 'commentbuttons')],
             [('📤 发布任务', 'jobs:0'), ('🛠 车评处理', 'reviewmanage')],
             [('💾 导出数据备份', 'export'), ('📥 导入数据备份', 'import')],
             [('返回主菜单', 'home')]])
 
+    def comment_buttons_panel(self, uid):
+        layout = self.store.comment_buttons()
+        rows = [[(f"{'✓ ' if size == layout[axis] else ''}{size} {unit}", f'cbsize:{axis}:{size}')
+                 for size in range(1, limit + 1)]
+                for axis, unit, limit in (('rows', '行', MAX_COMMENT_ROWS), ('columns', '列', MAX_COMMENT_COLUMNS))]
+        styles = {}
+        visible_positions = set()
+        for row in range(1, layout['rows'] + 1):
+            cells = []
+            for column in range(1, layout['columns'] + 1):
+                position = f'{row}:{column}'
+                visible_positions.add(position)
+                action = f'cbcell:{position}'
+                button = layout['buttons'].get(position)
+                cells.append((button['text'] if button else f'＋ {row}-{column}', action))
+                if button:
+                    styles[action] = button['style']
+            rows.append(cells)
+        text = '评论按钮 · 编辑布局\n先选最大行数和列数，再点击对应位置。公开评论会跳过空位和空行。'
+        hidden = len(layout['buttons'].keys() - visible_positions)
+        if hidden:
+            text += f'\n布局外保留了 {hidden} 个按钮。增大行列后可重新显示。'
+        return self.panel(uid, self.scoped(text), rows + [[('返回管理后台', 'admin')]], styles=styles)
+
+    def comment_button_panel(self, uid, row, column):
+        layout = self.store.comment_buttons()
+        if row > layout['rows'] or column > layout['columns']:
+            return self.comment_buttons_panel(uid)
+        position = f'{row}:{column}'
+        button = layout['buttons'].get(position)
+        header = f'评论按钮 · 第 {row} 行第 {column} 列'
+        if not button:
+            return self.panel(uid, self.scoped(header + '\n此位置为空。'),
+                              [[('套用「评价当前老师」', f'cbtemplate:{position}')],
+                               [('自行填写', f'cbedit:{position}:new')],
+                               [('返回布局', 'commentbuttons')]])
+        content = '评价当前老师（动态入口）' if button['content'] == REVIEW_ACTION else button['content']
+        detail = (f"显示名称　{button['text']}\n内部内容　{content}\n颜色　{COMMENT_COLORS[button['style']]}")
+        rows = [[('更改显示名称', f'cbedit:{position}:text'), ('更改内容', f'cbedit:{position}:content')],
+                [('更改颜色', f'cbedit:{position}:style'), ('清空此位置', f'cbclear:{position}')]]
+        if button != REVIEW_TEMPLATE:
+            rows.append([('重置为「评价当前老师」模板', f'cbtemplate:{position}')])
+        return self.panel(uid, self.scoped(header + '\n' + detail),
+                          rows + [[('返回布局', 'commentbuttons')]],
+                          link_preview_options={'is_disabled': True})
+
+    def edit_comment_button(self, uid, row, column, field):
+        position = f'{row}:{column}'
+        back = f'cbcell:{position}'
+        pending = ('commentbuttoninput', row, column, field)
+        if field == 'new':
+            text = ('按顺序发送以下内容，每项一行。\n'
+                    '第 1 行：显示名称\n第 2 行：内部内容（HTTP 或 HTTPS 链接）\n'
+                    '第 3 行（可省略）：蓝色、绿色、红色或无颜色\n\n' + COMMENT_LINK_HINT)
+        elif field == 'text':
+            text = '发送新的显示名称，限一行，1～40 字。'
+        elif field == 'content':
+            text = self.scoped('发送新的 HTTP 或 HTTPS 链接。\n' + COMMENT_LINK_HINT)
+            return self.panel(uid, text, [[('使用「评价当前老师」入口', f'cbcontent:{position}')],
+                                          [('取消 / 返回', back)]], pending)
+        else:
+            button = self.store.comment_buttons()['buttons'].get(position)
+            if not button:
+                return self.comment_button_panel(uid, row, column)
+            styles = {f'cbcolor:{position}:{style or "none"}': style for style in COMMENT_COLORS}
+            options = [(('✓ ' if style == button['style'] else '') + COMMENT_COLORS[style], action)
+                       for action, style in styles.items()]
+            return self.panel(uid, self.scoped('选择按钮颜色。'),
+                              [options, [('取消 / 返回', back)]], styles=styles)
+        return self.prompt(uid, self.scoped(text), pending, back)
+
     def cluster_panel(self, uid, destination, page):
-        is_admin = self.store.admin(uid)
-        choices = [(cluster_id, name) for cluster_id, name in self.store.clusters.names.items()
-                   if is_admin or self.router.bots[cluster_id].store.ready()]
+        choices = list(self.store.clusters.names.items())
         rows = [[(('✓ ' if cluster_id == self.store.cluster_id else '') +
-                  (name if name == str(cluster_id) else '%s · #%s' % (name, cluster_id)),
+                  ('%s%s' % (name if name == str(cluster_id) else '%s · #%s' % (name, cluster_id),
+                             '' if cluster_id in self.store.clusters.authorized else '（未激活）')),
                   'clusterselect:%s:%s' % (destination, cluster_id))]
                 for cluster_id, name in choices[page * 8:(page + 1) * 8]]
         nav = []
@@ -236,43 +334,171 @@ class Bot:
             rows.append([('＋ 新建集群', 'clusternew')])
         return self.panel(uid, '选择集群' if choices else '暂无可用集群。', rows + [[('返回', destination)]])
 
+    def activation_panel(self, uid, issued=None):
+        clusters = self.store.clusters
+        cid = self.store.cluster_id
+        if self.store.service_authorized():
+            text = '集群授权 · 已激活'
+            rows = [[('撤销授权', 'activationrevoke')]]
+        else:
+            text = '集群授权 · 未激活'
+            pending = clusters.pending_activation(cid)
+            if issued:
+                code, expires = issued
+                text += '\n\n%s\n有效至 %s。此码只显示一次，仅用于当前集群。' % (code, date(expires))
+            elif pending:
+                text += '\n授权码有效至 %s。重新生成会使旧码失效。' % date(pending)
+            rows = [[('重新生成授权码' if pending else '生成授权码', 'activationissue'),
+                     ('输入授权码', 'activationinput')]]
+            if pending:
+                rows.append([('作废未使用的授权码', 'activationrevoke')])
+        return self.panel(uid, self.scoped(text), rows + [[('返回管理后台', 'admin')]])
+
+    def member_sources_panel(self, uid, page):
+        sources = list(self.store.member_sources().items())
+        selected = self.store.member_source_ids() or set()
+        rows = [[('%s %s' % ('☑️' if cid in selected else '⬜', title[:60]),
+                  'msource:%s:%s' % (cid, page))]
+                for cid, title in sources[page * 8:(page + 1) * 8]]
+        navigation = []
+        if page:
+            navigation.append(('上一页', 'msources:%s' % (page - 1)))
+        if len(sources) > (page + 1) * 8:
+            navigation.append(('下一页', 'msources:%s' % (page + 1)))
+        if navigation:
+            rows.append(navigation)
+        text = '成员资格来源\n成员加入任意一个已勾选的群或频道，即可使用这个集群。'
+        if not sources:
+            text += '\n请先绑定频道或群。'
+        elif not selected.intersection(cid for cid, _ in sources):
+            text += ('\n当前沿用单集群的公开访问。勾选后开始验证成员身份。'
+                     if self.router.legacy_access(self) else '\n请选择至少一个来源，才能向普通成员开放。')
+        return self.panel(uid, self.scoped(text), rows + [[('返回管理后台', 'admin')]])
+
+    def review_items(self, uid, limit, offset=0):
+        return self.store.db.execute("""SELECT * FROM reviews WHERE author=?
+            AND status IN ('accepted','withdrawn','pending','rejected')
+            ORDER BY created DESC,id DESC LIMIT ? OFFSET ?""", (uid, limit, offset))
+
+    def my_reviews_panel(self, uid, page, items):
+        rows, urls = [], []
+        text = '📋 我的车评 · 第 %s 页' % (page + 1)
+        notes = []
+        for bot, review in items[:8]:
+            publication = bot.store.publication_link(review)
+            label = '#%s %s · %s' % (review['id'], bot.store.teacher(review['teacher'])['name'],
+                                     review_date(json.loads(review['data'])['时间'], legacy=True))
+            if self.router and len(self.router.bots) > 1:
+                label = self.store.clusters.names[bot.store.cluster_id] + ' · ' + label
+            status = {'pending': '🕓 待审核', 'rejected': '❌ 未通过审核',
+                      'withdrawn': '已撤下'}.get(review['status'])
+            if not status and publication:
+                urls.append([{'text': label, 'url': publication}])
+            else:
+                notes.append(label + ' · ' + (status or '暂无可用链接'))
+        if notes:
+            text += '\n' + '\n'.join(notes)
+        if not items:
+            text += '\n📭 暂无车评。可返回主菜单选择「写车评」。'
+        if page:
+            rows.append([('上一页', 'mine:%s' % (page - 1))])
+        if len(items) > 8:
+            rows.append([('下一页', 'mine:%s' % (page + 1))])
+        return self.panel(uid, text, rows + [[('返回主菜单', 'home')]], urls=urls)
+
     def action(self, user, action):
         uid = user['id']
         parts = action.split(':'); kind = parts[0]
         if self.router and kind in ('clusters', 'clusterselect', 'clusternew', 'clusterrename'):
+            self.store.require_admin(uid)
             if kind == 'clusternew':
-                self.store.require_admin(uid)
                 return self.router.switch(self, uid, self.router.create(uid), 'admin')
             if kind == 'clusterrename':
-                self.store.require_admin(uid)
                 destination = 'bindings' if parts[1:] == ['bindings'] else 'admin'
                 return self.prompt(uid, '当前名称：%s\n发送新名称（1～40 字）。' %
                                    self.store.clusters.names[self.store.cluster_id], ('clusterrename', destination),
                                    destination)
             destination = parts[1]
-            if destination not in ('home', 'admin', 'bindings'):
+            if destination not in ('admin', 'bindings'):
                 raise ValueError('请从主菜单重新选择集群。')
-            if destination != 'home':
-                self.store.require_admin(uid)
             if kind == 'clusters':
                 return self.cluster_panel(uid, destination, int(parts[2]))
             return self.router.switch(self, uid, int(parts[2]), destination)
-        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset','codesadmin','codefor','admins','adminadd','adminremove',
+        if self.router and kind in ('member', 'memberpage', 'memberpick'):
+            if kind == 'memberpick':
+                previous = self.previous_pending
+                message = previous[2] if previous and previous[0] == 'memberpick' else None
+                return self.router.enter(self, user, parts[1], int(parts[2]), message)
+            previous = self.previous_pending if kind == 'memberpage' else None
+            message = previous[2] if previous and previous[0] == 'memberpick' else None
+            return self.router.member_menu(self, user, parts[1], int(parts[2]) if kind == 'memberpage' else 0, message)
+        if self.router and kind == 'mine':
+            return self.router.mine(self, uid, max(0, int(parts[1])))
+        admin_kinds = {'membertarget','membertargetset','membertargetclear','admin','teachersadmin','teachernew','teacheredit','teacherdetail','teacherbind','teacherunbind','teacherunbindyes','teacherrename','teacherdelete','teacherdeleteyes','teachertrash','teacherpurge','teacherpurgeyes','trashdays','trashdaysset','codesadmin','codefor','admins',
                        'teacherbatch','teacherbatchpage','teacherbatchconfirm','teacherbatchcancel',
+                       'msources','msource',
+                       'activation','activationissue','activationinput','activationrevoke','activationrevokeyes',
                        'bindings','bind','binding','recheck','unbind','unbindyes','queue','moderate','approve','reject',
-                       'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','removeadmin','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
+                       'import','importconfirm','importcancel','setroot','pausejobs','resumejobs','export','jobs','job','retry','jobdone','reviewmanage','reviewadmin','withdraw','withdrawyes','reviewedit'}
         if kind in ('mycodes','codes','codefor','codesadmin','queue','moderate','approve','reject'):
             raise ValueError('留名及审核机制已取消，请上传出击证明后直接提交车评。')
+        admin_kinds |= COMMENT_EDITOR_ACTIONS
         if kind in admin_kinds:
             self.store.require_admin(uid)
+        elif self.router and kind not in ('home', 'cancel'):
+            self.router.require_member(self, uid)
         if kind not in admin_kinds and kind not in ('home','cancel') and not self.store.ready():
-            raise ValueError('尚无可用的老师专帖绑定，业务暂不可用。')
+            raise ValueError('当前集群没有可用绑定。')
+        if kind in ('write','choose','field','score','anon','preview','submit') and not self.store.can_publish():
+            raise ValueError('写评需要一个可用的车评直发或老师专帖频道。')
         if kind in ('home','cancel'):
             self.imports.pop(uid, None)
             self.teacher_imports.pop(uid, None)
             return self.home(uid)
         if kind == 'admin':
             return self.admin_panel(uid)
+        if kind == 'commentbuttons':
+            return self.comment_buttons_panel(uid)
+        if kind == 'cbsize':
+            if self.store.resize_comment_buttons(uid, parts[1], int(parts[2])):
+                self.success(uid, '布局已保存。')
+            return self.comment_buttons_panel(uid)
+        if kind in COMMENT_EDITOR_ACTIONS:
+            row, column = map(int, parts[1:3])
+            if kind == 'cbedit':
+                return self.edit_comment_button(uid, row, column, parts[3])
+            if kind != 'cbcell':
+                changes = {'cbtemplate': REVIEW_TEMPLATE, 'cbcontent': {'content': REVIEW_ACTION}, 'cbclear': None}
+                change = {'style': None if parts[3] == 'none' else parts[3]} if kind == 'cbcolor' else changes[kind]
+                if self.store.set_comment_button(uid, row, column, change):
+                    self.success(uid, '已保存，历史评论将依次更新。')
+            return self.comment_button_panel(uid, row, column)
+        if self.router and kind.startswith('activation'):
+            clusters = self.store.clusters
+            cid = self.store.cluster_id
+            if kind == 'activation':
+                return self.activation_panel(uid)
+            if kind == 'activationissue':
+                return self.activation_panel(uid, clusters.issue_activation(uid, cid))
+            if kind == 'activationinput':
+                return self.prompt(uid, self.scoped('发送本集群的授权码。'), ('activationinput',), 'activation')
+            if kind == 'activationrevoke':
+                text = ('撤销后，本集群的查档、写评和发布会停止。已保存的资料和任务保留。'
+                        if self.store.service_authorized() else '作废后，该授权码将无法激活集群。')
+                return self.panel(uid, self.scoped(text),
+                                  [[('确认', 'activationrevokeyes'), ('取消', 'activation')]])
+            if kind == 'activationrevokeyes':
+                clusters.revoke_activation(uid, cid)
+                return self.activation_panel(uid)
+        if kind in ('msources', 'msource'):
+            page = int(parts[-1])
+            if kind == 'msource':
+                cid = int(parts[1])
+                if cid not in (self.store.member_source_ids() or set()):
+                    self.publisher._rights(cid, False, '成员资格来源')
+                self.store.toggle_member_source(uid, cid)
+                self.router.invalidate_chat(cid)
+            return self.member_sources_panel(uid, page)
         if kind=='membertarget':
             target=self.store.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
             value=json.loads(target[0]) if target else None
@@ -318,7 +544,7 @@ class Bot:
             if not token:
                 token=secrets.token_hex(12)
             if kind=='choose':
-                self.store.teacher(int(parts[1])); d['老师']=int(parts[1])
+                self.store.active_teacher(int(parts[1])); d['老师']=int(parts[1])
             elif kind=='score':
                 if parts[1] not in SCORES or not 1<=int(parts[2])<=10:
                     raise ValueError('无效分数。')
@@ -344,7 +570,7 @@ class Bot:
             rid,status=self.store.submit(user,token)
             return self.panel(uid,'📝 车评 #%s\n✅ 已提交，无需审核。%s'%(rid,'⏸ 发布已暂停，恢复后自动发布。' if self.paused() else '正在限速发布文字和证明图，可在「我的车评」查看链接。'),[[('返回主菜单','home')]])
         if kind=='findteacher':
-            return self.prompt(uid,'输入老师姓名关键词或 @用户名，或发送“全部”浏览。',('findteacher',))
+            return self.prompt(uid,self.scoped('输入老师姓名关键词或 @用户名，或发送“全部”浏览。'),('findteacher',))
         if kind in ('teachersearch','teacherall'):
             intent=parts[1]
             if intent not in ('choose','teacherlink','teacherdetail','codefor'):
@@ -357,28 +583,32 @@ class Bot:
             old=getattr(self,'previous_pending',None)
             return self.teachers(uid,parts[1],old[2] if old and old[0]=='teacherlist' else '',int(parts[2]))
         if kind=='teacherlink':
-            t=self.store.teacher(int(parts[1])); urls=[]
-            for p in self.store.db.execute('SELECT p.*,b.chat_id,b.title FROM posts p JOIN bindings b ON b.id=p.binding WHERE p.teacher=? AND p.message IS NOT NULL AND b.active=1',(t['id'],)):
-                urls.append([{'text':p['title'],'url':link(p['chat_id'],p['message'])}])
-            return self.panel(uid,t['name']+(' · 选择评价主帖' if urls else ' · 主帖正在准备中。'),[[('给这位老师写评价','choose:%s'%t['id']),('返回主菜单','home')]],urls=urls)
+            teacher = self.store.active_teacher(int(parts[1]))
+            tid = teacher['id']
+            page = max(0, int(parts[2])) if len(parts) > 2 else 0
+            reviews = self.store.db.execute("""SELECT id,teacher,data FROM reviews WHERE teacher=? AND status='accepted'
+                ORDER BY json_extract(data,'$.时间') DESC,id DESC LIMIT 9 OFFSET ?""", (tid,page*8)).fetchall()
+            lines = [html.escape(self.scoped('%s · 车评 · 第 %s 页' % (teacher['name'], page+1)))]
+            for review in reviews[:8]:
+                label = '#%s · %s' % (review['id'], review_date(json.loads(review['data'])['时间'], legacy=True))
+                url = self.store.publication_link(review)
+                lines.append('<a href="%s">%s</a>' % (url,label) if url else label + ' · 暂无可用链接')
+            if not reviews:
+                lines.append('本页暂无车评。')
+            nav = []
+            if page:
+                nav.append(('上一页', 'teacherlink:%s:%s' % (tid,page-1)))
+            if len(reviews) > 8:
+                nav.append(('下一页', 'teacherlink:%s:%s' % (tid,page+1)))
+            rows = [nav] if nav else []
+            if self.store.can_publish():
+                rows.append([('给这位老师写评价','choose:%s' % tid)])
+            rows.append([('返回老师列表','teacherall:teacherlink'),('返回主菜单','home')])
+            return self.panel(uid,'\n'.join(lines),rows,parse_mode='HTML',link_preview_options={'is_disabled':True})
         if kind=='mine':
-            page=max(0,int(parts[1])); rows=[]; text='📋 我的车评 · 第 %s 页'%(page+1); urls=[]
-            reviews=self.store.db.execute("SELECT * FROM reviews WHERE author=? AND status IN ('accepted','withdrawn','pending','rejected') ORDER BY id DESC LIMIT 9 OFFSET ?",(uid,page*8)).fetchall()
-            for r in reviews[:8]:
-                pub=self.store.db.execute('''SELECT p.* FROM publications p JOIN bindings b ON b.id=p.binding
-                    LEFT JOIN posts t ON t.binding=p.binding AND t.teacher=? WHERE p.review=? AND b.active=1
-                    AND (b.mode='feed' OR p.generation=t.generation) ORDER BY CASE b.mode WHEN 'thread' THEN 0 ELSE 1 END,b.id LIMIT 1''',(r['teacher'],r['id'])).fetchone()
-                label='#%s %s · %s'%(r['id'],self.store.teacher(r['teacher'])['name'],review_date(json.loads(r['data'])['时间'], legacy=True))
-                if r['status'] in ('pending','rejected'):
-                    text+='\n'+label+(' · 🕓 待审核' if r['status']=='pending' else ' · ❌ 未通过审核')
-                elif r['status']=='withdrawn': text+='\n'+label+' · 已撤下'
-                elif pub: urls.append([{'text':label,'url':link(pub['chat_id'],pub['message'])}])
-                else: text+='\n'+label+' · 待发布 / 请联系管理员核对任务'
-            if not reviews: text+='\n📭 暂无车评。可返回主菜单选择「写车评」。'
-            if page: rows.append([('上一页','mine:%s'%(page-1))])
-            if len(reviews)>8: rows.append([('下一页','mine:%s'%(page+1))])
-            return self.panel(uid,text,rows+[[('返回主菜单','home')]],urls=urls)
-        if kind=='search': return self.prompt(uid,'发送客户 ID、@用户名，或转发目标消息。',('search',))
+            page = max(0, int(parts[1]))
+            return self.my_reviews_panel(uid, page, [(self, r) for r in self.review_items(uid, 9, page * 8)])
+        if kind=='search': return self.prompt(uid,self.scoped('发送客户 ID、@用户名，或转发目标消息。'),('search',))
         if kind=='person': return self.show_person(uid,int(parts[1]))
         if kind in ('edit','askdelete','delete'):
             self.store.require_editor(uid)
@@ -410,7 +640,7 @@ class Bot:
                 raise ValueError('预览已过期，请重新进入批量导入并发送名单。')
             ids=self.store.import_teachers(uid,batch['entries'])
             self.teacher_imports.pop(uid,None)
-            self.success(uid,'已导入 %s 位老师。主帖已加入限速队列；已绑定账号可用于用户名搜索。'%len(ids))
+            self.success(uid,'已导入 %s 位老师。已绑定账号可用于用户名搜索。'%len(ids))
             return self.admin_panel(uid)
         if kind in ('teacherdetail','teacheredit'):
             t=self.store.teacher(int(parts[1]))
@@ -422,7 +652,7 @@ class Bot:
             return self.panel(uid,'👩‍🏫 %s · #%s\n%s\n未绑定不影响主帖、客户写评和查评。'%(t['name'],t['id'],identity),rows)
         if kind=='teacherdelete':
             t=self.store.teacher(int(parts[1]))
-            return self.panel(uid,'⚠️ 删除「%s」？\n老师和全部评价将进入回收站 %s 天。专帖里的评价正文和证明图会依次清除；到期后自动彻底删除。'%(t['name'],self.store.trash_days()),[[('确认删除','teacherdeleteyes:%s'%t['id'])],[('取消','teacherdetail:%s'%t['id'])]])
+            return self.panel(uid,'⚠️ 删除「%s」？\n老师和全部评价将进入回收站 %s 天。已发布的评价正文和证明图会依次清除；到期后自动彻底删除。'%(t['name'],self.store.trash_days()),[[('确认删除','teacherdeleteyes:%s'%t['id'])],[('取消','teacherdetail:%s'%t['id'])]])
         if kind=='teacherdeleteyes':
             tid=int(parts[1]);count=self.store.delete_teacher(uid,tid)
             self.success(uid,'老师已移入回收站，%s 条评价的公开内容正在清除。'%count)
@@ -443,15 +673,9 @@ class Bot:
             return self.action(user,'teacherdetail:%s'%tid)
         if kind=='teachersadmin': return self.teachers(uid,'teacherdetail')
         if kind=='admins':
-            rows=[[('移除 %s'%admin,'adminremove:%s'%admin)] for admin in self.store.admin_ids()]
-            return self.panel(uid,'👑 superadmin 名单\n下列账号拥有同等管理权限。添加后立即生效。',rows+[[('添加','adminadd'),('返回','admin')]])
-        if kind=='adminadd': return self.prompt(uid,'发送要添加的 Telegram 数字 ID。',('adminadd',),'admins')
-        if kind=='adminremove':
-            return self.panel(uid,'⚠️ 确认移除 %s？\n该账号将失去后台权限。若 .env 仍包含此 ID，重启后会重新加入。'%parts[1],[[('确认移除','removeadmin:%s'%parts[1])],[('取消','admins')]])
-        if kind=='removeadmin':
-            self.store.set_admin(uid,int(parts[1]),False)
-            self.success(uid, '已移除管理员 %s。如该 ID 仍在 .env 中，重启后会重新添加。' % parts[1])
-            return self.home(uid)
+            ids = '\n'.join(str(admin) for admin in self.store.admin_ids())
+            return self.panel(uid,'👑 superadmin 名单\n修改 .env 后重启生效。\n\n' + ids,
+                              [[('返回','admin')]])
         if kind=='bindings':
             page = max(0, int(parts[1])) if len(parts) > 1 else 0
             bindings = self.store.db.execute('SELECT * FROM bindings ORDER BY id LIMIT 13 OFFSET ?', (page * 12,)).fetchall()
@@ -501,7 +725,7 @@ class Bot:
             self.store.db.execute("UPDATE jobs SET state='pending' WHERE binding=? AND state='blocked'",(b['id'],))
             self.success(uid, '权限及关联检查通过，绑定已恢复；受阻任务已重新排队。')
             return self.action(user,'binding:'+parts[1])
-        if kind=='unbind': return self.panel(uid,'解除绑定会停止后续发布，已发出的消息保留。最后一个专帖绑定解除后业务停止。',[[('确认解除','unbindyes:'+parts[1])],[('取消','bindings')]])
+        if kind=='unbind': return self.panel(uid,'解除后此目标停止服务，已发消息保留。其他绑定可继续使用。',[[('确认解除','unbindyes:'+parts[1])],[('取消','bindings')]])
         if kind=='unbindyes':
             with self.store.transaction():
                 bid=int(parts[1]); self.store.db.execute("UPDATE jobs SET state='superseded' WHERE binding=?",(bid,))
@@ -510,6 +734,7 @@ class Bot:
                 self.store.db.execute('DELETE FROM jobs WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM posts WHERE binding=?',(bid,))
                 self.store.db.execute('DELETE FROM bindings WHERE id=?',(bid,));self.store.log(uid,'解除绑定',bid)
+                self.store.prune_member_sources()
             if self.store.clusters:
                 self.store.clusters.refresh_routes(self.store)
             self.success(uid, '绑定已解除，后续不再向此目标发布；远端消息保留。')
@@ -526,8 +751,7 @@ class Bot:
             scope = '当前集群'
             if self.router:
                 scope = '集群「%s」' % self.store.clusters.names[self.store.cluster_id]
-            admins = ' 集群 1 的备份同时恢复 superadmin 名单，保留当前操作者和 .env 管理员。' if self.store.cluster_id == 1 else ''
-            return self.prompt(uid,'📥 导入数据备份\n请上传同一批 JSON（最大 15 MB）和 ZIP（最大 19 MB），顺序不限。\n确认后覆盖%s的业务数据。%s\n上传后可先预览。' % (scope, admins),('importfile',),'admin')
+            return self.prompt(uid,'📥 导入数据备份\n请上传同一批 JSON（最大 15 MB）和 ZIP（最大 19 MB），顺序不限。\n确认后覆盖%s的业务数据。\n上传后可先预览。' % scope,('importfile',),'admin')
         if kind=='importcancel':
             self.imports.pop(uid, None)
             self.success(uid,'已取消导入，当前数据未改变。')
@@ -578,6 +802,9 @@ class Bot:
         if kind=='job':
             j=self.store.db.execute('SELECT * FROM jobs WHERE id=?',(int(parts[1]),)).fetchone()
             if not j:raise ValueError('任务不存在。')
+            if j['kind'] == 'commentbuttons':
+                return self.panel(uid, '📤 任务 #%s · 更新评论按钮\n%s' % (j['id'], j['error']),
+                                  [[('重试更新', 'retry:' + parts[1])], [('返回', 'jobs:0')]])
             kinds={'post':'创建老师主帖','comment':'发布评价评论','feed':'频道直发','summary':'更新总评价','checkpost':'巡检主帖','check':'巡检评价','health':'检查权限','proof':'发布 / 巡检证明图'}
             return self.panel(uid,'📤 任务 #%s · %s\n%s\n结果不明时请先核对目标：若已发送，登记远端消息 ID；若确认未发送，才重试。'%(j['id'],kinds.get(j['kind'],j['kind']),j['error']),[[('确认未发送，重试','retry:'+parts[1]),('已发送，登记消息 ID','jobdone:'+parts[1])],[('返回','jobs:0')]])
         if kind=='retry':
@@ -617,7 +844,8 @@ class Bot:
 
     def callback(self, q):
         uid=q['from']['id'];msg=q.get('message',{});nonce,_,action=q.get('data','').partition('|');s=self.sessions.get(uid)
-        if msg.get('chat',{}).get('type')!='private' or msg['chat']['id']!=uid or not s or nonce!=s['nonce'] or s['until']<time.monotonic():
+        if (msg.get('chat',{}).get('type')!='private' or msg['chat']['id']!=uid or not s
+                or nonce!=s['nonce'] or s['until']<time.monotonic() or action not in s['actions']):
             return self.api.call('answerCallbackQuery',callback_query_id=q['id'],text='⌛ 菜单已过期或已使用，请发送 /start 重新打开。草稿仍保留。',show_alert=True)
         self.sessions.pop(uid,None);self.previous_pending=s.get('pending');self.edit_target=msg.get('message_id') or s.get('message')
         try:
@@ -639,8 +867,7 @@ class Bot:
         if chat['type'] in ('group','supergroup'):
             route=self.store.db.execute('''SELECT
                 EXISTS(SELECT 1 FROM settings WHERE key='membership_target' AND json_extract(value,'$.id')=?),
-                EXISTS(SELECT 1 FROM bindings WHERE mode='lookup' AND chat_id=? AND active=1)
-                AND EXISTS(SELECT 1 FROM bindings WHERE mode='thread' AND active=1)''',(chat['id'],chat['id'])).fetchone()
+                EXISTS(SELECT 1 FROM bindings WHERE mode='lookup' AND chat_id=? AND active=1)''',(chat['id'],chat['id'])).fetchone()
             is_target,lookup_enabled=route
             if is_target or lookup_enabled:
                 self.observe_message(msg)
@@ -660,18 +887,26 @@ class Bot:
                 if payload.startswith(('edit_','delete_')) and payload.partition('_')[2].isdigit():
                     return self.action(user,('edit:' if payload.startswith('edit_') else 'askdelete:')+payload.partition('_')[2])
                 return self.home(uid)
-            if not self.store.ready() and not self.store.admin(uid):return self.home(uid)
             session=self.sessions.get(uid);pending=session.get('pending') if session else None
             if session and session['until']<time.monotonic():
                 self.sessions.pop(uid,None)
                 self.notices[uid] = '⌛ 上次输入已过期，请重新选择操作。草稿仍保留。'
                 return self.home(uid)
             if not pending:
+                if not self.router and not self.store.ready() and not self.store.admin(uid):
+                    return self.home(uid)
                 if targets(msg) or text.isdigit():
-                    if text.isdigit():return self.show_person(uid,self.store.track(text)['id'])
-                    return self.query(msg)
+                    if self.router:
+                        return self.router.member_menu(self, user, 'lookup', message=msg)
+                    return self.private_lookup(msg)
                 return self.home(uid)
             kind=pending[0]
+            if self.router and kind == 'memberpick':
+                return self.send(uid, '请点击上方按钮选择集群。')
+            if self.router and not self.store.admin(uid):
+                self.router.require_member(self, uid)
+            if not self.store.ready() and not self.store.admin(uid):
+                return self.home(uid)
             if kind=='proof':
                 photos=msg.get('photo')
                 if not photos:raise ValueError('请以照片方式上传一张图片，不接受文字、文件或视频。')
@@ -711,6 +946,24 @@ class Bot:
                 self.success(uid, '新增内容已保存，下方显示最新资料。')
                 return self.show_person(uid,p['id'])
             self.store.require_admin(uid)
+            if kind == 'commentbuttoninput':
+                row, column, field = pending[1:]
+                if field == 'new':
+                    lines = text.splitlines()
+                    if len(lines) not in (2, 3):
+                        raise ValueError('请用两到三行填写，依次发送显示名称、链接和可省略的颜色。')
+                    label, content, color = (lines + [''])[:3]
+                    changes = {'text': label.strip(), 'content': content.strip(), 'style': parse_comment_color(color)}
+                else:
+                    changes = {field: text}
+                if changes.get('content') == REVIEW_ACTION:
+                    raise ValueError('请填写 HTTP 或 HTTPS 链接，或点击按钮选用模板入口。')
+                changed = self.store.set_comment_button(uid, row, column, changes)
+                self.success(uid, '已保存，历史评论将依次更新。' if changed else '按钮设置未变更。')
+                return self.comment_button_panel(uid, row, column)
+            if self.router and kind == 'activationinput':
+                self.store.clusters.redeem_activation(uid, self.store.cluster_id, text)
+                return self.activation_panel(uid)
             if kind=='clusterrename':
                 self.store.clusters.rename(uid, self.store.cluster_id, text)
                 self.success(uid, '集群名称已更新。')
@@ -757,8 +1010,6 @@ class Bot:
                 self.store.check_backup_scope(data)
                 scope = self.store.clusters.names[self.store.cluster_id] if self.router else '1'
                 summary='📥 备份校验通过，尚未导入\n目标集群：%s\n导出时间：%s\n老师：%s · 客户：%s · 车评：%s\n证明图：%s · 绑定：%s\n\n⚠️ 确认后覆盖此集群的数据，包括预览期间的新数据。\n恢复前自动保存原数据。恢复后，此集群的绑定和队列暂停，请核对后恢复发布。' % (scope,date(data['created']),len(tables['teachers']),len(tables['people']),len(tables['reviews']),len(data.get('media',{})),len(tables['bindings']))
-                if self.store.cluster_id == 1:
-                    summary += '\n同时恢复 superadmin 名单，保留当前操作者和 .env 管理员。'
                 return self.panel(uid,summary,[[('确认覆盖并恢复','importconfirm')],[('取消，不改数据','importcancel')]],('importfile',))
             if kind in ('teachernew','teacherrename'):
                 if len(text.splitlines())!=1:
@@ -776,10 +1027,6 @@ class Bot:
                 self.store.set_teacher_account(uid,pending[1],int(text))
                 self.success(uid,'本人账号已绑定，请老师私聊机器人以记录用户名。')
                 return self.action(user,'teacherdetail:%s'%pending[1])
-            if kind=='adminadd':
-                self.store.set_admin(uid,int(text))
-                self.success(uid, 'superadmin %s 已加入名单，发送 /start 即可进入后台。' % int(text))
-                return self.action(user,'admins')
             if kind=='bind':
                 cid=int(text) if text.lstrip('-').isdigit() else text
                 c,d=self.publisher.validate(pending[1],cid)
@@ -787,8 +1034,8 @@ class Bot:
                 effect={'thread':'将限速创建老师主帖，并从旧到新补发历史评价。','feed':'之后的新车评会发布到此频道，不补发历史。','lookup':'此群已允许转发、回复和 @用户名查档。'}[pending[1]]
                 if self.paused() and pending[1] != 'lookup':
                     effect += '⏸ 发布队列当前暂停，恢复后开始处理。'
-                if pending[1] == 'lookup' and not self.store.ready():
-                    effect = '群配置已保存；仍需先绑定有效的老师专帖频道，查档才会开放。'
+                if not self.store.service_authorized():
+                    effect = '激活集群后启用。'
                 self.success(uid, '%s绑定成功，权限检查已通过。%s' % (MODES[pending[1]], effect))
                 return self.action(user,'binding:%s' % bid)
             if kind=='setroot':
@@ -838,10 +1085,10 @@ class Bot:
             e=update['my_chat_member'];cid=e['chat']['id']
             if e['chat'].get('type') == 'channel' and e['new_chat_member']['status'] in ('administrator','creator'):
                 try:
-                    self.publisher.validate('thread',cid)
-                    notice='✅ 频道权限和讨论组检查通过。\nℹ️ 当前尚未自动绑定，请在管理后台选择绑定模式。'
+                    self.publisher.validate('feed',cid)
+                    notice='✅ 频道发布权限检查通过。选择老师专帖时会另行检查讨论组。\nℹ️ 当前尚未自动绑定，请在管理后台选择绑定模式。'
                 except ValueError as error:
-                    notice='⚠️ 专帖频道检查未通过。\n'+str(error)
+                    notice='⚠️ 频道发布权限检查未通过。\n'+str(error)
                 except APIError as error:
                     notice=self.api_hint(error)
                 for admin in self.store.admin_ids():
@@ -849,6 +1096,13 @@ class Bot:
                     except APIError:pass
             if e['new_chat_member']['status'] not in ('administrator','creator'):
                 self.store.db.execute("UPDATE bindings SET active=0,error='机器人管理员权限已失效' WHERE chat_id=? OR discussion=?",(cid,cid))
+
+    def private_lookup(self, msg):
+        uid = msg['from']['id']
+        text = msg.get('text', '').strip()
+        if text.isdigit():
+            return self.show_person(uid, self.store.track(text)['id'])
+        return self.query(msg)
 
     def card(self, p, chat_id=None):
         text = '\n'.join(('档案编号：' + str(p['id']),
@@ -999,6 +1253,8 @@ class ClusterBot:
         self.pacing = [0, {}]
         self.bots = {cid: self.make_bot(store) for cid, store in stores.stores.items()}
         self.selected = {}
+        self.member_cache = OrderedDict()
+        self.membership_retry_at = 0
         self.next_publisher = 0
 
     def make_bot(self, store):
@@ -1008,6 +1264,132 @@ class ClusterBot:
         store = self.stores.create(uid)
         self.bots[store.cluster_id] = self.make_bot(store)
         return store.cluster_id
+
+    def legacy_access(self, bot):
+        return len(self.bots) == 1 and bot.store.member_source_ids() is None
+
+    def invalidate_chat(self, chat_id, uid=None):
+        if uid is not None:
+            self.member_cache.pop((chat_id, uid), None)
+            return
+        for key in list(self.member_cache):
+            if key[0] == chat_id:
+                del self.member_cache[key]
+
+    def chat_member(self, chat_id, uid):
+        key = chat_id, uid
+        now = time.monotonic()
+        previous = self.member_cache.get(key)
+        if previous and now < previous[0]:
+            self.member_cache.move_to_end(key)
+            return previous[1]
+        if now < self.membership_retry_at:
+            return None
+        try:
+            member = self.api.call('getChatMember', chat_id=chat_id, user_id=uid)
+            result = (member.get('status') in ('administrator', 'creator') if uid == self.bot_id
+                      else member_present(member))
+        except APIError as error:
+            if error.code == 429:
+                self.membership_retry_at = time.monotonic() + max(1, error.retry_after)
+            result = None
+        self.member_cache[key] = time.monotonic() + (30 if result is not None else 3), result
+        self.member_cache.move_to_end(key)
+        if len(self.member_cache) > 8192:
+            self.member_cache.popitem(last=False)
+        return result
+
+    def member_access(self, bot, uid, is_admin):
+        if not bot.store.service_authorized():
+            return False
+        if not bot.store.ready():
+            # Temporarily unavailable bindings cannot prove membership.
+            return None if bot.store.member_source_ids() else False
+        if is_admin or self.legacy_access(bot):
+            return True
+        selected = bot.store.member_source_ids() or set()
+        sources = selected.intersection(bot.store.member_sources())
+        unknown = bool(selected - sources)
+        for chat_id in sorted(sources):
+            member = self.chat_member(chat_id, uid) if self.chat_member(chat_id, self.bot_id) else None
+            if member is True:
+                return True
+            unknown |= member is None
+        return None if unknown else False
+
+    def require_member(self, bot, uid):
+        if not bot.store.service_authorized():
+            raise ValueError('该集群尚未激活，请联系管理员。')
+        if self.stores.primary.admin(uid):
+            return
+        result = self.member_access(bot, uid, False)
+        if result is None:
+            raise ValueError('暂时无法确认成员身份，请稍后重试。')
+        if result is False:
+            raise ValueError('请先加入该集群指定的群或频道。')
+
+    def member_menu(self, source, user, operation, page=0, message=None):
+        uid = user['id']
+        if operation not in MEMBER_ACTIONS:
+            raise ValueError('请从主菜单选择要使用的功能。')
+        is_admin = self.stores.primary.admin(uid)
+        choices = []
+        unknown = False
+        for cid, bot in self.bots.items():
+            if operation == 'write' and not bot.store.can_publish():
+                continue
+            result = self.member_access(bot, uid, is_admin)
+            if result and bot.store.ready():
+                choices.append(cid)
+            unknown |= result is None
+        if len(choices) == 1:
+            if unknown:
+                self.bots[choices[0]].notices[uid] = '部分集群暂时无法核验。'
+            return self.enter(source, user, operation, choices[0], message)
+        if not choices:
+            text = ('暂时无法确认成员身份，请稍后重试。' if unknown else
+                    '暂无可用集群。请先加入对应群或频道，或联系管理员。')
+            return source.panel(uid, text, [[('重试', 'memberpage:%s:0' % operation)], [('返回主菜单', 'home')]],
+                                ('memberpick', operation, message))
+        page = min(max(0, page), (len(choices) - 1) // 8)
+        rows = [[(self.stores.names[cid], 'memberpick:%s:%s' % (operation, cid))]
+                for cid in choices[page * 8:(page + 1) * 8]]
+        nav = []
+        if page:
+            nav.append(('上一页', 'memberpage:%s:%s' % (operation, page - 1)))
+        if len(choices) > (page + 1) * 8:
+            nav.append(('下一页', 'memberpage:%s:%s' % (operation, page + 1)))
+        if nav:
+            rows.append(nav)
+        text = '选择集群 · ' + MEMBER_ACTIONS[operation]
+        if unknown:
+            text += '\n部分集群暂时无法核验。'
+            rows.append([('重新核验', 'memberpage:%s:0' % operation)])
+        return source.panel(uid, text, rows + [[('返回主菜单', 'home')]], ('memberpick', operation, message))
+
+    def enter(self, source, user, operation, cluster_id, message=None):
+        uid = user['id']
+        target = self.bots[cluster_id]
+        self.require_member(target, uid)
+        if not target.store.ready():
+            raise ValueError('此集群暂不可用。')
+        target.edit_target = source.edit_target
+        try:
+            if operation == 'lookup':
+                result = target.private_lookup(message)
+            else:
+                result = target.action(user, operation)
+        finally:
+            target.edit_target = None
+        self.select(source, target, uid)
+        return result
+
+    def mine(self, source, uid, page):
+        start = page * 8
+        streams = [zip(repeat(bot), bot.review_items(uid, start + 9)) for bot in self.bots.values()]
+        items = merge(*streams, key=lambda item: (item[1]['created'], item[1]['id'], item[0].store.cluster_id),
+                      reverse=True)
+        return source.my_reviews_panel(uid, page, list(islice(items, start, start + 9)))
 
     def select(self, source, target, uid):
         if target is source:
@@ -1039,9 +1421,15 @@ class ClusterBot:
             return
         chat = event['chat']
         if chat['type'] != 'private':
+            if 'chat_member' in update:
+                self.invalidate_chat(chat['id'], event['new_chat_member']['user']['id'])
+            elif 'my_chat_member' in update:
+                self.invalidate_chat(chat['id'])
             cluster_id = self.stores.routes.get(chat['id'])
-            if cluster_id is not None or 'my_chat_member' in update:
+            if 'my_chat_member' in update:
                 return self.bots[cluster_id or 1].handle(update)
+            if cluster_id is not None and self.bots[cluster_id].store.service_authorized():
+                return self.bots[cluster_id].handle(update)
             return
         uid = chat['id']
         source = self.bots[self.selected.get(uid, 1)]
@@ -1053,6 +1441,10 @@ class ClusterBot:
                 target = self.bots.get(cluster_id)
                 if not target:
                     return source.send(uid, '该链接对应的集群不存在。')
+                try:
+                    self.require_member(target, uid)
+                except ValueError as error:
+                    return source.send(uid, str(error))
                 self.select(source, target, uid)
                 try:
                     return target.message({**event, 'text': match[1] + ' ' + match[3]})
@@ -1061,7 +1453,9 @@ class ClusterBot:
         return source.handle(update)
 
     def tick(self):
-        publishers = [bot.publisher for bot in self.bots.values()]
+        publishers = [bot.publisher for bot in self.bots.values() if bot.store.service_authorized()]
+        if not publishers:
+            return
         start = self.next_publisher
         for i in range(len(publishers)):
             index = (start + i) % len(publishers)
@@ -1071,4 +1465,5 @@ class ClusterBot:
                 self.next_publisher = (index + 1) % len(publishers)
 
     def poll_timeout(self):
-        return min(bot.publisher.poll_timeout() for bot in self.bots.values())
+        return min((bot.publisher.poll_timeout() for bot in self.bots.values()
+                    if bot.store.service_authorized()), default=20)

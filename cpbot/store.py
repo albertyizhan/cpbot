@@ -1,6 +1,8 @@
-"""Global identities, durable personal grants and transactional edit history."""
+"""Cluster data, deployment authority and transactional edit history."""
+import hashlib
 import json
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager, nullcontext
@@ -13,7 +15,9 @@ from .backup import BackupStore
 class Store(ReviewStore, BackupStore):
     def __init__(self, path, owner, configured_admins=()):
         self.owner = owner
-        self.configured_admins = tuple(configured_admins)
+        self.configured_admins = tuple(dict.fromkeys(configured_admins or (owner,)))
+        if any(type(uid) is not int or not 0 < uid < 2**63 for uid in self.configured_admins):
+            raise ValueError('无效的 superadmin ID。')
         self.cluster_id = 1
         self.clusters = None
         self.db = sqlite3.connect(path, isolation_level=None, timeout=10)
@@ -45,30 +49,63 @@ class Store(ReviewStore, BackupStore):
             if not self.db.execute("SELECT 1 FROM settings WHERE key='notes_removed'").fetchone():
                 self.clear_notes()
                 self.db.execute("INSERT INTO settings VALUES('notes_removed','1')")
-            for uid in configured_admins:
-                if not isinstance(uid, int) or not 0 < uid < 2**63:
-                    raise ValueError("无效的 superadmin ID。")
-                self.db.execute("INSERT OR IGNORE INTO admins VALUES(?)", (uid,))
 
     def admin_ids(self):
         authority = self.clusters.primary if self.clusters else self
-        return [row[0] for row in authority.db.execute('SELECT user_id FROM admins ORDER BY user_id')]
+        return sorted(authority.configured_admins)
 
     def admin(self, uid):
         authority = self.clusters.primary if self.clusters else self
-        return ReviewStore.admin(authority, uid)
+        return uid in authority.configured_admins
 
-    def set_admin(self, actor, uid, add=True):
-        authority = self.clusters.primary if self.clusters else self
-        return ReviewStore.set_admin(authority, actor, uid, add)
+    def service_authorized(self):
+        return not self.clusters or self.cluster_id in self.clusters.authorized
 
     def membership_target(self):
         row = self.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
         return json.loads(row[0]) if row else None
 
+    def member_sources(self):
+        sources = {}
+        for row in self.db.execute('SELECT chat_id,title,discussion FROM bindings WHERE active=1 ORDER BY id'):
+            sources[row['chat_id']] = row['title']
+            if row['discussion']:
+                sources[row['discussion']] = '%s · 讨论组' % row['title']
+        target = self.membership_target()
+        if target:
+            sources.setdefault(target['id'], target['title'])
+        return sources
+
+    def member_source_ids(self):
+        row = self.db.execute("SELECT value FROM settings WHERE key='cluster_member_sources'").fetchone()
+        return set(json.loads(row[0])) if row else None
+
+    def toggle_member_source(self, actor, chat_id):
+        self.require_admin(actor)
+        if chat_id not in self.member_sources():
+            raise ValueError('该群或频道暂不可用，请检查绑定状态。')
+        with self.transaction():
+            selected = self.member_source_ids() or set()
+            selected.symmetric_difference_update({chat_id})
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('cluster_member_sources',?)",
+                            (json.dumps(sorted(selected)),))
+            self.log(actor, '设置集群成员资格来源', '%s %s' % (chat_id, '启用' if chat_id in selected else '停用'))
+
+    def prune_member_sources(self):
+        selected = self.member_source_ids()
+        if selected is None:
+            return
+        owned = {cid for row in self.db.execute('SELECT chat_id,discussion FROM bindings') for cid in row if cid}
+        target = self.membership_target()
+        if target:
+            owned.add(target['id'])
+        if selected - owned:
+            self.db.execute("UPDATE settings SET value=? WHERE key='cluster_member_sources'",
+                            (json.dumps(sorted(selected & owned)),))
+
     def start_payload(self, action, record_id):
         payload = '%s_%s' % (action, record_id)
-        return payload if self.cluster_id == 1 else 'c%s_%s' % (self.cluster_id, payload)
+        return 'c%s_%s' % (self.cluster_id, payload) if self.clusters else payload
 
     def check_chat_ownership(self, chat_ids):
         if self.clusters:
@@ -89,6 +126,7 @@ class Store(ReviewStore, BackupStore):
             else:
                 self.db.execute("DELETE FROM settings WHERE key='membership_target'")
                 self.log(actor, '取消在群判定目标', '')
+            self.prune_member_sources()
         if self.clusters:
             self.clusters.refresh_routes(self)
 
@@ -245,8 +283,19 @@ class ClusterStores:
         with primary.transaction():
             primary.db.execute('''CREATE TABLE IF NOT EXISTS clusters(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)''')
-            primary.db.execute("INSERT OR IGNORE INTO clusters VALUES(1,'1')")
+            primary.db.execute("INSERT OR IGNORE INTO clusters(id,name) VALUES(1,'1')")
+            if not primary.db.execute("SELECT 1 FROM sqlite_master WHERE name='cluster_authorizations'").fetchone():
+                primary.db.execute('''CREATE TABLE cluster_authorizations(
+                    cluster_id INTEGER PRIMARY KEY REFERENCES clusters(id))''')
+                primary.db.execute('INSERT INTO cluster_authorizations SELECT id FROM clusters')
+            primary.db.execute('''CREATE TABLE IF NOT EXISTS cluster_activation_codes(
+                id INTEGER PRIMARY KEY, cluster_id INTEGER NOT NULL REFERENCES clusters(id),
+                code_hash TEXT UNIQUE NOT NULL, expires REAL NOT NULL,
+                redeemed REAL, revoked INTEGER NOT NULL DEFAULT 0)''')
+            primary.db.execute('''CREATE INDEX IF NOT EXISTS cluster_activation_pending
+                ON cluster_activation_codes(cluster_id) WHERE redeemed IS NULL AND revoked=0''')
         self.names = dict(primary.db.execute('SELECT id,name FROM clusters ORDER BY id').fetchall())
+        self.authorized = {row[0] for row in primary.db.execute('SELECT cluster_id FROM cluster_authorizations')}
         primary.clusters = self
         for cluster_id in self.names:
             if cluster_id != 1:
@@ -304,6 +353,54 @@ class ClusterStores:
             self.primary.db.execute('UPDATE clusters SET name=? WHERE id=?', (name, cluster_id))
             self.primary.log(actor, '集群改名', '%s · %s' % (cluster_id, name))
         self.names[cluster_id] = name
+
+    def pending_activation(self, cluster_id):
+        row = self.primary.db.execute('''SELECT expires FROM cluster_activation_codes
+            WHERE cluster_id=? AND redeemed IS NULL AND revoked=0 AND expires>?''',
+                                      (cluster_id, time.time())).fetchone()
+        return row['expires'] if row else None
+
+    def issue_activation(self, actor, cluster_id):
+        self.primary.require_admin(actor)
+        code = secrets.token_urlsafe(24)
+        digest = hashlib.sha256(code.encode('ascii')).hexdigest()
+        expires = time.time() + 86400
+        with self.primary.transaction():
+            if self.primary.db.execute('SELECT 1 FROM cluster_authorizations WHERE cluster_id=?', (cluster_id,)).fetchone():
+                raise ValueError('集群已激活。')
+            self.primary.db.execute('''UPDATE cluster_activation_codes SET revoked=1
+                WHERE cluster_id=? AND redeemed IS NULL AND revoked=0''', (cluster_id,))
+            self.primary.db.execute('''INSERT INTO cluster_activation_codes(cluster_id,code_hash,expires)
+                VALUES(?,?,?)''', (cluster_id, digest, expires))
+            self.primary.log(actor, '生成集群授权码', cluster_id)
+        return code, expires
+
+    def redeem_activation(self, actor, cluster_id, code):
+        self.primary.require_admin(actor)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{32}', code):
+            raise ValueError('请输入完整的集群授权码。')
+        digest = hashlib.sha256(code.encode('ascii')).hexdigest()
+        now = time.time()
+        with self.primary.transaction():
+            if self.primary.db.execute('SELECT 1 FROM cluster_authorizations WHERE cluster_id=?', (cluster_id,)).fetchone():
+                raise ValueError('集群已激活。')
+            redeemed = self.primary.db.execute('''UPDATE cluster_activation_codes SET redeemed=?
+                WHERE cluster_id=? AND code_hash=? AND redeemed IS NULL AND revoked=0 AND expires>?''',
+                                               (now, cluster_id, digest, now))
+            if not redeemed.rowcount:
+                raise ValueError('此授权码不适用于当前集群，或已过期、使用、作废。')
+            self.primary.db.execute('INSERT INTO cluster_authorizations VALUES(?)', (cluster_id,))
+            self.primary.log(actor, '激活集群', cluster_id)
+        self.authorized.add(cluster_id)
+
+    def revoke_activation(self, actor, cluster_id):
+        self.primary.require_admin(actor)
+        with self.primary.transaction():
+            self.primary.db.execute('DELETE FROM cluster_authorizations WHERE cluster_id=?', (cluster_id,))
+            self.primary.db.execute('UPDATE cluster_activation_codes SET revoked=1 WHERE cluster_id=? AND revoked=0',
+                                    (cluster_id,))
+            self.primary.log(actor, '撤销集群授权', cluster_id)
+        self.authorized.discard(cluster_id)
 
     def close(self):
         for store in self.stores.values():

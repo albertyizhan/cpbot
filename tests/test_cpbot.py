@@ -104,6 +104,41 @@ class Tests(unittest.TestCase):
         self.assertNotIn('customer',render_review(self.s,r))
         data=self.click('返回主菜单');self.click('',data=data)
         self.assertTrue(self.api.calls[-1][1]['show_alert'])
+    def test_independent_bindings_and_review_directory(self):
+        feed = self.s.bind(1, 'feed', {'id':-10033, 'title':'直发'})
+        self.s.bind(1, 'lookup', {'id':-10044, 'title':'查档'})
+        rid, _ = self.submit()
+        self.tick(); self.forward(); self.tick(10)
+        def directory():
+            self.bot.action({'id':2}, 'teacherlink:%s' % self.tid)
+            return self.api.calls[-1][1]['text']
+        self.assertEqual(directory().count('href='), 1)
+        self.assertIn('https://t.me/c/22/', directory())
+        self.bot.action({'id':1}, 'unbindyes:%s' % self.bid)
+        self.assertIn('https://t.me/c/33/', directory())
+        for uid in range(10,19):
+            self.submit(uid=uid,token=str(uid))
+        self.tick(24)
+        self.bot.message(message(text='/start'))
+        self.click('🔎 找老师'); self.bot.message(message(text='全部')); self.click('老师甲 · #%s' % self.tid)
+        panel = next(p for m,p in reversed(self.api.calls) if 'text' in p and 'reply_markup' in p)
+        self.assertEqual(panel['text'].count('https://t.me/c/33/'), 8)
+        self.click('下一页')
+        panel = next(p for m,p in reversed(self.api.calls) if 'text' in p and 'reply_markup' in p)
+        self.assertEqual(panel['text'].count('https://t.me/c/33/'), 2)
+        self.bot.change_review(1,rid,None)
+        self.bot.action({'id':2}, 'teacherlink:%s:1' % self.tid)
+        self.assertNotIn('>#%s ·' % rid, self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1}, 'unbindyes:%s' % feed)
+        self.assertIn('暂无可用链接', directory())
+        self.bot.home(2)
+        self.assertNotIn('🌷 写车评',str(self.api.calls[-1]))
+        with self.assertRaisesRegex(ValueError,'发布|直发'):
+            self.bot.action({'id':2},'write')
+        self.bot.message(message(cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
+        self.assertEqual(self.api.calls[-1][1]['chat_id'], -10044)
+        self.assertIn('新增标签',str(self.api.calls[-1]))
+
     def test_direct_submit_idempotence_and_proof_required(self):
         self.draft();self.draft(3,token='other')
         self.assertEqual(self.s.submit({'id':2},'token')[1],'accepted')
@@ -159,7 +194,7 @@ class Tests(unittest.TestCase):
         self.s.db.execute("INSERT INTO grants VALUES(2,'old',0)");self.assertFalse(self.s.allowed(2))
         p=self.s.track('50')
         with self.assertRaises(ValueError):self.s.save(p['id'],0,{'id':2},'bad')
-        self.s.set_admin(1,2);self.s.save(p['id'],0,{'id':2},'鸽子')
+        self.s.set_teacher_account(1,self.tid,2);self.s.save(p['id'],0,{'id':2},'鸽子')
         self.bot.message(message(text='@target_a',cid=-10044));self.assertEqual(len(self.api.calls),0)
         self.s.bind(1,'lookup',{'id':-10044,'title':'内群'})
         self.bot.message(message(text='查询',cid=-10044,reply_to_message={'from':{'id':50},'date':1}))
@@ -167,9 +202,8 @@ class Tests(unittest.TestCase):
         self.assertEqual([b['text'] for b in self.api.calls[-1][1]['reply_markup']['inline_keyboard'][0]], ['新增标签','删除标签'])
         self.bot.show_person(2,p['id'])
         self.assertEqual([b['text'] for b in self.api.calls[-1][1]['reply_markup']['inline_keyboard'][0]], ['新增标签','删除标签'])
-        self.s.set_admin(1,2,False)
+        self.s.set_teacher_account(1,self.tid,None)
         with self.assertRaises(ValueError):self.bot.action({'id':2},'edit:%s'%p['id'])
-        with self.assertRaises(ValueError):self.s.set_admin(1,1,False)
     def test_binding_conflicts_required_and_admin_checks(self):
         for cid in (-10011,-10022):
             with self.assertRaises(ValueError):self.s.bind(1,'lookup',{'id':cid,'title':'冲突'})
@@ -547,9 +581,9 @@ class Tests(unittest.TestCase):
         self.bot.message(message(uid=1,text='新增老师'))
         self.assertIn('已保存',self.api.calls[-1][1]['text'])
         with self.assertRaises(ValueError):self.bot.action({'id':1},'codefor:1')
-        self.bot.action({'id':1},'adminadd')
-        self.bot.message(message(uid=1,text='3'))
-        self.assertIn('已加入名单',self.api.calls[-1][1]['text'])
+        self.bot.action({'id':1},'admins')
+        self.assertIn('修改 .env 后重启生效',self.api.calls[-1][1]['text'])
+        self.assertFalse(self.s.admin(3))
         rid,_=self.submit(code='not-found')
         self.assertEqual(self.s.db.execute('SELECT status FROM reviews WHERE id=?',(rid,)).fetchone()[0],'accepted')
         self.bot.action({'id':1},'pausejobs')
@@ -569,7 +603,8 @@ class Tests(unittest.TestCase):
         self.s.db.execute('UPDATE history SET after_value=? WHERE person=?',(json.dumps(['旧备注','旧标签'],ensure_ascii=False),p['id']))
         backup=self.s.export(99)
         self.s.save(p['id'],1,{'id':1},'新标签')
-        self.s.set_admin(1,3)
+        self.s.db.close();self.s=Store(str(self.path),1,[1,3])
+        self.bot=Bot(self.s,self.api,'review_bot',99)
         self.s.db.execute("INSERT OR REPLACE INTO settings VALUES('offset','123')")
         self.api.upload=backup
         self.bot.action({'id':3},'import')
@@ -686,7 +721,6 @@ class Tests(unittest.TestCase):
         self.bot.message(message(uid=70,text='标签') | {'from':{'id':70,'username':'Teacher_B'}})
         self.assertEqual(self.s.person(p['id'])['tags'],'标签')
         with self.assertRaises(ValueError):self.bot.action({'id':70},'admin')
-        with self.assertRaises(ValueError):self.s.set_admin(70,100)
         self.bot.action({'id':70},'askdelete:%s'%p['id'])
         self.bot.action({'id':70},'delete:%s:1'%p['id'])
         self.assertEqual(self.s.person(p['id'])['tags'],'')
@@ -796,15 +830,18 @@ class Tests(unittest.TestCase):
         self.assertIsNone(self.s.db.execute("SELECT 1 FROM teachers WHERE name='老师乙'").fetchone())
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM jobs').fetchone()[0],before)
 
-    def test_teacher_batch_large_preview_pagination_and_revocation(self):
+    def test_teacher_batch_large_preview_pagination_and_stale_menu(self):
         self.bot.action({'id':1},'teacherbatch')
         self.bot.message(message(uid=1,text='\n'.join('批量老师%s'%n for n in range(100))))
         self.assertIn('第 1/7 页',self.api.calls[-1][1]['text'])
         for _ in range(6):self.click('下一页',uid=1)
         self.assertIn('100. 批量老师99',self.api.calls[-2][1]['text'])
         self.click('上一页',uid=1)
-        self.s.set_admin(1,3);self.s.set_admin(3,1,False)
-        self.click('确认导入全部 100 位',uid=1)
+        nonce=next(b['callback_data'] for row in self.api.calls[-2][1]['reply_markup']['inline_keyboard']
+                   for b in row if b['text']=='确认导入全部 100 位')
+        self.s.db.close();self.s=Store(str(self.path),3,[3])
+        self.bot=Bot(self.s,self.api,'review_bot',99)
+        self.click('',uid=1,data=nonce)
         self.assertTrue(self.api.calls[-1][1]['show_alert'])
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM teachers').fetchone()[0],1)
 
@@ -870,24 +907,18 @@ class Tests(unittest.TestCase):
         self.bot=Bot(self.s,self.api,'review_bot',99)
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM jobs').fetchone()[0],count)
 
-    def test_env_admin_additions_and_revocation_semantics(self):
+    def test_env_admin_is_authoritative_across_restarts(self):
         self.assertEqual(admin_ids({'SUPERADMIN_ID':'1','SUPERADMIN_IDS':'2, 3 2，4'}),[1,2,3,4])
         for value in ('', '0', '-1', 'abc', '1,,bad', str(2**63)):
             with self.assertRaises(ValueError):admin_ids({'SUPERADMIN_IDS':value})
-        self.s.set_admin(1,5)
+        self.s.db.execute('INSERT INTO admins VALUES(5)')
         self.s.db.close();self.s=Store(str(self.path),1,[1,2,3])
-        self.assertTrue(all(self.s.admin(uid) for uid in (1,2,3,5)))
-        self.s.set_admin(1,2,False);self.assertFalse(self.s.admin(2))
-        self.s.db.close();self.s=Store(str(self.path),1,[1,2,3])
-        self.assertTrue(self.s.admin(2))
-        self.s.set_admin(1,2,False)
+        self.assertEqual(self.s.admin_ids(),[1,2,3]);self.assertFalse(self.s.admin(5))
         self.s.db.close();self.s=Store(str(self.path),1,[1])
-        self.assertFalse(self.s.admin(2));self.assertTrue(self.s.admin(3));self.assertTrue(self.s.admin(5))
+        self.assertEqual(self.s.admin_ids(),[1])
 
-    def test_pause_and_bootstrap_not_readded(self):
-        self.s.set_admin(1,3);self.s.set_admin(3,1,False)
-        self.s.db.close();self.s=Store(str(self.path),1)
-        self.assertFalse(self.s.admin(1));self.assertTrue(self.s.admin(3))
+    def test_pause_and_resume_with_configured_admin(self):
+        self.s.db.close();self.s=Store(str(self.path),3,[3])
         self.bot=Bot(self.s,self.api,'review_bot',99)
         self.bot.action({'id':3},'pausejobs');self.tick()
         self.assertEqual(self.s.db.execute("SELECT count(*) FROM jobs WHERE state='done'").fetchone()[0],0)

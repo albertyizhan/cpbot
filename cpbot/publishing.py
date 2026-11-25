@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 
 from .api import APIError
+from .comment_buttons import REVIEW_ACTION, expand_comment_link, visible_comment_rows
 from .reviews import FIELDS, TZ, review_date
 
 
@@ -46,6 +47,11 @@ class Publisher:
                 for post in self.s.db.execute('SELECT * FROM posts WHERE message IS NOT NULL'):
                     self.s.enqueue('summary',post['binding'],post['teacher'],generation=100000000000000001)
                 self.s.db.execute('INSERT INTO settings VALUES(?,?)',(migration,'1'))
+        migration = 'comment_buttons_v1'
+        if not self.s.db.execute('SELECT 1 FROM settings WHERE key=?', (migration,)).fetchone():
+            with self.s.transaction():
+                self.s.queue_comment_buttons()
+                self.s.db.execute('INSERT INTO settings VALUES(?,?)', (migration, '1'))
 
     @property
     def next_global(self):
@@ -107,6 +113,24 @@ class Publisher:
         text += '\n\n✍️ <a href="https://t.me/%s?start=%s">给这位老师写评价</a>' % (
             self.username, self.s.start_payload('review', tid))
         return text, {'inline_keyboard': []}
+
+    def comment_markup(self, review):
+        keyboard = []
+        if review['status'] != 'accepted':
+            return {'inline_keyboard': keyboard}
+        for row in visible_comment_rows(self.s.comment_buttons()):
+            rendered_row = []
+            for button in row:
+                if button['content'] == REVIEW_ACTION:
+                    url = 'https://t.me/%s?start=%s' % (self.username, self.s.start_payload('review', review['teacher']))
+                else:
+                    url = expand_comment_link(button['content'], self.s.cluster_id, review['teacher'], review['id'])
+                rendered = {'text': button['text'], 'url': url}
+                if button['style']:
+                    rendered['style'] = button['style']
+                rendered_row.append(rendered)
+            keyboard.append(rendered_row)
+        return {'inline_keyboard': keyboard}
 
     def automatic_forward(self, msg):
         if not msg.get('is_automatic_forward'):
@@ -187,7 +211,8 @@ class Publisher:
         if not job:
             return
         j = dict(job)
-        target = j['discussion'] if j['mode']=='thread' and j['kind'] in ('comment', 'check', 'proof', 'redact', 'redactproof') else j['chat_id']
+        target = j['discussion'] if j['mode']=='thread' and j['kind'] in (
+            'comment', 'check', 'commentbuttons', 'proof', 'redact', 'redactproof') else j['chat_id']
         if self.next_chat.get(target, 0) > now:
             self.s.db.execute('UPDATE jobs SET due=? WHERE id=?', (self.next_chat[target], j['id']))
             return
@@ -219,6 +244,15 @@ class Publisher:
             elif kind == 'redactpost':
                 if p and p['message']:
                     self._edit(j['chat_id'], p['message'], '此老师已删除。历史评价已移入回收站。', parse_mode='HTML', reply_markup={'inline_keyboard': []})
+            elif kind == 'commentbuttons':
+                if j['mode'] == 'thread' and p and p['generation'] == j['generation']:
+                    review = self.s.db.execute("SELECT * FROM reviews WHERE id=? AND status='accepted'",
+                                               (j['review'],)).fetchone()
+                    pub = self.s.db.execute('SELECT * FROM publications WHERE binding=? AND review=? AND generation=?',
+                                            (j['binding'], j['review'], j['generation'])).fetchone()
+                    if review and pub:
+                        self.api.call('editMessageReplyMarkup', chat_id=pub['chat_id'], message_id=pub['message'],
+                                      reply_markup=self.comment_markup(review))
             elif kind == 'proof':
                 r=self.s.db.execute('SELECT * FROM reviews WHERE id=?',(j['review'],)).fetchone()
                 generation=p['generation'] if j['mode']=='thread' else 1
@@ -262,12 +296,13 @@ class Publisher:
                 pub = self.s.db.execute('SELECT * FROM publications WHERE binding=? AND review=? AND generation=?',
                                         (j['binding'], j['review'], generation)).fetchone()
                 text = render_review(self.s, r) if r['status'] == 'accepted' else '此评价已由管理员撤下。'
+                markup = {'reply_markup': self.comment_markup(r)} if j['mode'] == 'thread' else {}
                 if pub:
-                    self._edit(pub['chat_id'], pub['message'], text, parse_mode='HTML')
+                    self._edit(pub['chat_id'], pub['message'], text, parse_mode='HTML', **markup)
                 elif r['status'] == 'accepted':
                     params = {'reply_parameters': {'message_id': p['root'], 'allow_sending_without_reply': False}} if j['mode'] == 'thread' else {}
                     cid = j['discussion'] if j['mode'] == 'thread' else j['chat_id']
-                    result = self.api.call('sendMessage', chat_id=cid, text=text, parse_mode='HTML', **params)
+                    result = self.api.call('sendMessage', chat_id=cid, text=text, parse_mode='HTML', **params, **markup)
                     self.s.db.execute('INSERT INTO publications VALUES(?,?,?,?,?)', (j['binding'], j['review'], generation, result['message_id'], cid))
             self.s.db.execute("UPDATE jobs SET state='done',error='' WHERE id=?", (j['id'],))
             if j['review'] and j['mode'] == 'thread' and j['kind'] == 'comment':
@@ -293,7 +328,8 @@ class Publisher:
                 if pub:
                     try:
                         if j['kind']=='redact':
-                            self._edit(pub['chat_id'],pub['message'],'此评价已删除。',parse_mode='HTML')
+                            self._edit(pub['chat_id'],pub['message'],'此评价已删除。',parse_mode='HTML',
+                                       reply_markup={'inline_keyboard': []})
                         else:
                             import struct,zlib
                             def chunk(kind,content):
@@ -304,7 +340,7 @@ class Publisher:
                         self.s.db.execute("UPDATE jobs SET state='done',error='超过 Telegram 删除时限，已清除公开内容' WHERE id=?",(j['id'],))
                     except APIError as edit_error:
                         self.s.db.execute("UPDATE jobs SET state='blocked',error=? WHERE id=?",(edit_error.description[:200],j['id']))
-            elif j['kind'] in ('redact', 'redactproof', 'redactpost') and any(text in description for text in ('message to delete not found', 'message to edit not found', 'message_id_invalid')):
+            elif j['kind'] in ('redact', 'redactproof', 'redactpost', 'commentbuttons') and any(text in description for text in ('message to delete not found', 'message to edit not found', 'message_id_invalid')):
                 self.s.db.execute("UPDATE jobs SET state='done',error='远端消息已不存在' WHERE id=?", (j['id'],))
             elif any(text in description for text in ('message to edit not found', 'message_id_invalid', 'message to be replied not found', 'message to be replied to not found')):
                 # Rebuild the affected teacher replica to preserve chronological order.

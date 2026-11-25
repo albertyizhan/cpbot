@@ -11,7 +11,9 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .reviews import FIELDS, LEGACY_FIELDS, valid_proof, SCORES, overall_score, valid_score, MODES, review_date
+from .comment_buttons import comment_layout, default_comment_layout, validate_comment_layout
+from .reviews import (FIELDS, LEGACY_FIELDS, MODES, SCORES, overall_score,
+                      review_date, valid_proof, valid_score)
 
 MAX_BACKUP_BYTES = 15 * 1024 * 1024
 MAX_IMAGE_ZIP_BYTES = 19 * 1024 * 1024
@@ -94,6 +96,16 @@ def validate_backup(content, bot_id=0, images=None):
         if not raw or len(raw)>10*1024*1024:raise ValueError('备份图片为空或过大。')
     if not isinstance(tables, dict) or set(tables) != set(TABLES):
         raise ValueError('备份数据表不完整或包含未知数据。')
+    if 'cluster_member_sources' in data:
+        sources = data['cluster_member_sources']
+        if sources is not None and (not isinstance(sources, list)
+                                    or any(type(cid) is not int or not -(2**63) <= cid < 0 for cid in sources)
+                                    or len(set(sources)) != len(sources)):
+            raise ValueError('备份中的成员资格来源无效。')
+    if 'comment_buttons' in data:
+        layout = comment_layout(data['comment_buttons'])
+        validate_comment_layout(layout)
+        data['comment_buttons'] = layout
     # Local import avoids a module cycle. Only our schema is ever installed.
     from .store import Store
     stage = Store(':memory:', 1)
@@ -130,6 +142,11 @@ def validate_backup(content, bot_id=0, images=None):
         if stage.db.execute('PRAGMA foreign_key_check').fetchone():
             raise ValueError('备份中存在失去关联的记录。')
         check_relations(stage.db)
+        owned = {cid for row in stage.db.execute('SELECT chat_id,discussion FROM bindings') for cid in row if cid}
+        if target:
+            owned.add(target['id'])
+        if set(data.get('cluster_member_sources') or ()) - owned:
+            raise ValueError('备份中的成员资格来源不属于此集群。')
         for table in ('reviews','drafts'):
             for row in stage.db.execute('SELECT data FROM '+table):
                 name=json.loads(row['data']).get('出击证明')
@@ -206,9 +223,11 @@ def check_relations(db):
         require(p['chat_id'] == (b['discussion'] if b['mode']=='thread' else b['chat_id']), '发布目标错误。')
     for j in db.execute('SELECT * FROM jobs'):
         require(j['binding'] in bindings and j['state'] in ('pending','sending','done','blocked','uncertain','superseded') and j['generation'] > 0, '任务状态无效。')
-        require(j['kind'] in ('post','comment','feed','summary','checkpost','check','health','proof','redact','redactproof','redactpost'), '任务类型无效。')
+        require(j['kind'] in ('post','comment','feed','summary','checkpost','check','health','proof','redact','redactproof','redactpost','commentbuttons'), '任务类型无效。')
         require(j['kind']=='health' or j['teacher'] in teacher_ids, '任务老师不存在。')
         require(not j['review'] or j['review'] in reviews and reviews[j['review']]['teacher']==j['teacher'], '任务评价不存在。')
+        if j['kind'] == 'commentbuttons':
+            require(j['review'] > 0 and bindings[j['binding']]['mode'] == 'thread', '评论按钮任务关联无效。')
 
 
 class BackupStore:
@@ -229,6 +248,12 @@ class BackupStore:
             data=json.loads(encode_backup(target, source_bot))
             data['cluster_id'] = self.cluster_id
             data['tables']['admins'] = [{'user_id': uid} for uid in self.admin_ids()]
+            settings = dict(target.execute("SELECT key,value FROM settings WHERE key IN (?,?,?)",
+                                           ('membership_target', 'cluster_member_sources', 'comment_buttons')))
+            data['membership_target'] = json.loads(settings.get('membership_target', 'null'))
+            data['cluster_member_sources'] = json.loads(settings.get('cluster_member_sources', 'null'))
+            data['comment_buttons'] = (comment_layout(json.loads(settings['comment_buttons']))
+                                       if 'comment_buttons' in settings else default_comment_layout())
             names=set()
             for table in ('reviews','drafts'):
                 for row in data['tables'][table]:
@@ -238,8 +263,6 @@ class BackupStore:
                 bundle=secrets.token_hex(16)
                 data['image_bundle']=bundle
                 data['image_files']=sorted(names)
-                target_setting=self.db.execute("SELECT value FROM settings WHERE key='membership_target'").fetchone()
-                data['membership_target']=json.loads(target_setting[0]) if target_setting else None
                 text=json.dumps(data,ensure_ascii=False,separators=(',',':')).encode()
                 if len(text)>MAX_BACKUP_BYTES:raise ValueError('JSON 数据超过 15 MB，请使用服务器完整备份。')
                 buffer=io.BytesIO()
@@ -302,21 +325,30 @@ class BackupStore:
         with self.transaction():
             self.require_admin(actor)
             self.db.execute('PRAGMA defer_foreign_keys=ON')
-            for table in reversed(TABLES):
+            tables = [table for table in TABLES if table != 'admins']
+            for table in reversed(tables):
                 self.db.execute('DELETE FROM '+table)
-            for table in TABLES:
+            for table in tables:
                 columns = [r['name'] for r in self.db.execute('PRAGMA table_info('+table+')')]
                 self.db.executemany('INSERT INTO '+table+' ('+','.join(columns)+') VALUES ('+','.join('?' for _ in columns)+')',
                                     ([row[c] for c in columns] for row in data['tables'][table]))
             self.clear_notes()
-            for uid in {actor, *self.configured_admins}:
-                self.db.execute('INSERT OR IGNORE INTO admins VALUES(?)',(uid,))
             if 'membership_target' in data:
                 self.db.execute("DELETE FROM settings WHERE key='membership_target'")
                 if data['membership_target'] is not None:
                     self.db.execute("INSERT INTO settings VALUES('membership_target',?)",(json.dumps(data['membership_target'],ensure_ascii=False),))
+            if 'cluster_member_sources' in data:
+                self.db.execute("DELETE FROM settings WHERE key='cluster_member_sources'")
+                if data['cluster_member_sources'] is not None:
+                    self.db.execute("INSERT INTO settings VALUES('cluster_member_sources',?)",
+                                    (json.dumps(data['cluster_member_sources']),))
+            if 'comment_buttons' in data:
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('comment_buttons',?)",
+                                (json.dumps(data['comment_buttons'], ensure_ascii=False),))
+            self.prune_member_sources()
             self.db.execute("UPDATE bindings SET active=0,error='备份已恢复，请重新检查权限及消息位置后启用'")
             self.db.execute("UPDATE jobs SET state='uncertain',error='恢复前的发送结果不明，请核对' WHERE state='sending'")
+            self.queue_comment_buttons()
             self.db.execute("INSERT OR REPLACE INTO settings VALUES('publishing_paused','1')")
             self.db.execute("DELETE FROM settings WHERE key='last_check'")
             self.log(actor,'导入备份',str(recovery))
