@@ -67,11 +67,9 @@ func EnsurePost(ctx context.Context, tx pgx.Tx, cid, bid, tid int64) error {
 		SELECT cluster_id,'post',binding,teacher,0,generation FROM cpbot.posts
 		WHERE (cluster_id,binding,teacher)=($1,$2,$3) AND message IS NULL
 		UNION ALL
-		SELECT p.cluster_id,k.kind,p.binding,p.teacher,r.id,p.generation FROM cpbot.posts p
+	SELECT p.cluster_id,'comment',p.binding,p.teacher,r.id,p.generation FROM cpbot.posts p
 		JOIN cpbot.reviews r ON (r.cluster_id,r.teacher)=(p.cluster_id,p.teacher) AND r.status='accepted'
-		CROSS JOIN (VALUES ('comment'),('proof')) AS k(kind)
 		WHERE (p.cluster_id,p.binding,p.teacher)=($1,$2,$3)
-		AND (k.kind='comment' OR coalesce(r.data->>'出击证明','')<>'')
 		ON CONFLICT (cluster_id,kind,binding,teacher,review,generation) DO NOTHING`, cid, bid, tid)
 	return err
 }
@@ -159,7 +157,10 @@ func scheduleCluster(ctx context.Context, tx pgx.Tx, cid, revision int64, day st
 		_, err = tx.Exec(ctx, `INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation)
 			SELECT $1,k.kind,$2,$3,r.id,$4 FROM cpbot.reviews r CROSS JOIN (VALUES ('check'),('proof')) AS k(kind)
 			WHERE (r.cluster_id,r.teacher)=($1,$3) AND r.status='accepted'
-			AND (k.kind='check' OR coalesce(r.data->>'出击证明','')<>'')
+			AND (k.kind='check' OR EXISTS (
+				SELECT 1 FROM cpbot.posts p JOIN cpbot.proof_publications proof
+				ON (proof.cluster_id,proof.binding,proof.generation)=(p.cluster_id,p.binding,p.generation)
+				WHERE (p.cluster_id,p.binding,p.teacher,proof.review)=($1,$2,$3,r.id)))
 			ON CONFLICT (cluster_id,kind,binding,teacher,review,generation) DO NOTHING`, cid, r.Binding, r.Teacher, revision)
 		if err != nil {
 			return err
@@ -195,12 +196,13 @@ func (w *Worker) ConfirmUncertain(ctx context.Context, cid, id, actor, message i
 	return pgx.BeginFunc(ctx, w.db, func(tx pgx.Tx) error {
 		j := job{cid: cid, id: id}
 		var attemptGeneration *int64
+		var attemptPhoto bool
 		err := tx.QueryRow(ctx, `SELECT j.kind,j.binding,j.teacher,j.review,j.generation,b.mode,b.chat_id,b.discussion,
-			p.message,p.generation,j.attempt_generation FROM cpbot.jobs j
+			p.message,p.generation,j.attempt_generation,j.attempt_photo FROM cpbot.jobs j
 			JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(j.cluster_id,j.binding)
 			LEFT JOIN cpbot.posts p ON (p.cluster_id,p.binding,p.teacher)=(j.cluster_id,j.binding,j.teacher)
 			WHERE (j.cluster_id,j.id)=($1,$2) AND j.state='uncertain' FOR UPDATE OF j`, cid, id).
-			Scan(&j.kind, &j.binding, &j.teacher, &j.review, &j.revision, &j.mode, &j.channel, &j.discussion, &j.post, &j.generation, &attemptGeneration)
+			Scan(&j.kind, &j.binding, &j.teacher, &j.review, &j.revision, &j.mode, &j.channel, &j.discussion, &j.post, &j.generation, &attemptGeneration, &attemptPhoto)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return jobError("任务不在待核对状态")
 		}
@@ -219,15 +221,21 @@ func (w *Worker) ConfirmUncertain(ctx context.Context, cid, id, actor, message i
 				return jobError("专帖已换代，请核对旧讨论串后处理")
 			}
 			_, err = tx.Exec(ctx, `UPDATE cpbot.posts SET message=$4 WHERE (cluster_id,binding,teacher)=($1,$2,$3)`, j.cid, j.binding, j.teacher, message)
-		case "proof", "comment", "check", "feed":
-			table := "publications"
-			if j.kind == "proof" {
-				table = "proof_publications"
-			}
-			name := pgx.Identifier{"cpbot", table}.Sanitize()
-			_, err = tx.Exec(ctx, `INSERT INTO `+name+` (cluster_id,binding,review,generation,message,chat_id)
+		case "proof":
+			_, err = tx.Exec(ctx, `INSERT INTO cpbot.proof_publications (cluster_id,binding,review,generation,message,chat_id)
 				VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (cluster_id,binding,review,generation) DO UPDATE
 				SET message=excluded.message,chat_id=excluded.chat_id`, cid, j.binding, j.review, generation, message, j.destination())
+		case "comment", "check", "feed":
+			var insertedPhoto bool
+			err = tx.QueryRow(ctx, `INSERT INTO cpbot.publications (cluster_id,binding,review,generation,message,chat_id,photo)
+				VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (cluster_id,binding,review,generation) DO UPDATE
+				SET message=excluded.message,chat_id=excluded.chat_id RETURNING photo`, cid, j.binding, j.review, generation, message, j.destination(), attemptPhoto).Scan(&insertedPhoto)
+			if err == nil && !insertedPhoto && (j.mode != "thread" || j.replica() == generation) {
+				_, err = tx.Exec(ctx, `INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation)
+					SELECT $1,'proof',$2,$3,$4,$5 FROM cpbot.reviews
+					WHERE (cluster_id,id)=($1,$4) AND coalesce(data->>'出击证明','')<>''
+					ON CONFLICT (cluster_id,kind,binding,teacher,review,generation) DO NOTHING`, cid, j.binding, j.teacher, j.review, generation)
+			}
 		}
 		if err != nil {
 			return err
@@ -250,10 +258,9 @@ func EnqueueReview(ctx context.Context, tx pgx.Tx, cid, tid, rid int64) error {
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation)
 		SELECT p.cluster_id,k.kind,p.binding,p.teacher,CASE WHEN k.kind='post' THEN 0 ELSE $3 END,p.generation
-		FROM cpbot.posts p CROSS JOIN (VALUES ('post'),('comment'),('proof')) AS k(kind)
+		FROM cpbot.posts p CROSS JOIN (VALUES ('post'),('comment')) AS k(kind)
 		WHERE p.cluster_id=$1 AND p.teacher=$2 AND (k.kind<>'post' OR p.message IS NULL)
-		UNION ALL SELECT b.cluster_id,k.kind,b.id,$2,$3,1 FROM cpbot.bindings b
-		CROSS JOIN (VALUES ('feed'),('proof')) AS k(kind) WHERE b.cluster_id=$1 AND b.mode='feed'
+		UNION ALL SELECT b.cluster_id,'feed',b.id,$2,$3,1 FROM cpbot.bindings b WHERE b.cluster_id=$1 AND b.mode='feed'
 		ON CONFLICT (cluster_id,kind,binding,teacher,review,generation) DO NOTHING`, cid, tid, rid); err != nil {
 		return err
 	}

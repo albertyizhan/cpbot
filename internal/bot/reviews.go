@@ -201,7 +201,7 @@ func (b *Bot) draft(ctx context.Context, uid int64, state panel, notice string) 
 	if err != nil {
 		return err
 	}
-	lines := []string{fmt.Sprintf("集群：%s\n\n📝 车评草稿 · 已填写 %d/%d 项", name, len(pgstore.InputFields)-len(missing), len(pgstore.InputFields))}
+	lines := []string{fmt.Sprintf("集群：%s\n\n📝 车评草稿 · 已填写 %d/%d 项", name, pgstore.RequiredReviewFields-len(missing), pgstore.RequiredReviewFields)}
 	if notice != "" {
 		lines = append(lines, notice)
 	}
@@ -210,10 +210,10 @@ func (b *Bot) draft(ctx context.Context, uid int64, state panel, notice string) 
 	}
 	anon := "✅ 匿名"
 	if d.Anonymous() {
-		lines = append(lines, "🔒 匿名发布。证明图将公开，请先遮挡个人信息。")
+		lines = append(lines, "🔒 匿名发布。")
 	} else {
 		anon = "✅ 实名"
-		lines = append(lines, "👤 实名发布：公开 Telegram ID、身份链接及已有用户名。证明图将公开。")
+		lines = append(lines, "👤 实名发布：公开 Telegram ID、身份链接及已有用户名。")
 	}
 	var rows [][]choice
 	for i, key := range pgstore.InputFields {
@@ -223,8 +223,9 @@ func (b *Bot) draft(ctx context.Context, uid int64, state panel, notice string) 
 		}
 		switch key {
 		case "出击证明":
-			if !missing[key] {
-				value = "已上传 ✅（点击可替换）"
+			value = "未上传（选填）"
+			if d.Proof() != "" {
+				value = "已上传 ✅（图片将公开）"
 			}
 		case "老师":
 			if d.TeacherID() > 0 {
@@ -249,7 +250,11 @@ func (b *Bot) draft(ctx context.Context, uid int64, state panel, notice string) 
 		}
 		lines = append(lines, "【"+key+"】："+value)
 		label := key
-		if !missing[key] {
+		complete := !missing[key]
+		if key == "出击证明" {
+			complete = d.Proof() != ""
+		}
+		if complete {
 			label += " ✅"
 		}
 		if i%2 == 0 {
@@ -270,14 +275,17 @@ func (b *Bot) preview(ctx context.Context, uid int64, state panel) error {
 	if len(d.Missing()) > 0 {
 		return pgstore.UserError("请补齐所有字段后预览。")
 	}
-	name, err := b.teacherName(ctx, state.cluster, d.TeacherID())
+	name, handle, err := pgstore.TeacherDisplay(ctx, b.db, state.cluster, d.TeacherID())
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pgstore.UserError("这位老师已不存在或进入回收站。")
 	}
 	if err != nil {
 		return err
 	}
-	lines := []string{"车评预览 · 证明图将随正文公开"}
+	lines := []string{"车评预览"}
+	if d.Proof() != "" {
+		lines[0] += " · 证明图将随正文公开"
+	}
 	for _, key := range pgstore.InputFields {
 		if key == "出击证明" {
 			continue
@@ -291,6 +299,9 @@ func (b *Bot) preview(ctx context.Context, uid int64, state panel) error {
 			lines = append(lines, fmt.Sprintf("【综合】：%.1f", score))
 		}
 		lines = append(lines, "【"+key+"】："+value)
+		if key == "老师" && handle != "" {
+			lines = append(lines, "@"+strings.TrimPrefix(handle, "@"))
+		}
 	}
 	if !d.Anonymous() {
 		lines = append(lines, fmt.Sprintf("【作者】：%d", uid))
@@ -560,6 +571,16 @@ func (b *Bot) action(ctx context.Context, user telegram.User, state panel, actio
 		return b.draft(ctx, user.ID, state, "")
 	case "preview":
 		return b.preview(ctx, user.ID, state)
+	case "removeproof":
+		d, err := pgstore.GetDraft(ctx, b.db, state.cluster, user.ID)
+		if err != nil {
+			return err
+		}
+		delete(d.Data, "出击证明")
+		if _, err := pgstore.SaveDraft(ctx, b.db, state.cluster, user.ID, d); err != nil {
+			return err
+		}
+		return b.draft(ctx, user.ID, state, "已移除出击证明。")
 	case "submit":
 		review, err := pgstore.Submit(ctx, b.db, b.source, state.cluster, user.ID, state.submitted, user, time.Now())
 		if err != nil {
@@ -578,7 +599,16 @@ func (b *Bot) field(ctx context.Context, uid int64, state panel, field string) e
 		return b.teacherList(ctx, uid, state)
 	case "时间", "过程", "出击证明":
 		state.input = field
-		hints := map[string]string{"时间": "请输入评价日期 YYYY-MM-DD。", "过程": "请发送过程文字，最多 1600 字。", "出击证明": "请以照片发送一张证明图，最大 10 MB。图片将公开，请先遮挡个人信息。"}
+		hints := map[string]string{"时间": "请输入评价日期 YYYY-MM-DD。", "过程": "请发送过程文字，最多 1600 字。带图时整条评价需放进 1024 字的图片说明。", "出击证明": "选填。请以照片发送一张证明图，最大 10 MB。图片将公开，请先遮挡个人信息。"}
+		if field == "出击证明" {
+			d, err := pgstore.GetDraft(ctx, b.db, state.cluster, uid)
+			if err != nil {
+				return err
+			}
+			if d.Proof() != "" {
+				back = append([]choice{{"移除证明", "removeproof"}}, back...)
+			}
+		}
 		return b.show(ctx, uid, state, hints[field], [][]choice{back})
 	default:
 		var rows [][]choice

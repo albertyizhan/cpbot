@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"cpbot/internal/pgstore"
+	"cpbot/internal/publish"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -108,8 +109,15 @@ func (b *Bot) reviewAdminPanel(ctx context.Context, uid int64, state panel, id i
 func (b *Bot) changeReview(ctx context.Context, uid, cid, id int64, changes map[string]any) error {
 	return pgx.BeginFunc(ctx, b.db, func(tx pgx.Tx) error {
 		var raw []byte
-		var teacher int64
-		err := tx.QueryRow(ctx, `SELECT teacher,data FROM cpbot.reviews WHERE (cluster_id,id,status)=($1,$2,'accepted') FOR UPDATE`, cid, id).Scan(&teacher, &raw)
+		var teacher, author int64
+		var authorHandle string
+		var anonymous int
+		var captionRequired bool
+		err := tx.QueryRow(ctx, `SELECT r.teacher,r.data,r.author,coalesce(r.identity->>'username',''),r.anonymous,
+			EXISTS (SELECT 1 FROM cpbot.publications p WHERE (p.cluster_id,p.review)=(r.cluster_id,r.id) AND p.photo)
+			OR NOT EXISTS (SELECT 1 FROM cpbot.publications p WHERE (p.cluster_id,p.review)=(r.cluster_id,r.id))
+			FROM cpbot.reviews r WHERE (r.cluster_id,r.id,r.status)=($1,$2,'accepted') FOR UPDATE`, cid, id).
+			Scan(&teacher, &raw, &author, &authorHandle, &anonymous, &captionRequired)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pgstore.UserError("仅可处理正式有效车评。")
 		}
@@ -157,6 +165,19 @@ func (b *Bot) changeReview(ctx context.Context, uid, cid, id int64, changes map[
 					return pgstore.UserError("旧版车评需要同时补充人照分数。")
 				}
 				data["综合"] = score
+			}
+			if captionRequired && (pgstore.Draft{Data: data}).Proof() != "" {
+				name, handle, err := pgstore.TeacherDisplay(ctx, tx, cid, teacher)
+				if err != nil {
+					return err
+				}
+				fits, err := publish.CaptionFits(id, data, name, handle, author, authorHandle, anonymous != 0)
+				if err != nil {
+					return err
+				}
+				if !fits {
+					return pgstore.UserError("该车评带图，完整图片说明最多 1024 字。请缩短过程。")
+				}
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE cpbot.reviews SET status=$3,data=$4,version=version+1 WHERE (cluster_id,id)=($1,$2)`, cid, id, status, data); err != nil {

@@ -26,6 +26,10 @@ FILES = ('cpbot/__init__.py', 'cpbot/__main__.py', 'cpbot/api.py', 'cpbot/bot.py
          'deploy/cpbot.service', 'manage.sh', '.env.example', '.gitignore', 'README.md')
 
 
+class DatabaseLockedError(ValueError):
+    """The database lock is held by another process; do not start a second bot."""
+
+
 def configuration():
     env = Path(os.environ.get('ENV_FILE', '.env')).expanduser().resolve()
     load_env(env)
@@ -177,7 +181,7 @@ def backup_postgres(env, db):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('请先停止 cpbot，再备份 PostgreSQL 和证明图。') from None
+            raise DatabaseLockedError('请先停止 cpbot，再备份 PostgreSQL 和证明图。') from None
         directory = ROOT / 'backups'
         directory.mkdir(mode=0o700, exist_ok=True)
         stamp = time.strftime('%Y%m%d-%H%M%S') + '-' + str(time.time_ns())
@@ -268,6 +272,8 @@ def update():
         ctl('stop', check=True)
         try:
             archive = backup()
+        except DatabaseLockedError:
+            raise ValueError('另一个手动运行的实例仍占用数据库；代码未升级，systemd 服务保持停止以避免双实例冲突。停止占用实例后请运行 manage.sh start。') from None
         except (OSError, ValueError, subprocess.CalledProcessError):
             if was_active:
                 ctl('start', check=True)
@@ -318,12 +324,16 @@ def upgrade(source):
                    env={**os.environ, 'PYTHONPATH': str(source), 'PYTHONDONTWRITEBYTECODE': '1'})
     _, db = configuration()
     was_active = ctl('is-active', '--quiet').returncode == 0
+    # Fail on an unusable data path before stopping the currently healthy service.
+    db.parent.mkdir(parents=True, exist_ok=True)
     if engine() == 'go':
         build_go(source)
         go_command('check', source)
         ctl('stop', check=True)
         try:
             archive = backup()
+        except DatabaseLockedError:
+            raise ValueError('另一个手动运行的实例仍占用数据库；代码未升级，systemd 服务保持停止以避免双实例冲突。停止占用实例后请运行 manage.sh start。') from None
         except (OSError, ValueError, subprocess.CalledProcessError):
             if was_active:
                 ctl('start', check=True)
@@ -331,12 +341,21 @@ def upgrade(source):
     else:
         archive = backup()
         ctl('stop', check=True)
-    db.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(db) + '.lock', 'a') as lock:
+    try:
+        lock = open(str(db) + '.lock', 'a')
+    except OSError:
+        if was_active:
+            ctl('start', check=True)
+        raise
+    with lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('另一个手动运行的实例仍占用数据库；代码未升级。') from None
+            raise ValueError('另一个手动运行的实例仍占用数据库；代码未升级。systemd 服务保持停止以避免双实例冲突；停止占用实例后请运行 manage.sh start。') from None
+        except OSError:
+            if was_active:
+                ctl('start', check=True)
+            raise
         try:
             for name in inventory:
                 (ROOT / name).parent.mkdir(parents=True, exist_ok=True)

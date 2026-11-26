@@ -106,27 +106,24 @@ def exercise(base, source, command, sql, dsn):
         q("INSERT INTO cpbot.settings VALUES (1,'comment_buttons','{" +
           '"rows":2,"columns":2,"buttons":{"1:1":{"text":"评价当前老师","content":"review_current_teacher","style":null},' +
           '"2:1":{"text":"链接","content":"https://example.invalid/{cluster_id}/{teacher_id}/{review_id}","style":"success"}}}' + "')")
-        _, calls = drive(fwd, timed('tick', 32), timed('tick', 33), timed('tick', 34), timed('tick', 39), expected=[
-            success('sendMessage', {'message_id': 103}),
-            success('editMessageText', {'message_id': 101}),
-            failure('sendPhoto', 429, 'Too Many Requests', retry_after=7),
-        ])
-        comment, _, photo = [r['params'] for r in calls]
-        assert comment['reply_parameters'] == {'message_id': 102, 'allow_sending_without_reply': False}
-        assert '【作者】' not in comment['text'] and '【综合】：8.0' in comment['text']
-        assert comment['reply_markup']['inline_keyboard'][1][0] == {'text': '链接', 'url': 'https://example.invalid/1/1/1', 'style': 'success'}
-        assert photo['reply_parameters']['message_id'] == 103 and photo['photo']['head'].startswith('ffd8')
-        assert q("SELECT state,error FROM cpbot.jobs WHERE cluster_id=1 AND kind='proof' AND generation=2") == 'pending|Telegram 限流'
-        drive(timed('tick', 45), timed('tick', 46), expected=[failure('sendPhoto', 502, 'Bad Gateway')])
-        assert q("SELECT state FROM cpbot.jobs WHERE cluster_id=1 AND kind='proof' AND generation=2") == 'uncertain'
-        q("INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation) VALUES(1,'proof',1,1,1,20261126)")
+        _, calls = drive(fwd, timed('tick', 32), timed('tick', 33), timed('tick', 38),
+                         expected=[failure('sendPhoto', 429, 'Too Many Requests', retry_after=7)])
+        photo = calls[0]['params']
+        assert photo['reply_parameters'] == {'message_id': 102, 'allow_sending_without_reply': False}
+        assert '【作者】' not in photo['caption'] and '【综合】：8.0' in photo['caption']
+        assert photo['reply_markup']['inline_keyboard'][1][0] == {'text': '链接', 'url': 'https://example.invalid/1/1/1', 'style': 'success'}
+        assert photo['photo']['head'].startswith('ffd8')
+        assert q("SELECT state,error FROM cpbot.jobs WHERE cluster_id=1 AND kind='comment' AND generation=2") == 'pending|Telegram 限流'
+        drive(timed('tick', 39), expected=[failure('sendPhoto', 502, 'Bad Gateway')])
+        assert q("SELECT state,attempt_photo FROM cpbot.jobs WHERE cluster_id=1 AND kind='comment' AND generation=2") == 'uncertain|t'
+        q("INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation) VALUES(1,'check',1,1,1,20261126)")
         drive(timed('tick', 50))
-        q("UPDATE cpbot.jobs SET state='superseded' WHERE cluster_id=1 AND kind='proof' AND generation=20261126")
-        uncertain_id = int(q("SELECT id FROM cpbot.jobs WHERE cluster_id=1 AND kind='proof' AND generation=2"))
-        _, calls = drive({'operation': 'retry', 'cluster': 1, 'job': uncertain_id}, timed('tick', 58),
-                         expected=[success('sendPhoto', {'message_id': 104})])
-        assert calls[0]['params']['reply_parameters']['message_id'] == 103
-        assert q('SELECT cluster_id,generation,message FROM cpbot.proof_publications ORDER BY 1,2') == '1|1|77\n1|2|104\n2|1|32'
+        uncertain_id = int(q("SELECT id FROM cpbot.jobs WHERE cluster_id=1 AND kind='comment' AND generation=2"))
+        _, calls = drive({'operation': 'confirm', 'cluster': 1, 'job': uncertain_id, 'remote_id': 104}, timed('tick', 61),
+                         expected=[success('editMessageCaption', {'message_id': 104})])
+        assert calls[0]['params']['message_id'] == 104
+        assert q("SELECT photo,message FROM cpbot.publications WHERE (cluster_id,generation)=(1,2)") == 't|104'
+        assert q('SELECT cluster_id,generation,message FROM cpbot.proof_publications ORDER BY 1,2') == '1|1|77\n2|1|32'
         assert q("SELECT count(*) FROM cpbot.audit WHERE action IN ('登记发送结果','确认未发送，重试任务')") == '2'
 
         drive(timed('nightly', -1))
@@ -138,11 +135,10 @@ def exercise(base, source, command, sql, dsn):
         assert drive({'operation': 'poll-timeout'})[0] == [20]  # Only the paused cluster has jobs left.
 
         q("UPDATE cpbot.reviews SET status='withdrawn' WHERE cluster_id=1 AND id=1")
-        q("INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation) VALUES(1,'check',1,1,1,20261126),(1,'proof',1,1,1,20261127)")
-        _, calls = drive(timed('tick', 70), timed('tick', 74), expected=[
-            success('editMessageText', {'message_id': 103}), success('editMessageMedia', {'message_id': 104})])
-        assert calls[0]['params']['text'] == '此评价已由管理员撤下。'
-        assert calls[1]['params']['photo']['head'] == '89504e470d0a1a0a'
+        q("INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation) VALUES(1,'check',1,1,1,20261127)")
+        _, calls = drive(timed('tick', 70), expected=[success('editMessageMedia', {'message_id': 104})])
+        assert calls[0]['params']['media']['caption'] == '此评价已由管理员撤下。'
+        assert calls[0]['params']['photo']['head'] == '89504e470d0a1a0a'
         assert q('SELECT status FROM cpbot.reviews WHERE cluster_id=1 AND id=1') == 'withdrawn'
 
         q("INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,generation) VALUES(1,'health',1,0,20261127)")
@@ -151,8 +147,8 @@ def exercise(base, source, command, sql, dsn):
             'blocked|目标类型不符合绑定模式')
         assert q('SELECT active,error FROM cpbot.bindings WHERE (cluster_id,id)=(1,1)') == '0|目标类型不符合绑定模式'
         return ['pending_proof_no_blind_retry', 'admin_remote_id_registration', 'replica_rebuild',
-                'automatic_forward_wait_and_mapping', 'thread_comment_markup', 'multipart_proof_replies_to_text',
-                'telegram_429_and_global_pacing', 'telegram_502_uncertain', 'admin_retry_audit',
+                'automatic_forward_wait_and_mapping', 'thread_photo_comment_markup', 'single_multipart_photo_and_caption',
+                'telegram_429_and_global_pacing', 'telegram_502_uncertain', 'admin_confirmation_preserves_photo_type',
                 'nightly_once_per_day', 'paused_cluster_excluded', 'withdrawn_proof_replaced', 'invalid_binding_blocked']
     finally:
         server.shutdown()

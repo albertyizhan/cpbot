@@ -83,7 +83,14 @@ func (b *Bot) buildBackup(ctx context.Context, cid int64, includeAdmins bool) ([
 				case "people":
 					row["note"] = rawJSON("")
 				case "jobs":
-					delete(row, "attempt_generation")
+					if string(row["attempt_photo"]) != "true" {
+						delete(row, "attempt_photo")
+						delete(row, "attempt_generation")
+					}
+				case "publications":
+					if string(row["photo"]) != "true" {
+						delete(row, "photo")
+					}
 				case "reviews", "drafts":
 					var field struct {
 						Proof string `json:"出击证明"`
@@ -300,7 +307,7 @@ func prepareRecord(table string, row backupRecord, cid int64, definitions map[st
 		if table == "people" && key == "note" {
 			continue
 		}
-		if _, ok := definitions[key]; !ok || key == "cluster_id" || key == "attempt_generation" {
+		if _, ok := definitions[key]; !ok || key == "cluster_id" {
 			return bad()
 		}
 		result[key] = raw
@@ -314,11 +321,19 @@ func prepareRecord(table string, row backupRecord, cid int64, definitions map[st
 		}
 	}
 	if table == "jobs" {
-		result["attempt_generation"] = rawJSON(nil)
+		if result["attempt_generation"] == nil {
+			result["attempt_generation"] = rawJSON(nil)
+		}
+		if result["attempt_photo"] == nil {
+			result["attempt_photo"] = rawJSON(false)
+		}
 		if string(result["state"]) == `"sending"` {
 			result["state"] = rawJSON("uncertain")
 			result["error"] = rawJSON("恢复前的发送结果不明，请核对")
 		}
+	}
+	if table == "publications" && result["photo"] == nil {
+		result["photo"] = rawJSON(false)
 	}
 	if len(result) != len(definitions) {
 		return bad()
@@ -329,6 +344,10 @@ func prepareRecord(table string, row backupRecord, cid int64, definitions map[st
 			continue
 		}
 		switch kind {
+		case "boolean":
+			if string(raw) != "true" && string(raw) != "false" {
+				return bad()
+			}
 		case "bigint", "integer":
 			if _, err := strconv.ParseInt(string(raw), 10, 64); err != nil {
 				return bad()
@@ -613,7 +632,10 @@ func verifyBackupRelations(ctx context.Context, tx pgx.Tx, cid int64) error {
 		UNION ALL SELECT 1 FROM cpbot.posts p LEFT JOIN cpbot.teachers t ON (t.cluster_id,t.id)=(p.cluster_id,p.teacher)
 		JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(p.cluster_id,p.binding) WHERE p.cluster_id=$1 AND
 		(t.id IS NULL OR b.mode<>'thread' OR p.generation<=0 OR p.message<=0 OR p.root<=0 OR p.root IS NOT NULL AND p.message IS NULL)
-		UNION ALL SELECT 1 FROM (SELECT * FROM cpbot.publications UNION ALL SELECT * FROM cpbot.proof_publications) p
+		UNION ALL SELECT 1 FROM (
+			SELECT cluster_id,binding,generation,message,chat_id FROM cpbot.publications
+			UNION ALL SELECT cluster_id,binding,generation,message,chat_id FROM cpbot.proof_publications
+		) p
 		LEFT JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(p.cluster_id,p.binding) WHERE p.cluster_id=$1 AND
 		(b.id IS NULL OR b.mode NOT IN('feed','thread') OR p.generation<=0 OR p.message<=0 OR p.chat_id<>coalesce(b.discussion,b.chat_id))
 		UNION ALL SELECT 1 FROM cpbot.jobs j LEFT JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(j.cluster_id,j.binding)

@@ -129,7 +129,7 @@ def exercise_server(base, source, executable, pg_bin, environment, command, sql,
         with archive.extractfile('cpbot.pgdump') as dump, (base / 'cpbot.pgdump').open('wb') as target:
             shutil.copyfileobj(dump, target)
     command([pg_bin / 'pg_restore', '--single-transaction', '--no-owner', '--no-acl', '-d', 'restore', base / 'cpbot.pgdump'])
-    assert sql('restore', 'SELECT count(*) FROM cpbot.reviews') == '3'
+    assert sql('restore', 'SELECT count(*) FROM cpbot.reviews') == '4'
     assert sql('restore', 'SELECT count(*) FROM cpbot.cluster_management_groups') == '2'
     assert sql('restore', "SELECT value FROM cpbot.settings WHERE (cluster_id,key)=(1,'offset')") == (
         sql('runtime', "SELECT value FROM cpbot.settings WHERE (cluster_id,key)=(1,'offset')"))
@@ -178,7 +178,7 @@ esac
         'is-active', 'stop', 'start', '验收：新版启动失败', 'stop', 'start', 'cpbot PostgreSQL schema 1 可用',
     ]
     assert (server_root / 'cmd' / 'cpbot' / 'main.go').read_text() == original_main
-    assert sql('runtime', 'SELECT count(*) FROM cpbot.reviews') == '3'
+    assert sql('runtime', 'SELECT count(*) FROM cpbot.reviews') == '4'
     return ['postgres_backup_refuses_run_lock', 'postgres_server_backup_restore', 'failed_upgrade_restores_binary']
 
 
@@ -272,6 +272,8 @@ def main():
             publish_checks = exercise(base, source, command, sql, dsn('publish'))
 
             migrate('runtime', source)
+            # Exercise starting from the schema used by an already-running installation.
+            sql('runtime', 'ALTER TABLE cpbot.publications DROP COLUMN photo; ALTER TABLE cpbot.jobs DROP COLUMN attempt_photo')
             runtime_checks = exercise_runtime(base, source, sql, dsn('runtime'), JPEG)
 
             server_checks = exercise_server(base, source, executable, pg_bin, environment, command, sql, dsn('runtime'))

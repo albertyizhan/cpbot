@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 
-from .api import API, APIError
+from .api import API, APIError, APIInterrupted
 from .bot import ClusterBot
 from .store import ClusterStores, Store
 
@@ -54,7 +54,7 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    store, api = Store(str(path), configured_admins[0], configured_admins), API(token)
+    store, api = Store(str(path), configured_admins[0], configured_admins), API(token, stop)
     os.chmod(path, 0o600)
     clusters = None
     try:
@@ -97,12 +97,19 @@ def main():
                         break
                     try:
                         bot.handle(update)
+                    except APIInterrupted:
+                        if not stop.is_set():
+                            raise
+                        break
                     except APIError as error:
-                        logging.warning('Update %s: API code %s; response not replayed', update['update_id'], error.code)
+                        logging.warning('Update %s: Telegram API code %s; not replaying an uncertain result',
+                                        update['update_id'], error.code)
                         if error.retry_after:
                             stop.wait(error.retry_after)
                     except ValueError as error:
                         logging.warning('Update %s rejected: %s', update['update_id'], error)
+                    if stop.is_set():
+                        break
                     offset = update['update_id'] + 1
                     store.db.execute("INSERT OR REPLACE INTO settings VALUES('offset',?)", (str(offset),))
                     update_count += 1
@@ -114,6 +121,10 @@ def main():
                                  store.db.total_changes-measured_changes)
                     measured_at, measured_cpu, measured_changes = now, cpu, store.db.total_changes
                     update_count = poll_count = 0
+            except APIInterrupted:
+                if not stop.is_set():
+                    raise
+                break
             except APIError as error:
                 if error.code in (401, 409):
                     raise SystemExit('Token 无效或存在另一个轮询 / Webhook 实例，请检查配置。') from None

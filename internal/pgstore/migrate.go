@@ -22,6 +22,23 @@ import (
 //go:embed schema.sql
 var schema string
 
+//go:embed photo_publications.sql
+var photoPublications string
+
+// Upgrade adds photo delivery metadata. The original column contract remains usable.
+// Call under the same database owner lock used by the running bot.
+func Upgrade(ctx context.Context, db *pgx.Conn) error {
+	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		var applied bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.columns
+			WHERE table_schema='cpbot' AND table_name='publications' AND column_name='photo')`).Scan(&applied); err != nil || applied {
+			return err
+		}
+		_, err := tx.Exec(ctx, photoPublications)
+		return err
+	})
+}
+
 //go:embed sqlite_export.py
 var sqliteExport string
 
@@ -99,6 +116,9 @@ func MigrateSQLite(ctx context.Context, dsn, source string, checkOnly bool) (Mig
 	}
 	footer, err := importSQLiteRows(ctx, tx, path, columns, report.Rows)
 	if err != nil {
+		return report, err
+	}
+	if _, err := tx.Exec(ctx, photoPublications); err != nil {
 		return report, err
 	}
 	report.ReferencedProofs = footer.ReferencedProofs

@@ -61,9 +61,19 @@ class Publisher:
     def next_global(self, value):
         self.pacing[0] = value
 
+    def _api_call(self, method, **params):
+        # Keep 429 scheduling durable in the outbox; request retries here would
+        # block the poller and bypass its persisted next-attempt time.
+        call = getattr(self.api, 'call_once', self.api.call)
+        return call(method, **params)
+
+    def _api_photo(self, content, **params):
+        upload = getattr(self.api, 'photo_once', self.api.photo)
+        return upload(content, **params)
+
     def _chat(self, cid, label):
         try:
-            return self.api.call('getChat', chat_id=cid)
+            return self._api_call('getChat', chat_id=cid)
         except APIError as error:
             if error.code in (400, 403):
                 raise ValueError('%s（%s）无法访问，请确认目标 ID 正确，并已将当前机器人 @%s 加入。' % (label, cid, self.username)) from None
@@ -91,7 +101,7 @@ class Publisher:
 
     def _rights(self, cid, channel, label):
         try:
-            m = self.api.call('getChatMember', chat_id=cid, user_id=self.bot_id)
+            m = self._api_call('getChatMember', chat_id=cid, user_id=self.bot_id)
         except APIError as error:
             if error.code in (400, 403):
                 raise ValueError('%s（%s）无法检查 @%s 的身份，请确认机器人已加入该目标。' % (label, cid, self.username)) from None
@@ -177,7 +187,7 @@ class Publisher:
 
     def _edit(self, cid, mid, text, **extra):
         try:
-            return self.api.call('editMessageText', chat_id=cid, message_id=mid, text=text, **extra)
+            return self._api_call('editMessageText', chat_id=cid, message_id=mid, text=text, **extra)
         except APIError as error:
             if error.description == 'Bad Request: message is not modified' or 'message is not modified' in error.description:
                 return
@@ -240,7 +250,7 @@ class Publisher:
                 publication = self.s.db.execute('SELECT * FROM %s WHERE binding=? AND review=? AND generation=?' % table,
                                                 (j['binding'], j['review'], j['generation'])).fetchone()
                 if publication:
-                    self.api.call('deleteMessage', chat_id=publication['chat_id'], message_id=publication['message'])
+                    self._api_call('deleteMessage', chat_id=publication['chat_id'], message_id=publication['message'])
             elif kind == 'redactpost':
                 if p and p['message']:
                     self._edit(j['chat_id'], p['message'], '此老师已删除。历史评价已移入回收站。', parse_mode='HTML', reply_markup={'inline_keyboard': []})
@@ -251,7 +261,7 @@ class Publisher:
                     pub = self.s.db.execute('SELECT * FROM publications WHERE binding=? AND review=? AND generation=?',
                                             (j['binding'], j['review'], j['generation'])).fetchone()
                     if review and pub:
-                        self.api.call('editMessageReplyMarkup', chat_id=pub['chat_id'], message_id=pub['message'],
+                        self._api_call('editMessageReplyMarkup', chat_id=pub['chat_id'], message_id=pub['message'],
                                       reply_markup=self.comment_markup(review))
             elif kind == 'proof':
                 r=self.s.db.execute('SELECT * FROM reviews WHERE id=?',(j['review'],)).fetchone()
@@ -265,9 +275,9 @@ class Publisher:
                     content=self.s.proof_path(json.loads(r['data'])['出击证明']).read_bytes()
                     caption='📷 出击证明 · 车评 #%s'%r['id']
                     if proof:
-                        self.api.call('editMessageCaption',chat_id=target,message_id=proof['message'],caption=caption)
+                        self._api_call('editMessageCaption',chat_id=target,message_id=proof['message'],caption=caption)
                     else:
-                        sent=self.api.photo(content,chat_id=target,caption=caption,reply_parameters={'message_id':pub['message'],'allow_sending_without_reply':False})
+                        sent=self._api_photo(content,chat_id=target,caption=caption,reply_parameters={'message_id':pub['message'],'allow_sending_without_reply':False})
                         self.s.db.execute('INSERT INTO proof_publications VALUES(?,?,?,?,?)',(j['binding'],j['review'],generation,sent['message_id'],target))
                 elif proof:
                     # Replace the public proof with a neutral image when withdrawing.
@@ -276,7 +286,7 @@ class Publisher:
                         return struct.pack('!I',len(content))+kind+content+struct.pack('!I',zlib.crc32(kind+content))
                     blank=(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!2I5B',320,180,8,2,0,0,0))
                            +chunk(b'IDAT',zlib.compress((b'\x00'+b'\xe8\xe8\xe8'*320)*180))+chunk(b'IEND',b''))
-                    self.api.photo(blank,_method='editMessageMedia',chat_id=target,message_id=proof['message'],caption='此评价已由管理员撤下。')
+                    self._api_photo(blank,_method='editMessageMedia',chat_id=target,message_id=proof['message'],caption='此评价已由管理员撤下。')
             elif kind == 'health':
                 _, discussion = self.validate(j['mode'], j['chat_id'])
                 if discussion != j['discussion']:
@@ -286,7 +296,7 @@ class Publisher:
                 if p and p['message']:
                     self._edit(j['chat_id'], p['message'], text, reply_markup=markup, parse_mode='HTML', link_preview_options={'is_disabled': True})
                 else:
-                    result = self.api.call('sendMessage', chat_id=j['chat_id'], text=text, reply_markup=markup, parse_mode='HTML', link_preview_options={'is_disabled': True})
+                    result = self._api_call('sendMessage', chat_id=j['chat_id'], text=text, reply_markup=markup, parse_mode='HTML', link_preview_options={'is_disabled': True})
                     self.s.db.execute('UPDATE posts SET message=? WHERE binding=? AND teacher=?', (result['message_id'], j['binding'], j['teacher']))
             else:
                 r = self.s.db.execute('SELECT * FROM reviews WHERE id=?', (j['review'],)).fetchone()
@@ -302,7 +312,7 @@ class Publisher:
                 elif r['status'] == 'accepted':
                     params = {'reply_parameters': {'message_id': p['root'], 'allow_sending_without_reply': False}} if j['mode'] == 'thread' else {}
                     cid = j['discussion'] if j['mode'] == 'thread' else j['chat_id']
-                    result = self.api.call('sendMessage', chat_id=cid, text=text, parse_mode='HTML', **params, **markup)
+                    result = self._api_call('sendMessage', chat_id=cid, text=text, parse_mode='HTML', **params, **markup)
                     self.s.db.execute('INSERT INTO publications VALUES(?,?,?,?,?)', (j['binding'], j['review'], generation, result['message_id'], cid))
             self.s.db.execute("UPDATE jobs SET state='done',error='' WHERE id=?", (j['id'],))
             if j['review'] and j['mode'] == 'thread' and j['kind'] == 'comment':
@@ -336,7 +346,7 @@ class Publisher:
                                 return struct.pack('!I',len(content))+kind+content+struct.pack('!I',zlib.crc32(kind+content))
                             blank=(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!2I5B',320,180,8,2,0,0,0))
                                    +chunk(b'IDAT',zlib.compress((b'\x00'+b'\xe8\xe8\xe8'*320)*180))+chunk(b'IEND',b''))
-                            self.api.photo(blank,_method='editMessageMedia',chat_id=pub['chat_id'],message_id=pub['message'],caption='此评价已删除。')
+                            self._api_photo(blank,_method='editMessageMedia',chat_id=pub['chat_id'],message_id=pub['message'],caption='此评价已删除。')
                         self.s.db.execute("UPDATE jobs SET state='done',error='超过 Telegram 删除时限，已清除公开内容' WHERE id=?",(j['id'],))
                     except APIError as edit_error:
                         self.s.db.execute("UPDATE jobs SET state='blocked',error=? WHERE id=?",(edit_error.description[:200],j['id']))

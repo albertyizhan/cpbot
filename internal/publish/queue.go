@@ -137,7 +137,7 @@ func (w *Worker) Tick(ctx context.Context, now time.Time) error {
 	if reason != "" {
 		return w.deferJob(ctx, j, now.Add(10*time.Second), reason)
 	}
-	tag, err := w.db.Exec(ctx, `UPDATE cpbot.jobs SET state='sending',attempt_generation=$3
+	tag, err := w.db.Exec(ctx, `UPDATE cpbot.jobs SET state='sending',attempt_generation=$3,attempt_photo=false
 		WHERE (cluster_id,id)=($1,$2) AND state='pending'`, j.cid, j.id, j.replica())
 	if err != nil || tag.RowsAffected() == 0 {
 		return err
@@ -193,6 +193,8 @@ type delivery struct {
 	location    string
 	message     int64
 	waitForText bool
+	photo       bool
+	legacyProof bool
 	note        string
 }
 
@@ -203,9 +205,11 @@ func (w *Worker) complete(ctx context.Context, j job, result delivery) error {
 		case "post":
 			_, err = tx.Exec(ctx, `UPDATE cpbot.posts SET message=$4 WHERE (cluster_id,binding,teacher)=($1,$2,$3)`,
 				j.cid, j.binding, j.teacher, result.message)
-		case "publications", "proof_publications":
-			table := pgx.Identifier{"cpbot", result.location}.Sanitize()
-			_, err = tx.Exec(ctx, `INSERT INTO `+table+`(cluster_id,binding,review,generation,message,chat_id)
+		case "publications":
+			_, err = tx.Exec(ctx, `INSERT INTO cpbot.publications(cluster_id,binding,review,generation,message,chat_id,photo)
+				VALUES($1,$2,$3,$4,$5,$6,$7)`, j.cid, j.binding, j.review, j.replica(), result.message, j.destination(), result.photo)
+		case "proof_publications":
+			_, err = tx.Exec(ctx, `INSERT INTO cpbot.proof_publications(cluster_id,binding,review,generation,message,chat_id)
 				VALUES($1,$2,$3,$4,$5,$6)`, j.cid, j.binding, j.review, j.replica(), result.message, j.destination())
 		}
 		if err != nil {
@@ -213,6 +217,11 @@ func (w *Worker) complete(ctx context.Context, j job, result delivery) error {
 		}
 		if _, err := tx.Exec(ctx, `UPDATE cpbot.jobs SET state='done',error=$3 WHERE (cluster_id,id)=($1,$2)`, j.cid, j.id, result.note); err != nil {
 			return err
+		}
+		if result.legacyProof {
+			if err := Enqueue(ctx, tx, j.cid, "proof", j.binding, j.teacher, j.review, j.replica()); err != nil {
+				return err
+			}
 		}
 		if j.review != 0 && j.mode == "thread" && j.kind == "comment" {
 			return Enqueue(ctx, tx, j.cid, "summary", j.binding, j.teacher, 0, j.review+1000000)

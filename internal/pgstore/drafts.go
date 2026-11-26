@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"cpbot/internal/publish"
+	"cpbot/internal/telegram"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -23,6 +24,7 @@ var ScoreFields = [...]string{"人照", "颜值", "身材", "服务", "态度", 
 var InputFields = [...]string{"时间", "老师", "出击证明", "人照", "颜值", "身材", "服务", "态度", "环境", "过程"}
 
 const MaxProofBytes = 10 << 20
+const RequiredReviewFields = len(InputFields) - 1
 
 type UserError string
 
@@ -39,6 +41,11 @@ func (d Draft) TeacherID() int64 {
 }
 
 func (d Draft) Anonymous() bool { return d.Data["匿名"] != false }
+
+func (d Draft) Proof() string {
+	name, _ := d.Data["出击证明"].(string)
+	return name
+}
 
 func (d Draft) Score() (float64, bool) {
 	sum := 0
@@ -60,6 +67,9 @@ func (d Draft) Score() (float64, bool) {
 func (d Draft) Missing() map[string]bool {
 	out := make(map[string]bool)
 	for _, key := range InputFields {
+		if key == "出击证明" {
+			continue
+		}
 		if d.Data[key] == nil || strings.TrimSpace(fmt.Sprint(d.Data[key])) == "" {
 			out[key] = true
 		}
@@ -179,7 +189,7 @@ func SaveProof(source string, cid int64, data []byte) (string, error) {
 }
 
 // Submit creates exactly one review and enqueues only its new publications.
-func Submit(ctx context.Context, db *pgx.Conn, source string, cid, user int64, token string, identity any, now time.Time) (int64, error) {
+func Submit(ctx context.Context, db *pgx.Conn, source string, cid, user int64, token string, identity telegram.User, now time.Time) (int64, error) {
 	if strings.TrimSpace(token) == "" {
 		return 0, UserError("草稿已变更，请重新打开。")
 	}
@@ -210,17 +220,21 @@ func Submit(ctx context.Context, db *pgx.Conn, source string, cid, user int64, t
 		if len(d.Missing()) != 0 {
 			return UserError("请补齐所有字段。")
 		}
-		name, _ := d.Data["出击证明"].(string)
-		path, err := ProofPath(source, cid, name)
-		if err != nil {
-			return err
-		}
-		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > MaxProofBytes {
-			return UserError("出击证明文件缺失或无效，请重新上传图片。")
+		if proof := d.Proof(); proof != "" {
+			path, err := ProofPath(source, cid, proof)
+			if err != nil {
+				return err
+			}
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > MaxProofBytes {
+				return UserError("出击证明文件缺失或无效，请重新上传或移除图片。")
+			}
+		} else {
+			delete(d.Data, "出击证明")
 		}
 		tid := d.TeacherID()
-		if err := tx.QueryRow(ctx, `SELECT id FROM cpbot.teachers WHERE (cluster_id,id)=($1,$2) AND deleted_at IS NULL`, cid, tid).Scan(&tid); err != nil {
+		name, handle, err := TeacherDisplay(ctx, tx, cid, tid)
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return UserError("这位老师已不存在或进入回收站。")
 			}
@@ -254,6 +268,15 @@ func Submit(ctx context.Context, db *pgx.Conn, source string, cid, user int64, t
 		if err != nil {
 			return err
 		}
+		if d.Proof() != "" {
+			fits, err := publish.CaptionFits(id, d.Data, name, handle, user, identity.Username, d.Anonymous())
+			if err != nil {
+				return err
+			}
+			if !fits {
+				return UserError(publish.CaptionTooLong)
+			}
+		}
 		if err := publish.EnqueueReview(ctx, tx, cid, tid, id); err != nil {
 			return err
 		}
@@ -261,4 +284,13 @@ func Submit(ctx context.Context, db *pgx.Conn, source string, cid, user int64, t
 		return err
 	})
 	return id, err
+}
+
+func TeacherDisplay(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, cid, tid int64) (name, handle string, err error) {
+	err = db.QueryRow(ctx, `SELECT t.name,coalesce(CASE WHEN p.id IS NOT NULL THEN p.username ELSE t.username END,'')
+		FROM cpbot.teachers t LEFT JOIN cpbot.people p ON (p.cluster_id,p.user_id)=(t.cluster_id,t.user_id)
+		WHERE (t.cluster_id,t.id)=($1,$2) AND t.deleted_at IS NULL`, cid, tid).Scan(&name, &handle)
+	return
 }

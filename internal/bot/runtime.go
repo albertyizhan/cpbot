@@ -56,6 +56,9 @@ func Run(ctx context.Context, db *pgx.Conn, api *telegram.Client, source string,
 	}
 	// Close the owning connection to release a session lock, including on shutdown.
 	defer db.Close(context.Background())
+	if err := pgstore.Upgrade(ctx, db); err != nil {
+		return fmt.Errorf("升级车评发布记录：%w", err)
+	}
 	var me telegram.User
 	if err := api.Call(ctx, "getMe", telegram.Params{}, &me); err != nil {
 		return fmt.Errorf("无法确认 Telegram 机器人身份：%w", err)
@@ -147,12 +150,16 @@ func (b *Bot) poll(ctx context.Context) error {
 				continue
 			}
 			err := b.handle(ctx, update)
+			if err != nil && ctx.Err() != nil {
+				return nil
+			}
 			if err != nil {
 				var remote *telegram.Error
 				if !errors.As(err, &remote) {
 					return fmt.Errorf("处理 Telegram 更新 %d：%w", update.ID, err)
 				}
 				slog.Warn("Telegram 响应失败", "update", update.ID, "code", remote.Code)
+				slog.Warn("Telegram 响应结果不明，不自动重放更新", "update", update.ID, "code", remote.Code)
 				if remote.RetryAfter > 0 {
 					wait(ctx, time.Duration(remote.RetryAfter)*time.Second)
 				}

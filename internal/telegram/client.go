@@ -50,11 +50,28 @@ func (c *Client) Call(ctx context.Context, method string, params Params, result 
 	if method == "getUpdates" {
 		timeout = 40 * time.Second
 	}
-	return c.request(ctx, method, "application/json", bytes.NewReader(body), timeout, result)
+	return c.request(ctx, method, "application/json", bytes.NewReader(body), timeout, result, true)
+}
+
+// CallOnce leaves rate-limit scheduling to the durable publisher queue.
+func (c *Client) CallOnce(ctx context.Context, method string, params Params, result any) error {
+	body, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	timeout := 10 * time.Second
+	if method == "getUpdates" {
+		timeout = 40 * time.Second
+	}
+	return c.request(ctx, method, "application/json", bytes.NewReader(body), timeout, result, false)
 }
 
 func (c *Client) Photo(ctx context.Context, method string, params Params, filename string, data []byte, result any) error {
-	return c.upload(ctx, method, params, "photo", filename, data, result)
+	return c.upload(ctx, method, params, "photo", filename, data, result, true)
+}
+
+func (c *Client) PhotoOnce(ctx context.Context, method string, params Params, filename string, data []byte, result any) error {
+	return c.upload(ctx, method, params, "photo", filename, data, result, false)
 }
 
 type Document struct {
@@ -64,10 +81,14 @@ type Document struct {
 }
 
 func (c *Client) Document(ctx context.Context, chat int64, name string, data []byte) error {
-	return c.upload(ctx, "sendDocument", Params{"chat_id": chat}, "document", name, data, nil)
+	return c.upload(ctx, "sendDocument", Params{"chat_id": chat}, "document", name, data, nil, true)
 }
 
-func (c *Client) upload(ctx context.Context, method string, params Params, field, filename string, data []byte, result any) error {
+func (c *Client) DocumentOnce(ctx context.Context, chat int64, name string, data []byte) error {
+	return c.upload(ctx, "sendDocument", Params{"chat_id": chat}, "document", name, data, nil, false)
+}
+
+func (c *Client) upload(ctx context.Context, method string, params Params, field, filename string, data []byte, result any, retryRateLimit bool) error {
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)
 	for key, value := range params {
@@ -93,52 +114,90 @@ func (c *Client) upload(ctx context.Context, method string, params Params, field
 	if err := form.Close(); err != nil {
 		return err
 	}
-	return c.request(ctx, method, form.FormDataContentType(), &body, 60*time.Second, result)
+	return c.request(ctx, method, form.FormDataContentType(), &body, 60*time.Second, result, retryRateLimit)
 }
 
-func (c *Client) request(ctx context.Context, method, contentType string, body io.Reader, timeout time.Duration, result any) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/"+method, body)
+func (c *Client) request(ctx context.Context, method, contentType string, body io.Reader, timeout time.Duration, result any, retryRateLimit bool) error {
+	payload, err := io.ReadAll(body)
 	if err != nil {
-		return &Error{}
+		return err
 	}
-	req.Header.Set("Content-Type", contentType)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return &Error{}
-	}
-	defer resp.Body.Close()
-	var envelope struct {
-		OK          bool            `json:"ok"`
-		Result      json.RawMessage `json:"result"`
-		Code        int             `json:"error_code"`
-		Description string          `json:"description"`
-		Parameters  struct {
-			RetryAfter int `json:"retry_after"`
-		} `json:"parameters"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 20<<20)).Decode(&envelope); err != nil {
-		if resp.StatusCode >= 400 {
-			return &Error{Code: resp.StatusCode}
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, c.base+"/"+method, bytes.NewReader(payload))
+		if err != nil {
+			cancel()
+			return &Error{}
 		}
-		return &Error{}
-	}
-	if !envelope.OK || resp.StatusCode != http.StatusOK {
-		code := envelope.Code
-		if code == 0 && resp.StatusCode >= 400 {
-			code = resp.StatusCode
+		req.Header.Set("Content-Type", contentType)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return &Error{}
 		}
-		retry := envelope.Parameters.RetryAfter
-		if retry == 0 {
-			retry, _ = strconv.Atoi(resp.Header.Get("Retry-After"))
+		var envelope struct {
+			OK          bool            `json:"ok"`
+			Result      json.RawMessage `json:"result"`
+			Code        int             `json:"error_code"`
+			Description string          `json:"description"`
+			Parameters  struct {
+				RetryAfter int `json:"retry_after"`
+			} `json:"parameters"`
 		}
-		return &Error{Code: code, RetryAfter: retry, Description: envelope.Description}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 20<<20)).Decode(&envelope)
+		statusCode, retryHeader := resp.StatusCode, resp.Header.Get("Retry-After")
+		resp.Body.Close()
+		cancel()
+		if decodeErr != nil {
+			if retryRateLimit && statusCode == http.StatusTooManyRequests {
+				retry, _ := strconv.Atoi(retryHeader)
+				if err := waitRateLimit(ctx, retry); err != nil {
+					return err
+				}
+				continue
+			}
+			if statusCode >= 400 {
+				return &Error{Code: statusCode}
+			}
+			return &Error{}
+		}
+		if !envelope.OK || statusCode != http.StatusOK {
+			code := envelope.Code
+			if code == 0 && statusCode >= 400 {
+				code = statusCode
+			}
+			retry := envelope.Parameters.RetryAfter
+			if retry == 0 {
+				retry, _ = strconv.Atoi(retryHeader)
+			}
+			if retryRateLimit && code == http.StatusTooManyRequests {
+				if err := waitRateLimit(ctx, retry); err != nil {
+					return err
+				}
+				continue
+			}
+			return &Error{Code: code, RetryAfter: retry, Description: envelope.Description}
+		}
+		if len(envelope.Result) == 0 || (result != nil && json.Unmarshal(envelope.Result, result) != nil) {
+			return &Error{}
+		}
+		return nil
 	}
-	if len(envelope.Result) == 0 || (result != nil && json.Unmarshal(envelope.Result, result) != nil) {
-		return &Error{}
+}
+
+func waitRateLimit(ctx context.Context, retryAfter int) error {
+	delay := time.Duration(max(1, retryAfter)) * time.Second
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	return nil
 }
 
 type Entity struct {
