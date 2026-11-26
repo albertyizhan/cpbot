@@ -10,12 +10,54 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+type membershipDB interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// LookupAccess uses the bot's cluster policy for both user interfaces.
+type LookupAccess struct {
+	db     membershipDB
+	api    *telegram.Client
+	botID  int64
+	admins map[int64]bool
+}
+
+func NewLookupAccess(db membershipDB, api *telegram.Client, botID int64, admins map[int64]bool) LookupAccess {
+	return LookupAccess{db: db, api: api, botID: botID, admins: admins}
+}
+
+func (b *Bot) lookupAccess() LookupAccess {
+	return NewLookupAccess(b.db, b.api, b.me.ID, b.admins)
+}
+
+// VisibleClusterIDs returns only clusters this Telegram user may look up.
+func (b LookupAccess) VisibleClusterIDs(ctx context.Context, uid int64) ([]int64, error) {
+	clusters, err := b.availableClusters(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(clusters))
+	for _, c := range clusters {
+		if err := b.requireMember(ctx, c.ID, uid); err == nil {
+			ids = append(ids, c.ID)
+		} else if !memberDenied(err) {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
+
 type cluster struct {
 	ID   int64
 	Name string
 }
 
 func (b *Bot) availableClusters(ctx context.Context, publishing bool) ([]cluster, error) {
+	return b.lookupAccess().availableClusters(ctx, publishing)
+}
+
+func (b LookupAccess) availableClusters(ctx context.Context, publishing bool) ([]cluster, error) {
 	rows, err := b.db.Query(ctx, `SELECT c.id,c.name FROM cpbot.clusters c JOIN cpbot.cluster_authorizations a ON c.id=a.cluster_id
 		WHERE EXISTS (SELECT 1 FROM cpbot.bindings b WHERE b.cluster_id=c.id AND b.active=1 AND (NOT $1 OR b.mode IN ('thread','feed'))) ORDER BY c.id`, publishing)
 	if err != nil {
@@ -40,12 +82,20 @@ func (m member) presentState() *bool {
 }
 
 func (b *Bot) chatMember(ctx context.Context, chat, uid int64) (member, error) {
+	return b.lookupAccess().chatMember(ctx, chat, uid)
+}
+
+func (b LookupAccess) chatMember(ctx context.Context, chat, uid int64) (member, error) {
 	var result member
 	err := b.api.Call(ctx, "getChatMember", telegram.Params{"chat_id": chat, "user_id": uid}, &result)
 	return result, err
 }
 
 func (b *Bot) isAdmin(ctx context.Context, cid, uid int64) (bool, error) {
+	return b.lookupAccess().isAdmin(ctx, cid, uid)
+}
+
+func (b LookupAccess) isAdmin(ctx context.Context, cid, uid int64) (bool, error) {
 	if b.admins[uid] {
 		return true, nil
 	}
@@ -64,7 +114,7 @@ func (b *Bot) isAdmin(ctx context.Context, cid, uid int64) (bool, error) {
 		if err != nil || !person.admin() {
 			continue
 		}
-		bot, err := b.chatMember(ctx, chat, b.me.ID)
+		bot, err := b.chatMember(ctx, chat, b.botID)
 		if err == nil && bot.admin() {
 			return true, nil
 		}
@@ -73,6 +123,10 @@ func (b *Bot) isAdmin(ctx context.Context, cid, uid int64) (bool, error) {
 }
 
 func (b *Bot) requireMember(ctx context.Context, cid, uid int64) error {
+	return b.lookupAccess().requireMember(ctx, cid, uid)
+}
+
+func (b LookupAccess) requireMember(ctx context.Context, cid, uid int64) error {
 	var authorized, ready bool
 	var total int
 	var setting *string
@@ -126,7 +180,7 @@ func (b *Bot) requireMember(ctx context.Context, cid, uid int64) error {
 			unknown = true
 			continue
 		}
-		bot, err := b.chatMember(ctx, chat, b.me.ID)
+		bot, err := b.chatMember(ctx, chat, b.botID)
 		if err != nil || !bot.admin() {
 			unknown = true
 			continue

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>查车评</title>
+  <link rel="stylesheet" href="/app.css">
+  <script defer src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header id="search-bar" class="toolbar">
+      <label class="search">
+        <span class="search-icon" aria-hidden="true"></span>
+        <input id="search" type="search" aria-label="搜索老师" placeholder="搜索老师姓名或 @用户名" maxlength="80" autocomplete="off" enterkeyhint="search">
+        <button id="clear-search" class="icon" type="button" aria-label="清除搜索" hidden>×</button>
+      </label>
+    </header>
+    <header id="teacher-bar" class="toolbar teacher-bar" hidden>
+      <button id="back" type="button" class="back"><span aria-hidden="true">‹</span> 返回</button>
+      <span>老师主页</span>
+    </header>
+    <main>
+      <section id="home" aria-labelledby="home-title">
+        <div class="section-header">
+          <h1 id="home-title">最新车评</h1>
+          <button id="refresh" class="icon refresh" type="button" aria-label="刷新车评">↻</button>
+        </div>
+        <button id="new-reviews" class="notice" type="button" hidden>有新评价 · 查看</button>
+        <div id="feed-status" class="status" role="status" hidden></div>
+        <div id="feed" class="cards"></div>
+        <button id="more-feed" class="more" type="button" hidden>加载更早的车评</button>
+      </section>
+      <section id="results" aria-labelledby="search-title" hidden>
+        <h1 id="search-title" class="section-header">老师搜索</h1>
+        <div id="search-status" class="status" role="status" hidden></div>
+        <ul id="teachers" class="teachers"></ul>
+      </section>
+      <section id="profile" aria-labelledby="teacher-name" hidden>
+        <div class="profile-header">
+          <span id="teacher-initial" class="initial" aria-hidden="true"></span>
+          <div>
+            <h1 id="teacher-name"></h1>
+            <p id="teacher-meta" class="muted"></p>
+          </div>
+        </div>
+        <div class="filters" aria-label="筛选老师车评">
+          <label class="select"><span class="sr-only">排序</span>
+            <select id="order"><option value="desc">从新到旧</option><option value="asc">从旧到新</option></select>
+          </label>
+          <button id="open-dates" type="button" class="date-button" aria-haspopup="dialog">全部日期</button>
+        </div>
+        <div id="profile-status" class="status" role="status" hidden></div>
+        <div id="teacher-reviews" class="cards"></div>
+        <button id="more-teacher" class="more" type="button" hidden>加载更多车评</button>
+      </section>
+    </main>
+  </div>
+  <dialog id="dates" aria-labelledby="dates-title">
+    <form id="date-form">
+      <div class="section-header dialog-header">
+        <h2 id="dates-title">评价日期</h2>
+        <button id="close-dates" type="button" class="icon" aria-label="关闭日期筛选">×</button>
+      </div>
+      <div class="date-modes" role="group" aria-label="日期筛选方式">
+        <label><input type="radio" name="mode" value="all" checked><span>全部</span></label>
+        <label><input type="radio" name="mode" value="single"><span>指定日期</span></label>
+        <label><input type="radio" name="mode" value="range"><span>日期范围</span></label>
+      </div>
+      <div id="date-inputs" class="date-inputs" hidden>
+        <label><span id="date-start-label">日期</span><input id="date-start" type="date" min="0001-01-01" max="9998-12-31"></label>
+        <label id="date-end-field" hidden><span>结束日期</span><input id="date-end" type="date" min="0001-01-01" max="9998-12-31"></label>
+      </div>
+      <p id="date-error" class="date-error" role="alert" hidden></p>
+      <button class="primary" type="submit">应用</button>
+    </form>
+  </dialog>
+</body>
+</html>

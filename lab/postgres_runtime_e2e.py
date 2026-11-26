@@ -148,7 +148,8 @@ def exercise_runtime(base, source, sql, dsn, image):
     local = ThreadingHTTPServer(('127.0.0.1', 0), BotAPI)
     thread = Thread(target=local.serve_forever, daemon=True)
     thread.start()
-    env = {**os.environ, 'DATABASE_URL': dsn, 'SUPERADMIN_IDS': '1'}
+    mini_url = 'https://reviews.example.invalid/'
+    env = {**os.environ, 'DATABASE_URL': dsn, 'SUPERADMIN_IDS': '1', 'CPBOT_MINI_APP_URL': mini_url}
     cmd = [str(base / 'cpbot'), 'run-lab', '--source', str(source), '--api', f'http://127.0.0.1:{local.server_port}']
     with (base / 'bot-runtime.log').open('w', encoding='utf-8') as log:
         process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -206,6 +207,8 @@ def exercise_runtime(base, source, sql, dsn, image):
             path = sql('runtime', "SELECT data->>'出击证明' FROM cpbot.reviews WHERE (cluster_id,id)=(1,2)")
             assert (Path(source).parent / 'proofs' / path).read_bytes() == image
             home = panel_for(private('/start'), '车评主菜单')
+            inline = home['params']['reply_markup']['inline_keyboard']
+            assert inline[0] == [{'text': '📖 查车评', 'web_app': {'url': mini_url}}], inline
             start, _ = click(home, '📋 我的车评')
             mine = panel_for(start, '我的车评')
             assert f"https://t.me/c/0101/{public['result']['message_id']}" in mine['params']['text']
@@ -350,7 +353,8 @@ def exercise_runtime(base, source, sql, dsn, image):
                     'form_photo_and_score_validation', 'stale_submit_button', 'single_photo_caption_in_thread_and_feed',
                     'saved_username_with_empty_identity', 'observed_username_takes_precedence',
                     'overlong_caption_preserves_draft', 'optional_proof_removal_and_plain_publication',
-                    'my_reviews_and_teacher_directory', 'group_lookup_tag_deep_link_and_cluster_isolation',
+                    'mini_app_entry_and_existing_directory', 'my_reviews_and_teacher_directory',
+                    'group_lookup_tag_deep_link_and_cluster_isolation',
                     'pause_queue_and_bulk_teacher_identity', 'admin_registers_username_without_rebinding',
                     'default_buttons_on_thread_and_feed_photo_and_text', 'button_config_edits_existing_thread_and_feed_posts',
                     'backup_and_restore_preserve_photo_format', 'register_new_cluster']

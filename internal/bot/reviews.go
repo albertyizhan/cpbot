@@ -54,6 +54,10 @@ func (b *Bot) showPanel(ctx context.Context, uid int64, state panel, text string
 	for _, row := range rows {
 		buttons := make([]telegram.Params, 0, len(row))
 		for _, button := range row {
+			if button.action == "miniapp" {
+				buttons = append(buttons, telegram.Params{"text": button.label, "web_app": telegram.Params{"url": b.miniAppURL}})
+				continue
+			}
 			index := strconv.Itoa(len(state.actions))
 			state.actions[index] = button.action
 			buttons = append(buttons, telegram.Params{"text": button.label, "callback_data": nonce + "|" + index})
@@ -114,6 +118,9 @@ func (b *Bot) home(ctx context.Context, uid int64, state panel) error {
 		rows = append([][]choice{first}, []choice{{"👤 查学生", "lookup"}, {"📋 我的车评", "mine:0"}})
 	} else {
 		text = "⚠️ 尚未配置可用的发布绑定，请联系管理员。"
+	}
+	if b.miniAppURL != "" && len(clusters) != 0 {
+		rows = append([][]choice{{{"📖 查车评", "miniapp"}}}, rows...)
 	}
 	managed, err := b.adminClusters(ctx, uid)
 	if err != nil {

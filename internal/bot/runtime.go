@@ -20,17 +20,18 @@ import (
 )
 
 type Bot struct {
-	db        *pgx.Conn
-	api       *telegram.Client
-	publisher *publish.Worker
-	me        telegram.User
-	source    string
-	admins    map[int64]bool
-	panels    map[int64]panel
-	triggers  map[[2]int64]time.Time
+	db         *pgx.Conn
+	api        *telegram.Client
+	publisher  *publish.Worker
+	me         telegram.User
+	source     string
+	admins     map[int64]bool
+	panels     map[int64]panel
+	triggers   map[[2]int64]time.Time
+	miniAppURL string
 }
 
-func Run(ctx context.Context, db *pgx.Conn, api *telegram.Client, source string, admins map[int64]bool) error {
+func Run(ctx context.Context, db *pgx.Conn, api *telegram.Client, source string, admins map[int64]bool, miniAppURL string) error {
 	path, err := filepath.Abs(source)
 	if err != nil {
 		return err
@@ -82,7 +83,7 @@ func Run(ctx context.Context, db *pgx.Conn, api *telegram.Client, source string,
 	if err := api.Call(ctx, "setMyCommands", telegram.Params{"scope": telegram.Params{"type": "all_private_chats"}, "commands": private}, nil); err != nil {
 		return err
 	}
-	b := Bot{db: db, api: api, me: me, publisher: worker, source: path, admins: admins, panels: make(map[int64]panel), triggers: make(map[[2]int64]time.Time)}
+	b := Bot{db: db, api: api, me: me, publisher: worker, source: path, admins: admins, panels: make(map[int64]panel), triggers: make(map[[2]int64]time.Time), miniAppURL: miniAppURL}
 	slog.Info("cpbot 已启动", "username", me.Username)
 	return b.poll(ctx)
 }

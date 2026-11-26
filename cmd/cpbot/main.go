@@ -20,7 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const usage = "用法：cpbot {run | check | migrate-sqlite [--source <SQLite 文件>] [--check]}"
+const usage = "用法：cpbot {run | check | serve-mini-app | migrate-sqlite [--source <SQLite 文件>] [--check]}"
 
 func main() {
 	syscall.Umask(0077)
@@ -51,6 +51,11 @@ func run(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "migrate-sqlite":
 		return migrate(ctx, args[1:], source, dsn)
+	case "serve-mini-app":
+		if len(args) != 1 {
+			return errors.New(usage)
+		}
+		return serveMiniApp(ctx, dsn, strings.TrimSpace(os.Getenv("BOT_TOKEN")))
 	case "run-lab":
 		flags := flag.NewFlagSet("run-lab", flag.ContinueOnError)
 		source := flags.String("source", source, "SQLite 路径，用于运行锁和证明图布局")
@@ -125,5 +130,9 @@ func runBot(ctx context.Context, dsn, source string, api *telegram.Client, check
 		fmt.Println("cpbot PostgreSQL schema 1 可用")
 		return nil
 	}
-	return bot.Run(ctx, db, api, source, admins)
+	miniURL, err := miniAppURL()
+	if err != nil {
+		return err
+	}
+	return bot.Run(ctx, db, api, source, admins, miniURL)
 }

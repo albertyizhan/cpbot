@@ -21,15 +21,6 @@ type reviewListing struct {
 	Message *int64
 }
 
-const bestPublication = `LEFT JOIN LATERAL (
-	SELECT p.chat_id,p.message FROM cpbot.publications p
-	JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(p.cluster_id,p.binding)
-	LEFT JOIN cpbot.posts t ON (t.cluster_id,t.binding,t.teacher)=(p.cluster_id,p.binding,r.teacher)
-	WHERE (p.cluster_id,p.review)=(r.cluster_id,r.id) AND b.active=1
-	AND ((b.mode='thread' AND p.generation=t.generation) OR (b.mode='feed' AND p.generation=1))
-	ORDER BY (b.mode='thread') DESC,b.id LIMIT 1
-) p ON true`
-
 func (b *Bot) reviewList(ctx context.Context, uid int64, state panel, teacher int64, page int) error {
 	page = max(0, page)
 	var title, filter, order string
@@ -50,9 +41,9 @@ func (b *Bot) reviewList(ctx context.Context, uid int64, state panel, teacher in
 		args = []any{uid, 0, page * 8}
 		order = "r.created DESC,r.cluster_id,r.id DESC"
 	}
-	rows, err := b.db.Query(ctx, `SELECT r.id,c.name,t.name,coalesce(r.data->>'时间',''),p.chat_id,p.message FROM cpbot.reviews r
+	rows, err := b.db.Query(ctx, `SELECT r.id,c.name,t.name,coalesce(r.data->>'时间',''),pub.chat_id,pub.message FROM cpbot.reviews r
 		JOIN cpbot.clusters c ON c.id=r.cluster_id JOIN cpbot.teachers t ON (t.cluster_id,t.id)=(r.cluster_id,r.teacher) `+
-		bestPublication+` WHERE r.status='accepted' AND `+filter+` ORDER BY `+order+` LIMIT 9 OFFSET $3`, args...)
+		pgstore.BestPublication+` WHERE r.status='accepted' AND `+filter+` ORDER BY `+order+` LIMIT 9 OFFSET $3`, args...)
 	if err != nil {
 		return err
 	}

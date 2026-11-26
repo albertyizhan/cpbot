@@ -45,11 +45,11 @@ def engine():
 
 
 def go_sources(root):
-    paths = {name for name in ('go.mod', 'go.sum', 'deploy/build-go.sh', 'docs/GO_MIGRATION.md')
+    paths = {name for name in ('go.mod', 'go.sum', 'deploy/build-go.sh', 'docs/GO_MIGRATION.md', 'docs/MINI_APP.md')
              if (root / name).is_file()}
     for directory in ('cmd', 'internal'):
         paths.update(path.relative_to(root).as_posix() for path in (root / directory).rglob('*')
-                     if path.is_file() and path.suffix in ('.go', '.sql', '.py'))
+                     if path.is_file() and path.suffix in ('.go', '.sql', '.py', '.html', '.css', '.js'))
     return tuple(sorted(paths))
 
 
