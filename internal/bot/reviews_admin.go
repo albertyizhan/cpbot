@@ -408,10 +408,11 @@ func (b *Bot) editButton(ctx context.Context, uid int64, state panel, kind, text
 func queueButtons(ctx context.Context, tx pgx.Tx, cid int64) error {
 	_, err := tx.Exec(ctx, `INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation)
 		SELECT r.cluster_id,'commentbuttons',pub.binding,r.teacher,r.id,pub.generation FROM cpbot.publications pub
-		JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(pub.cluster_id,pub.binding) AND b.mode='thread'
+		JOIN cpbot.bindings b ON (b.cluster_id,b.id)=(pub.cluster_id,pub.binding)
 		JOIN cpbot.reviews r ON (r.cluster_id,r.id)=(pub.cluster_id,pub.review) AND r.status='accepted'
-		JOIN cpbot.posts p ON (p.cluster_id,p.binding,p.teacher,p.generation)=(pub.cluster_id,pub.binding,r.teacher,pub.generation)
-		WHERE pub.cluster_id=$1 ON CONFLICT(cluster_id,kind,binding,teacher,review,generation) DO UPDATE SET state='pending',due=0,error=''
+		LEFT JOIN cpbot.posts p ON (p.cluster_id,p.binding,p.teacher,p.generation)=(pub.cluster_id,pub.binding,r.teacher,pub.generation)
+		WHERE pub.cluster_id=$1 AND ((b.mode='thread' AND p.generation IS NOT NULL) OR (b.mode='feed' AND pub.generation=1))
+		ON CONFLICT(cluster_id,kind,binding,teacher,review,generation) DO UPDATE SET state='pending',due=0,error=''
 		WHERE jobs.state NOT IN ('pending','sending')`, cid)
 	return err
 }

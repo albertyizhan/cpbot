@@ -92,6 +92,14 @@ def exercise(base, source, command, sql, dsn):
         assert calls[0]['params']['message_id'] == 77
         assert q('SELECT message FROM cpbot.proof_publications WHERE cluster_id=1') == '77'
 
+        q("INSERT INTO cpbot.chat_ownership VALUES (-1004001,1); "
+          "INSERT INTO cpbot.bindings(cluster_id,id,mode,chat_id,title) VALUES (1,100,'feed',-1004001,'旧版直发'); "
+          "INSERT INTO cpbot.publications(cluster_id,binding,review,generation,message,chat_id) VALUES (1,100,1,1,78,-1004001); "
+          "INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review) VALUES (1,'proof',100,1,1)")
+        drive(timed('tick', 13))
+        assert q("SELECT state,error FROM cpbot.jobs WHERE (cluster_id,binding,kind)=(1,100,'proof')") == (
+            'done|独立证明补发已取消')
+
         q("INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,generation) VALUES(1,'checkpost',1,1,20261125)")
         drive(timed('tick', 16), expected=[failure('editMessageText', 400, 'Bad Request: message to edit not found')])
         assert q('SELECT message,root,generation FROM cpbot.posts ORDER BY cluster_id') == '||2\n20|30|1'
@@ -146,10 +154,31 @@ def exercise(base, source, command, sql, dsn):
         assert q("SELECT state,error FROM cpbot.jobs WHERE cluster_id=1 AND kind='health' AND generation=20261127") == (
             'blocked|目标类型不符合绑定模式')
         assert q('SELECT active,error FROM cpbot.bindings WHERE (cluster_id,id)=(1,1)') == '0|目标类型不符合绑定模式'
+
+        # Replay a review that fit before a username was observed. The later
+        # short review must still publish while the overlong review is corrected.
+        base_caption = photo['caption']
+        process_size = 1020 - (len(base_caption) - len('车评1'))
+        q("UPDATE cpbot.bindings SET active=1,error='' WHERE (cluster_id,id)=(1,1); "
+          "INSERT INTO cpbot.people(cluster_id,user_id,username) VALUES (1,42,'teacher_live'); "
+          "INSERT INTO cpbot.reviews(cluster_id,id,author,identity,teacher,data,anonymous,status,created,submission) "
+          "SELECT 1,v.id,r.author,r.identity,1,r.data || jsonb_build_object('过程', v.body, '时间', v.date),1,'accepted',r.created,'audit-'||v.id "
+          "FROM cpbot.reviews r CROSS JOIN (VALUES "
+          f"(2,repeat('长',{process_size}),'2026-11-24'),(3,'短评','2026-11-25')) AS v(id,body,date) WHERE (r.cluster_id,r.id)=(1,1); "
+          "INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation) VALUES (1,'comment',1,1,2,2),(1,'comment',1,1,3,2)")
+        _, calls = drive(timed('tick', 90), timed('tick', 94), expected=[success('sendPhoto', {'message_id': 105})])
+        assert '【老师】：老师1\n@teacher_live\n' in calls[0]['params']['caption']
+        assert '【过程】：短评' in calls[0]['params']['caption']
+        assert q("SELECT state,error FROM cpbot.jobs WHERE (cluster_id,review,kind)=(1,2,'comment')").startswith(
+            'blocked|图片说明最多 1024 字')
+        assert q("SELECT count(*) FROM cpbot.publications WHERE (cluster_id,review)=(1,2)") == '0'
+        assert q("SELECT count(*) FROM cpbot.jobs WHERE (cluster_id,review,kind)=(1,2,'proof')") == '0'
+
         return ['pending_proof_no_blind_retry', 'admin_remote_id_registration', 'replica_rebuild',
                 'automatic_forward_wait_and_mapping', 'thread_photo_comment_markup', 'single_multipart_photo_and_caption',
                 'telegram_429_and_global_pacing', 'telegram_502_uncertain', 'admin_confirmation_preserves_photo_type',
-                'nightly_once_per_day', 'paused_cluster_excluded', 'withdrawn_proof_replaced', 'invalid_binding_blocked']
+                'nightly_once_per_day', 'paused_cluster_excluded', 'withdrawn_proof_replaced', 'invalid_binding_blocked',
+                'no_new_legacy_proof_reply', 'overlong_caption_blocks_only_affected_review']
     finally:
         server.shutdown()
         server.server_close()

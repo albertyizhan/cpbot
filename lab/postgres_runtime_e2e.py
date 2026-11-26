@@ -28,7 +28,8 @@ def exercise_runtime(base, source, sql, dsn, image):
         "INSERT INTO cpbot.bindings(cluster_id,mode,chat_id,title) VALUES(1,'lookup',-1003001,'验收查档群')")
     sql('runtime', "INSERT INTO cpbot.chat_ownership VALUES(-1004001,1); "
         "INSERT INTO cpbot.bindings(cluster_id,mode,chat_id,title) VALUES(1,'feed',-1004001,'验收直发'); "
-        "INSERT INTO cpbot.people(cluster_id,user_id,username) VALUES(1,42,'teacher_live'); "
+        "UPDATE cpbot.teachers SET username='teacher_saved' WHERE (cluster_id,id)=(1,1); "
+        "INSERT INTO cpbot.people(cluster_id,user_id) VALUES(1,42); "
         "INSERT INTO cpbot.settings VALUES(1,'cluster_member_sources','[-1000101]')")
 
     class BotAPI(BaseHTTPRequestHandler):
@@ -178,7 +179,7 @@ def exercise_runtime(base, source, sql, dsn, image):
             start, _ = click(panel, '预览')
             preview = panel_for(start, '车评预览')
             assert '【综合】：6.5' in preview['params']['text']
-            assert '【老师】：老师1\n@teacher_live\n' in preview['params']['text']
+            assert '【老师】：老师1\n@teacher_saved\n' in preview['params']['text']
             start, submit_data = click(preview, '提交')
             panel_for(start, '车评 #2 已提交')
             start = callback(submit_data, preview['result']['message_id'])
@@ -188,11 +189,13 @@ def exercise_runtime(base, source, sql, dsn, image):
             for delivery in (public, feed):
                 params = delivery['params']
                 assert params['photo'] == image.hex()
-                assert '【老师】：老师1\n@teacher_live\n' in params['caption']
+                assert '【老师】：老师1\n@teacher_saved\n' in params['caption']
                 assert '【综合】：6.5' in params['caption'] and '【作者】' not in params['caption']
                 assert '真实进程端到端验收 &lt;&amp;&gt;' in params['caption']
+                assert params['reply_markup']['inline_keyboard'] == [[{
+                    'text': '评价当前老师', 'url': 'https://t.me/review_bot?start=c1_review_1',
+                }]]
             assert public['params']['reply_parameters']['message_id'] == 30
-            assert public['params']['reply_markup']['inline_keyboard'][0][0]['text'] == '评价当前老师'
             assert 'reply_parameters' not in feed['params']
             wait_for(lambda e: e['method'] == 'getUpdates' and e['params']['offset'] == update_id, start=0)
             assert sql('runtime', "SELECT author,status,data->>'综合' FROM cpbot.reviews WHERE (cluster_id,id)=(1,2)") == '1|accepted|6.5'
@@ -216,6 +219,8 @@ def exercise_runtime(base, source, sql, dsn, image):
             listing = panel_for(start, '老师1 · 车评')
             assert f"#{2} · 2026-11-25" in listing['params']['text']
 
+            panel_for(private('/start', user=42, date=int(datetime.now().timestamp()), **{
+                'from': {'id': 42, 'username': 'teacher_live', 'first_name': '老师1'}}), '车评主菜单', user=42)
             sql('runtime', "INSERT INTO cpbot.drafts(cluster_id,user_id,data,token) "
                 "SELECT 1,2,data || jsonb_build_object('过程',repeat('长',1200)),'long-draft' "
                 "FROM cpbot.reviews WHERE (cluster_id,id)=(1,2)")
@@ -228,11 +233,17 @@ def exercise_runtime(base, source, sql, dsn, image):
             start, _ = click(proof_panel, '移除证明', user=2)
             clean_draft = panel_for(start, '已移除出击证明', user=2)
             start, _ = click(clean_draft, '提交', user=2)
-            panel_for(start, '已提交', user=2)
+            submitted = panel_for(start, '已提交', user=2)
+            plain_review_id = int(re.search(r'车评 #(\d+) 已提交', submitted['params']['text']).group(1))
+            plain_deliveries = []
             for chat in (-1000101, -1004001):
                 plain = wait_for(lambda e: e['method'] == 'sendMessage' and e['params']['chat_id'] == chat, start)
                 assert '【老师】：老师1\n@teacher_live\n' in plain['params']['text']
                 assert '长' * 1200 in plain['params']['text']
+                assert plain['params']['reply_markup'] == feed['params']['reply_markup']
+                plain_deliveries.append(plain)
+            assert plain_deliveries[0]['params']['reply_parameters']['message_id'] == 30
+            assert 'reply_parameters' not in plain_deliveries[1]['params']
 
             start = submit_update({'message': {'chat': {'type': 'supergroup', 'id': -1003001},
                 'message_id': 98, 'from': {'id': 1}, 'date': 1760000100, 'text': '@customer'}})
@@ -260,6 +271,22 @@ def exercise_runtime(base, source, sql, dsn, image):
             admin = panel_for(start, '已导入 2 位老师')
             panel_for(private('/start', user=99991, **{'from': {'id': 99991, 'username': 'waitingteacher'}}), '车评主菜单', user=99991)
             assert sql('runtime', "SELECT user_id FROM cpbot.teachers WHERE name='新增甲'") == '99991'
+            start, _ = click(admin, '👩‍🏫 老师列表')
+            roster = panel_for(start, '老师列表')
+            new_teacher = next(button['text'] for row in roster['params']['reply_markup']['inline_keyboard']
+                               for button in row if button['text'].startswith('新增乙 · #'))
+            start, _ = click(roster, new_teacher)
+            detail = panel_for(start, '车评用户名：暂无')
+            binding = next(line for line in detail['params']['text'].splitlines() if line.startswith('已绑定本人账号'))
+            start, _ = click(detail, '登记用户名')
+            panel_for(start, '发送老师的 Telegram @用户名')
+            panel_for(private('@teacher_live'), '此用户名属于另一个已知账号')
+            detail = panel_for(private('@new_teacher_b'), '车评显示：@new_teacher_b')
+            assert binding in detail['params']['text'].splitlines()
+            start, _ = click(detail, '返回老师列表')
+            roster = panel_for(start, '老师列表')
+            start, _ = click(roster, '返回管理后台')
+            admin = panel_for(start, '管理后台')
             start, _ = click(admin, '评论按钮')
             grid = panel_for(start, '选择格子编辑')
             start, _ = click(grid, '＋')
@@ -270,6 +297,22 @@ def exercise_runtime(base, source, sql, dsn, image):
             start, _ = click(cell, '返回格子')
             grid = panel_for(start, '选择格子编辑')
             start, _ = click(grid, '返回')
+            admin = panel_for(start, '管理后台')
+            start, _ = click(admin, '📤 发布任务')
+            jobs = panel_for(start, '发布任务')
+            resume, _ = click(jobs, '继续任务')
+            jobs = panel_for(resume, '发布任务')
+            published = [(2, public), (2, feed)]
+            published.extend((plain_review_id, plain) for plain in plain_deliveries)
+            for review_id, delivery in published:
+                target = delivery['params']['chat_id'], delivery['result']['message_id']
+                updated = wait_for(lambda e: e['method'] == 'editMessageReplyMarkup' and
+                                   (e['params']['chat_id'], e['params']['message_id']) == target, resume)
+                assert updated['params']['reply_markup']['inline_keyboard'] == [[
+                    {'text': '评价当前老师', 'url': 'https://t.me/review_bot?start=c1_review_1'},
+                    {'text': '关于评价', 'url': f'https://example.invalid/{review_id}'},
+                ]]
+            start, _ = click(jobs, '返回')
             admin = panel_for(start, '管理后台')
             start, _ = click(admin, '💾 导出数据备份')
             admin = panel_for(start, '备份文件已发送')
@@ -305,9 +348,12 @@ def exercise_runtime(base, source, sql, dsn, image):
             assert sql('runtime', 'SELECT cluster_id FROM cpbot.cluster_management_groups WHERE chat_id=-1005001') == '9'
             return ['running_go_bot_with_persisted_offset', 'member_denied_for_deep_link', 'legacy_review_link',
                     'form_photo_and_score_validation', 'stale_submit_button', 'single_photo_caption_in_thread_and_feed',
-                    'teacher_username_below_teacher', 'overlong_caption_preserves_draft', 'optional_proof_removal_and_plain_publication',
+                    'saved_username_with_empty_identity', 'observed_username_takes_precedence',
+                    'overlong_caption_preserves_draft', 'optional_proof_removal_and_plain_publication',
                     'my_reviews_and_teacher_directory', 'group_lookup_tag_deep_link_and_cluster_isolation',
-                    'pause_queue_and_bulk_teacher_identity', 'comment_button_panel', 'backup_and_restore_preserve_photo_format', 'register_new_cluster']
+                    'pause_queue_and_bulk_teacher_identity', 'admin_registers_username_without_rebinding',
+                    'default_buttons_on_thread_and_feed_photo_and_text', 'button_config_edits_existing_thread_and_feed_posts',
+                    'backup_and_restore_preserve_photo_format', 'register_new_cluster']
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)

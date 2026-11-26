@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"cpbot/internal/publish"
+	"cpbot/internal/teacherprofile"
 	"cpbot/internal/telegram"
 	"github.com/jackc/pgx/v5"
 )
@@ -289,8 +290,7 @@ func Submit(ctx context.Context, db *pgx.Conn, source string, cid, user int64, t
 func TeacherDisplay(ctx context.Context, db interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, cid, tid int64) (name, handle string, err error) {
-	err = db.QueryRow(ctx, `SELECT t.name,coalesce(CASE WHEN p.id IS NOT NULL THEN p.username ELSE t.username END,'')
-		FROM cpbot.teachers t LEFT JOIN cpbot.people p ON (p.cluster_id,p.user_id)=(t.cluster_id,t.user_id)
-		WHERE (t.cluster_id,t.id)=($1,$2) AND t.deleted_at IS NULL`, cid, tid).Scan(&name, &handle)
+	err = db.QueryRow(ctx, `SELECT t.name,`+teacherprofile.Username+` FROM cpbot.teachers t`+teacherprofile.JoinPeople+
+		`WHERE (t.cluster_id,t.id)=($1,$2) AND t.deleted_at IS NULL`, cid, tid).Scan(&name, &handle)
 	return
 }

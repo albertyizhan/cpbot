@@ -127,7 +127,7 @@ func (w *Worker) Tick(ctx context.Context, now time.Time) error {
 	if next := w.nextChat[j.destination()]; now.Before(next) {
 		return w.deferJob(ctx, j, next, "")
 	}
-	if j.mode == "thread" && j.root == nil && (j.kind == "comment" || j.kind == "check" || j.kind == "proof") {
+	if j.mode == "thread" && j.root == nil && (j.kind == "comment" || j.kind == "check") {
 		return w.deferJob(ctx, j, now.Add(10*time.Second), "等待频道自动转发到讨论组")
 	}
 	reason, err := w.waitForOtherJobs(ctx, j)
@@ -153,9 +153,6 @@ func (w *Worker) Tick(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return w.handleFailure(ctx, j, now, err)
 	}
-	if result.waitForText {
-		return w.deferJob(ctx, j, now.Add(3*time.Second), "等待评价正文发布")
-	}
 	return w.complete(ctx, j, result)
 }
 
@@ -171,9 +168,10 @@ func (w *Worker) waitForOtherJobs(ctx context.Context, j job) (string, error) {
 		EXISTS(SELECT 1 FROM cpbot.jobs x JOIN cpbot.reviews other ON (other.cluster_id,other.id)=(x.cluster_id,x.review)
 			JOIN cpbot.reviews current ON (current.cluster_id,current.id)=($1,$4)
 			WHERE $6 IN ('comment','check') AND x.cluster_id=$1 AND x.binding=$2 AND x.teacher=$3
-			AND x.generation=$7 AND x.kind IN ('comment','proof') AND x.state NOT IN ('done','superseded')
+			AND x.generation=$7 AND x.kind='comment' AND x.state NOT IN ('done','superseded')
+			AND NOT (x.state='blocked' AND x.error=$8)
 			AND (other.data->>'时间',other.id)<(current.data->>'时间',current.id))`,
-		j.cid, j.binding, j.teacher, j.review, j.id, j.kind, j.replica()).Scan(&uncertain, &earlier)
+		j.cid, j.binding, j.teacher, j.review, j.id, j.kind, j.replica(), captionTooLongForPublish).Scan(&uncertain, &earlier)
 	if uncertain {
 		return "等待管理员核对上一次发送结果", err
 	}
@@ -190,12 +188,10 @@ func (w *Worker) deferJob(ctx context.Context, j job, until time.Time, reason st
 }
 
 type delivery struct {
-	location    string
-	message     int64
-	waitForText bool
-	photo       bool
-	legacyProof bool
-	note        string
+	location string
+	message  int64
+	photo    bool
+	note     string
 }
 
 func (w *Worker) complete(ctx context.Context, j job, result delivery) error {
@@ -208,20 +204,12 @@ func (w *Worker) complete(ctx context.Context, j job, result delivery) error {
 		case "publications":
 			_, err = tx.Exec(ctx, `INSERT INTO cpbot.publications(cluster_id,binding,review,generation,message,chat_id,photo)
 				VALUES($1,$2,$3,$4,$5,$6,$7)`, j.cid, j.binding, j.review, j.replica(), result.message, j.destination(), result.photo)
-		case "proof_publications":
-			_, err = tx.Exec(ctx, `INSERT INTO cpbot.proof_publications(cluster_id,binding,review,generation,message,chat_id)
-				VALUES($1,$2,$3,$4,$5,$6)`, j.cid, j.binding, j.review, j.replica(), result.message, j.destination())
 		}
 		if err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE cpbot.jobs SET state='done',error=$3 WHERE (cluster_id,id)=($1,$2)`, j.cid, j.id, result.note); err != nil {
 			return err
-		}
-		if result.legacyProof {
-			if err := Enqueue(ctx, tx, j.cid, "proof", j.binding, j.teacher, j.review, j.replica()); err != nil {
-				return err
-			}
 		}
 		if j.review != 0 && j.mode == "thread" && j.kind == "comment" {
 			return Enqueue(ctx, tx, j.cid, "summary", j.binding, j.teacher, 0, j.review+1000000)

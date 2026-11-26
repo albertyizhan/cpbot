@@ -103,6 +103,10 @@ func observePerson(ctx context.Context, tx pgx.Tx, cid int64, user telegram.User
 	if username != nil {
 		_, err = tx.Exec(ctx, `UPDATE cpbot.teachers SET user_id=$3 WHERE cluster_id=$1 AND deleted_at IS NULL AND user_id IS NULL
 			AND lower(username COLLATE "C")=$2 AND NOT EXISTS(SELECT 1 FROM cpbot.teachers WHERE (cluster_id,user_id)=($1,$3))`, cid, name, user.ID)
+	} else {
+		// A current observation without a username supersedes the saved hint.
+		_, err = tx.Exec(ctx, `UPDATE cpbot.teachers SET username=NULL WHERE (cluster_id,user_id)=($1,$2) AND username IS NOT NULL`,
+			cid, user.ID)
 	}
 	return p, err
 }

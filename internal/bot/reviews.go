@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"cpbot/internal/pgstore"
+	"cpbot/internal/teacherprofile"
 	"cpbot/internal/telegram"
 	"github.com/jackc/pgx/v5"
 )
@@ -317,10 +318,9 @@ func (b *Bot) teacherName(ctx context.Context, cid, tid int64) (string, error) {
 
 func (b *Bot) teacherList(ctx context.Context, uid int64, state panel) error {
 	state.page = max(0, state.page)
-	rows, err := b.db.Query(ctx, `SELECT t.id,t.name FROM cpbot.teachers t LEFT JOIN cpbot.people p
-		ON (p.cluster_id,p.user_id)=(t.cluster_id,t.user_id)
+	rows, err := b.db.Query(ctx, `SELECT t.id,t.name FROM cpbot.teachers t`+teacherprofile.JoinPeople+`
 		WHERE t.cluster_id=$1 AND t.deleted_at IS NULL AND
-		(($2 NOT LIKE '@%' AND strpos(lower(t.name),lower($2))>0) OR lower(coalesce(p.username,t.username) COLLATE "C")=lower(ltrim($2,'@') COLLATE "C"))
+		(($2 NOT LIKE '@%' AND strpos(lower(t.name),lower($2))>0) OR lower((`+teacherprofile.Username+`) COLLATE "C")=lower(ltrim($2,'@') COLLATE "C"))
 		ORDER BY t.id LIMIT 9 OFFSET $3`, state.cluster, state.search, state.page*8)
 	if err != nil {
 		return err
@@ -362,7 +362,7 @@ func (b *Bot) privateMessage(ctx context.Context, msg telegram.Message) error {
 	text := strings.TrimSpace(msg.Text)
 	parts := strings.Fields(text)
 	state, valid := b.panels[uid]
-	if len(parts) != 0 {
+	if len(parts) != 0 && strings.HasPrefix(parts[0], "/") {
 		command, suffix, _ := strings.Cut(parts[0], "@")
 		if suffix != "" && !strings.EqualFold(suffix, b.me.Username) {
 			return nil

@@ -226,16 +226,9 @@ func (w *Worker) ConfirmUncertain(ctx context.Context, cid, id, actor, message i
 				VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (cluster_id,binding,review,generation) DO UPDATE
 				SET message=excluded.message,chat_id=excluded.chat_id`, cid, j.binding, j.review, generation, message, j.destination())
 		case "comment", "check", "feed":
-			var insertedPhoto bool
-			err = tx.QueryRow(ctx, `INSERT INTO cpbot.publications (cluster_id,binding,review,generation,message,chat_id,photo)
+			_, err = tx.Exec(ctx, `INSERT INTO cpbot.publications (cluster_id,binding,review,generation,message,chat_id,photo)
 				VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (cluster_id,binding,review,generation) DO UPDATE
-				SET message=excluded.message,chat_id=excluded.chat_id RETURNING photo`, cid, j.binding, j.review, generation, message, j.destination(), attemptPhoto).Scan(&insertedPhoto)
-			if err == nil && !insertedPhoto && (j.mode != "thread" || j.replica() == generation) {
-				_, err = tx.Exec(ctx, `INSERT INTO cpbot.jobs(cluster_id,kind,binding,teacher,review,generation)
-					SELECT $1,'proof',$2,$3,$4,$5 FROM cpbot.reviews
-					WHERE (cluster_id,id)=($1,$4) AND coalesce(data->>'出击证明','')<>''
-					ON CONFLICT (cluster_id,kind,binding,teacher,review,generation) DO NOTHING`, cid, j.binding, j.teacher, j.review, generation)
-			}
+				SET message=excluded.message,chat_id=excluded.chat_id`, cid, j.binding, j.review, generation, message, j.destination(), attemptPhoto)
 		}
 		if err != nil {
 			return err

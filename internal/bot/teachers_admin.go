@@ -13,6 +13,7 @@ import (
 
 	"cpbot/internal/pgstore"
 	"cpbot/internal/publish"
+	"cpbot/internal/teacherprofile"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -49,11 +50,13 @@ func (b *Bot) teacherAdminAction(ctx context.Context, uid int64, state panel, ki
 		return true, b.adminPanel(ctx, uid, state, fmt.Sprintf("已导入 %d 位老师。", len(entries)))
 	case "admin.trashdays":
 		return true, b.promptAdmin(ctx, uid, state, kind, "请发送保留天数（1～3650）。", "admin.trash:0")
-	case "admin.trename", "admin.tbind":
+	case "admin.trename", "admin.tbind", "admin.tusername":
 		state.object = id
 		text := "发送新的老师名称（1～80 字）。"
 		if kind == "admin.tbind" {
 			text = "发送老师的 Telegram 数字 ID。"
+		} else if kind == "admin.tusername" {
+			text = "发送老师的 Telegram @用户名，或发送 - 清除登记。已绑定账号会优先使用机器人观测到的用户名。"
 		}
 		return true, b.promptAdmin(ctx, uid, state, kind, text, fmt.Sprintf("admin.teacher:%d", id))
 	case "admin.tunbind", "admin.tdelete", "admin.tpurge":
@@ -110,7 +113,7 @@ func (b *Bot) teacherAdminInput(ctx context.Context, uid int64, state panel, tex
 			return true, err
 		}
 		return true, b.adminTeachers(ctx, uid, state, 0, true)
-	case "admin.trename", "admin.tbind":
+	case "admin.trename", "admin.tbind", "admin.tusername":
 		if err := b.setTeacher(ctx, uid, state.cluster, state.object, strings.TrimPrefix(state.input, "admin."), text); err != nil {
 			return true, err
 		}
@@ -155,7 +158,10 @@ func (b *Bot) adminTeachers(ctx context.Context, uid int64, state panel, page in
 func (b *Bot) teacherDetail(ctx context.Context, uid int64, state panel, id int64, notice string) error {
 	var t teacherEntry
 	var deleted *float64
-	err := b.db.QueryRow(ctx, `SELECT name,user_id,username,deleted_at FROM cpbot.teachers WHERE (cluster_id,id)=($1,$2)`, state.cluster, id).Scan(&t.Name, &t.User, &t.Username, &deleted)
+	var handle string
+	err := b.db.QueryRow(ctx, `SELECT t.name,t.user_id,t.username,t.deleted_at,`+teacherprofile.Username+
+		` FROM cpbot.teachers t`+teacherprofile.JoinPeople+`WHERE (t.cluster_id,t.id)=($1,$2)`, state.cluster, id).
+		Scan(&t.Name, &t.User, &t.Username, &deleted, &handle)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pgstore.UserError("老师不存在。")
 	}
@@ -170,6 +176,11 @@ func (b *Bot) teacherDetail(ctx context.Context, uid int64, state panel, id int6
 	} else {
 		text += "\n未绑定本人账号，可按名称搜索。"
 	}
+	if handle != "" {
+		text += "\n车评显示：@" + strings.TrimPrefix(handle, "@")
+	} else {
+		text += "\n车评用户名：暂无"
+	}
 	if notice != "" {
 		text += "\n" + notice
 	}
@@ -179,6 +190,7 @@ func (b *Bot) teacherDetail(ctx context.Context, uid int64, state panel, id int6
 		rows = [][]choice{{button("彻底删除", "admin.tpurge")}, {{"返回回收站", "admin.trash:0"}}}
 	} else {
 		rows = [][]choice{{button("修改名称", "admin.trename"), button("绑定本人账号（可选）", "admin.tbind")}}
+		rows = append(rows, []choice{button("登记用户名", "admin.tusername")})
 		if t.User != nil || t.Username != nil {
 			rows = append(rows, []choice{button("解除本人绑定", "admin.tunbind")})
 		}
@@ -363,10 +375,29 @@ func (b *Bot) setTeacher(ctx context.Context, uid, cid, id int64, kind, text str
 			if parseErr != nil || account <= 0 {
 				return pgstore.UserError("请输入有效的 Telegram 数字 ID。")
 			}
-			tag, err = tx.Exec(ctx, `UPDATE cpbot.teachers SET user_id=$3,username=NULL WHERE (cluster_id,id)=($1,$2) AND deleted_at IS NULL`, cid, id, account)
-			if err != nil {
+			tag, err = tx.Exec(ctx, `UPDATE cpbot.teachers SET user_id=$3,
+				username=CASE WHEN user_id IS NULL OR user_id=$3 THEN username END
+				WHERE (cluster_id,id)=($1,$2) AND deleted_at IS NULL`, cid, id, account)
+		case "tusername":
+			var handle *string
+			if text != "-" {
+				name := strings.ToLower(strings.TrimPrefix(text, "@"))
+				if !teacherUsername.MatchString(name) {
+					return pgstore.UserError("请输入有效的 Telegram @用户名，或发送 - 清除登记。")
+				}
+				handle = &name
+			}
+			var occupied bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM cpbot.teachers t JOIN cpbot.people p
+				ON p.cluster_id=t.cluster_id AND lower(p.username COLLATE "C")=$3
+				WHERE (t.cluster_id,t.id)=($1,$2) AND t.user_id<>p.user_id)`, cid, id, handle).Scan(&occupied); err != nil {
 				return err
 			}
+			if occupied {
+				return pgstore.UserError("此用户名属于另一个已知账号，请核对老师的数字 ID。")
+			}
+			tag, err = tx.Exec(ctx, `UPDATE cpbot.teachers SET username=$3
+				WHERE (cluster_id,id)=($1,$2) AND deleted_at IS NULL`, cid, id, handle)
 		case "tunbind":
 			tag, err = tx.Exec(ctx, `UPDATE cpbot.teachers SET user_id=NULL,username=NULL WHERE (cluster_id,id)=($1,$2) AND deleted_at IS NULL`, cid, id)
 		}

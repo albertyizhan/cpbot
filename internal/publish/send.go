@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"cpbot/internal/teacherprofile"
 	"cpbot/internal/telegram"
 	"github.com/jackc/pgx/v5"
 )
@@ -38,11 +39,10 @@ type review struct {
 
 func (w *Worker) review(ctx context.Context, j job) (review, error) {
 	var r review
-	err := w.db.QueryRow(ctx, `SELECT r.data,r.status,t.name,r.author,r.anonymous,coalesce(r.identity->>'username',''),
-		coalesce(CASE WHEN p.id IS NOT NULL THEN p.username ELSE t.username END,'')
-		FROM cpbot.reviews r JOIN cpbot.teachers t ON (t.cluster_id,t.id)=(r.cluster_id,r.teacher)
-		LEFT JOIN cpbot.people p ON (p.cluster_id,p.user_id)=(t.cluster_id,t.user_id)
-		WHERE (r.cluster_id,r.id)=($1,$2)`, j.cid, j.review).
+	err := w.db.QueryRow(ctx, `SELECT r.data,r.status,t.name,r.author,r.anonymous,coalesce(r.identity->>'username',''),`+
+		teacherprofile.Username+` FROM cpbot.reviews r
+		JOIN cpbot.teachers t ON (t.cluster_id,t.id)=(r.cluster_id,r.teacher)`+teacherprofile.JoinPeople+
+		`WHERE (r.cluster_id,r.id)=($1,$2)`, j.cid, j.review).
 		Scan(&r.data, &r.status, &r.name, &r.author, &r.anon, &r.authorUsername, &r.teacherUsername)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, jobError("评价已不存在")
@@ -53,6 +53,7 @@ func (w *Worker) review(ctx context.Context, j job) (review, error) {
 const maxCaption = 1024
 
 const CaptionTooLong = "图片说明最多 1024 字（含评价各字段）。请缩短过程或移除出击证明。"
+const captionTooLongForPublish = "图片说明最多 1024 字。请在「车评处理」缩短过程，再重试发布任务。"
 
 func renderReview(id int64, r review) (string, int, error) {
 	var lines []string
@@ -289,7 +290,7 @@ func (w *Worker) publication(ctx context.Context, table string, j job, generatio
 }
 
 func (w *Worker) sendReview(ctx context.Context, j job) (delivery, error) {
-	if j.kind == "commentbuttons" && (j.mode != "thread" || j.replica() != j.revision) {
+	if j.kind == "commentbuttons" && ((j.mode != "thread" && j.mode != "feed") || j.replica() != j.revision) {
 		return delivery{}, nil
 	}
 	r, err := w.review(ctx, j)
@@ -313,16 +314,13 @@ func (w *Worker) sendReview(ctx context.Context, j job) (delivery, error) {
 		if photo {
 			return delivery{}, nil
 		}
-		return w.sendProof(ctx, j, r, message)
+		return w.editLegacyProof(ctx, j, r)
 	}
-	var markup telegram.Params
-	if j.mode == "thread" {
-		markup = emptyKeyboard()
-		if r.status == "accepted" {
-			markup, err = w.commentKeyboard(ctx, j)
-			if err != nil {
-				return delivery{}, err
-			}
+	markup := emptyKeyboard()
+	if r.status == "accepted" {
+		markup, err = w.commentKeyboard(ctx, j)
+		if err != nil {
+			return delivery{}, err
 		}
 	}
 	if j.kind == "commentbuttons" {
@@ -344,12 +342,9 @@ func (w *Worker) sendReview(ctx context.Context, j job) (delivery, error) {
 				return delivery{}, w.neutralProof(ctx, chat, message, text)
 			}
 			if size > maxCaption {
-				return delivery{}, jobError(CaptionTooLong)
+				return delivery{}, jobError(captionTooLongForPublish)
 			}
-			params := telegram.Params{"chat_id": chat, "message_id": message, "caption": text, "parse_mode": "HTML"}
-			if markup != nil {
-				params["reply_markup"] = markup
-			}
+			params := telegram.Params{"chat_id": chat, "message_id": message, "caption": text, "parse_mode": "HTML", "reply_markup": markup}
 			return delivery{}, w.api.CallOnce(ctx, "editMessageCaption", params, nil)
 		}
 		return delivery{}, w.edit(ctx, chat, message, text, markup)
@@ -357,14 +352,16 @@ func (w *Worker) sendReview(ctx context.Context, j job) (delivery, error) {
 	if r.status != "accepted" {
 		return delivery{}, nil
 	}
-	params := telegram.Params{"chat_id": j.destination(), "parse_mode": "HTML"}
+	params := telegram.Params{"chat_id": j.destination(), "parse_mode": "HTML", "reply_markup": markup}
 	if j.mode == "thread" {
 		params["reply_parameters"] = reply(*j.root)
-		params["reply_markup"] = markup
 	}
 	var name string
 	_ = json.Unmarshal(r.data["出击证明"], &name)
-	if name != "" && size <= maxCaption {
+	if name != "" {
+		if size > maxCaption {
+			return delivery{}, jobError(captionTooLongForPublish)
+		}
 		content, err := w.readProof(j, r)
 		if err != nil {
 			return delivery{}, err
@@ -383,9 +380,7 @@ func (w *Worker) sendReview(ctx context.Context, j job) (delivery, error) {
 		return delivery{location: "publications", message: sent.ID, photo: true}, nil
 	}
 	params["text"] = text
-	result, err := w.newMessage(ctx, "publications", params)
-	result.legacyProof = name != ""
-	return result, err
+	return w.newMessage(ctx, "publications", params)
 }
 
 func reply(message int64) telegram.Params {
@@ -405,43 +400,19 @@ func (w *Worker) proofPath(cid int64, name string) (string, error) {
 	return filepath.Join(folder, "proofs", name), nil
 }
 
-func (w *Worker) sendProof(ctx context.Context, j job, r review, textMessage int64) (delivery, error) {
-	var name string
-	_ = json.Unmarshal(r.data["出击证明"], &name)
-	if name == "" {
-		return delivery{}, nil
-	}
-	if textMessage == 0 {
-		return delivery{waitForText: true}, nil
-	}
+func (w *Worker) editLegacyProof(ctx context.Context, j job, r review) (delivery, error) {
 	message, chat, err := w.publication(ctx, "proof_publications", j, j.replica())
 	if err != nil {
 		return delivery{}, err
 	}
+	if message == 0 {
+		return delivery{note: "独立证明补发已取消"}, nil
+	}
 	if r.status != "accepted" {
-		if message != 0 {
-			return delivery{}, w.neutralProof(ctx, chat, message, "此评价已由管理员撤下。")
-		}
-		return delivery{}, nil
+		return delivery{}, w.neutralProof(ctx, chat, message, "此评价已由管理员撤下。")
 	}
 	caption := fmt.Sprintf("📷 出击证明 · 车评 #%d", j.review)
-	if message != 0 {
-		return delivery{}, w.api.CallOnce(ctx, "editMessageCaption", telegram.Params{"chat_id": chat, "message_id": message, "caption": caption}, nil)
-	}
-	content, err := w.readProof(j, r)
-	if err != nil {
-		return delivery{}, err
-	}
-	var sent telegram.Message
-	err = w.api.PhotoOnce(ctx, "sendPhoto", telegram.Params{"chat_id": j.destination(), "caption": caption,
-		"reply_parameters": reply(textMessage)}, "proof.jpg", content, &sent)
-	if err != nil {
-		return delivery{}, err
-	}
-	if sent.ID <= 0 {
-		return delivery{}, &telegram.Error{}
-	}
-	return delivery{location: "proof_publications", message: sent.ID}, nil
+	return delivery{}, w.api.CallOnce(ctx, "editMessageCaption", telegram.Params{"chat_id": chat, "message_id": message, "caption": caption}, nil)
 }
 
 func (w *Worker) readProof(j job, r review) ([]byte, error) {
@@ -511,7 +482,8 @@ func (w *Worker) neutralProof(ctx context.Context, chat, message int64, caption 
 		return err
 	}
 	return w.api.PhotoOnce(ctx, "editMessageMedia", telegram.Params{"chat_id": chat, "message_id": message,
-		"media": telegram.Params{"type": "photo", "media": "attach://photo", "caption": caption, "parse_mode": "HTML"}}, "removed.png", content.Bytes(), nil)
+		"reply_markup": emptyKeyboard(),
+		"media":        telegram.Params{"type": "photo", "media": "attach://photo", "caption": caption, "parse_mode": "HTML"}}, "removed.png", content.Bytes(), nil)
 }
 
 func unchanged(description string) bool {
