@@ -15,6 +15,8 @@
 3. 用 `curl -fsS http://127.0.0.1:8091/healthz` 检查数据库连接和 HTTP 服务。再把小程序 HTTPS 根地址写入 `CPBOT_MINI_APP_URL`，用 `bash manage.sh restart` 重读机器人配置。
 4. 在 Telegram 私聊发送 `/start`。用有权限的成员验收首页、老师搜索、日期筛选、图片放大和原帖跳转，再用无权限的成员核对访问受限状态。
 
+使用 `bash manage.sh update` 更新 Go 版本时，构建和机器人更新成功后，脚本会重启正在运行的 `cpbot-mini-app.service`。首次用旧脚本拉取这项修复时，更新完成后需执行一次 `sudo systemctl restart cpbot-mini-app.service`，再退出 Telegram 小程序并重新打开。
+
 临时隐藏入口时，清空 `CPBOT_MINI_APP_URL` 后重启机器人。需要同时关闭小程序服务时，停止对应的 systemd 服务。
 
 ## 独立环境验收

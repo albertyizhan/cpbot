@@ -255,8 +255,20 @@ def install():
     Path('/etc/systemd/system/cpbot.service').write_text(unit)
 
 
-def ctl(*args, **kwargs):
-    return subprocess.run(['systemctl', *args, 'cpbot.service'], **kwargs)
+def ctl(*args, unit='cpbot.service', **kwargs):
+    return subprocess.run(['systemctl', *args, unit], **kwargs)
+
+
+def restart_mini_app():
+    unit = 'cpbot-mini-app.service'
+    state = ctl('is-active', '--quiet', unit=unit)
+    if state.returncode in (3, 4):  # Inactive or not installed.
+        return
+    state.check_returncode()
+    ctl('try-restart', unit=unit, check=True)
+    time.sleep(3)
+    ctl('is-active', '--quiet', unit=unit, check=True)
+    print('小程序服务已重启。')
 
 
 def update():
@@ -268,7 +280,8 @@ def update():
         raise ValueError('有尚未提交的代码修改，请先处理；未停止服务或覆盖文件。')
     git('rev-parse', '--verify', '@{upstream}', check=True, stdout=subprocess.DEVNULL)
     was_active = ctl('is-active', '--quiet').returncode == 0
-    if engine() == 'go':
+    go_mode = engine() == 'go'
+    if go_mode:
         ctl('stop', check=True)
         try:
             archive = backup()
@@ -289,7 +302,7 @@ def update():
         raise ValueError('Git 拉取失败，已恢复原服务运行状态。请处理上方 Git 报错后重试；备份：%s' % archive) from None
     try:
         subprocess.run(['bash', '-n', str(ROOT / 'manage.sh')], check=True)
-        if engine() == 'go':
+        if go_mode:
             build_go()
             go_command('check')
         for path in (ROOT / 'cpbot').glob('*.py'):
@@ -303,6 +316,12 @@ def update():
     except (OSError, SyntaxError, subprocess.CalledProcessError):
         ctl('stop', check=True)
         raise ValueError('代码已拉取，但校验或启动失败，服务保持停止。请查看日志并按备份恢复；备份：%s' % archive) from None
+    if go_mode:
+        try:
+            restart_mini_app()
+        except (OSError, subprocess.CalledProcessError):
+            raise ValueError('机器人更新步骤已完成，小程序服务检查或重启失败。'
+                             '请运行 journalctl -u cpbot-mini-app.service -n 50 --no-pager 查看日志。') from None
     print('Git 更新完成。' + ('原服务已重新启动，请查看日志确认 Telegram 连接。' if was_active else '原服务未运行，保持停止。'))
 
 
