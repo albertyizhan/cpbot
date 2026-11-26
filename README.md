@@ -2,12 +2,12 @@
 
 独立 Telegram 机器人，使用自己的 Token、数据库和服务。与 xcbot 无数据库、接口或运行时连接。
 
-现有部署默认使用 Python 3.9+ 和 SQLite。计划切换到 Go + PostgreSQL 的部署请先完成[迁移演练](docs/GO_MIGRATION.md)。
+配置模板使用 Go + PostgreSQL。已有 Python/SQLite 部署按[迁移指南](docs/GO_MIGRATION.md)切换。
 
 ## 开始使用
 
-1. 将 `.env.example` 复制为 `.env`，填写 `BOT_TOKEN` 和 `SUPERADMIN_IDS`，例如 `SUPERADMIN_IDS=123456789,987654321`。旧 `SUPERADMIN_ID` 仍兼容，两项同时设置时取并集。
-2. 运行 `python3 -m cpbot`。
+1. 首次配置时，将 `.env.example` 复制为 `.env`，填写 `BOT_TOKEN`、`SUPERADMIN_IDS` 和 `DATABASE_URL`。多个 Superadmin ID 用逗号分隔。旧 `SUPERADMIN_ID` 仍兼容，两项同时设置时取并集。
+2. 确认 PostgreSQL 已有 `cpbot` schema 后，运行 `bash manage.sh build-go`，再以 root 运行 `bash manage.sh install` 安装并启动服务。启用「查车评」入口见 [Mini App 部署说明](docs/MINI_APP.md)。
 3. 为已有集群设置服务时，私聊发送 `/admin`，进入「频道 / 群绑定」。给新群开通服务时，先按下文用激活码注册集群。
 4. 按用途绑定目标。要发布车评，将机器人设为频道管理员并授予发布、编辑消息权限。仅「老师专帖」需要另行关联讨论组，并将机器人设为讨论组管理员。
 5. 只需在群内查档时，将机器人设为群管理员并绑定「内部查档」即可。

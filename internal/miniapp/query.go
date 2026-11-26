@@ -43,8 +43,11 @@ type review struct {
 	Text      string  `json:"text,omitempty"`
 	Score     string  `json:"score,omitempty"`
 	Link      string  `json:"link,omitempty"`
+	HasProof  bool    `json:"hasProof,omitempty"`
 	Created   float64 `json:"created"`
 }
+
+const visibleReview = `r.status='accepted' AND t.deleted_at IS NULL AND ` + clusterEnabled
 
 type reviewPage struct {
 	Items   []review `json:"items"`
@@ -196,11 +199,11 @@ func (s *server) reviews(ctx context.Context, profile *teacher, ids []int64, cur
 		CASE WHEN pub.chat_id IS NULL THEN '' ELSE coalesce(r.data->>'过程','') END,
 		CASE WHEN pub.chat_id IS NULL THEN '' ELSE coalesce(r.data->>'综合','') END,
 		CASE WHEN pub.chat_id::text ~ '^-100[1-9][0-9]*$' AND pub.message>0
-			THEN 'https://t.me/c/'||substr(pub.chat_id::text,5)||'/'||pub.message END,r.created
+			THEN 'https://t.me/c/'||substr(pub.chat_id::text,5)||'/'||pub.message END,`+publishedProof+`,r.created
 		FROM cpbot.reviews r
 		JOIN cpbot.teachers t ON (t.cluster_id,t.id)=(r.cluster_id,r.teacher)
 		JOIN cpbot.clusters c ON c.id=r.cluster_id `+pgstore.BestPublication+`
-		WHERE r.cluster_id=ANY($1) AND r.status='accepted' AND t.deleted_at IS NULL AND `+clusterEnabled+filter+`
+		WHERE r.cluster_id=ANY($1) AND `+visibleReview+filter+`
 		ORDER BY `+order+` LIMIT $2`, args...)
 	page := reviewPage{Items: make([]review, 0, pageSize), Teacher: profile}
 	if err != nil {
@@ -210,7 +213,7 @@ func (s *server) reviews(ctx context.Context, profile *teacher, ids []int64, cur
 	for rows.Next() {
 		var item review
 		var link *string
-		if err := rows.Scan(&item.ClusterID, &item.ID, &item.TeacherID, &item.Teacher, &item.Cluster, &item.Date, &item.Text, &item.Score, &link, &item.Created); err != nil {
+		if err := rows.Scan(&item.ClusterID, &item.ID, &item.TeacherID, &item.Teacher, &item.Cluster, &item.Date, &item.Text, &item.Score, &link, &item.HasProof, &item.Created); err != nil {
 			return page, err
 		}
 		if len(page.Items) == pageSize {

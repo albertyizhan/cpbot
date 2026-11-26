@@ -5,6 +5,15 @@ const tg = window.Telegram?.WebApp;
 const search = $('search');
 const dialog = $('dates');
 const form = $('date-form');
+const viewer = $('proof-viewer');
+const viewerImage = $('proof-image');
+const proofCards = new WeakMap();
+let proofTrigger = null;
+const proofObserver = new IntersectionObserver(entries => {
+  for (const entry of entries) {
+    if (entry.isIntersecting) proofCards.get(entry.target)?.load();
+  }
+});
 const feed = { items: [], next: '', pending: null, loaded: false, request: null };
 let profile = null;
 let searchTimer, searchRequest;
@@ -33,9 +42,13 @@ function setStatus(id, message, retry) {
   if (retry) el.append(action('text-button', '重试', retry));
 }
 
-async function api(path, signal) {
+function telegramFetch(path, signal) {
   if (!tg?.initData) throw new Error('请从 Telegram 机器人打开小程序。');
-  const res = await fetch(path, { signal, headers: { Authorization: `Telegram ${tg.initData}` } });
+  return fetch(path, { signal, headers: { Authorization: `Telegram ${tg.initData}` } });
+}
+
+async function api(path, signal) {
+  const res = await telegramFetch(path, signal);
   const payload = await res.json();
   if (!res.ok) {
     const error = new Error(payload.message || '暂时无法读取车评。');
@@ -51,6 +64,72 @@ function identity(person) {
 
 function initial(name) {
   return Array.from(name.trim())[0] || '师';
+}
+
+function proofPreview(review) {
+  const controller = new AbortController();
+  let objectURL;
+  let path = `/api/reviews/${review.clusterId}/${review.id}/proof`;
+  const preview = action('proof-preview', '查看出击证明', () => {
+    if (!objectURL) {
+      load();
+      return;
+    }
+    proofTrigger = preview;
+    viewerImage.src = objectURL;
+    viewer.showModal();
+    tg?.BackButton?.show();
+  });
+
+  async function load() {
+    proofObserver.unobserve(preview);
+    if (controller.signal.aborted || preview.disabled || !path) return;
+    preview.disabled = true;
+    preview.textContent = '正在加载出击证明…';
+    try {
+      const res = await telegramFetch(path, controller.signal);
+      if (res.status === 404 || res.status === 401 || res.status === 403) {
+        preview.textContent = '出击证明不可查看';
+        path = '';
+        return;
+      }
+      if (!res.ok) throw new Error('图片请求失败');
+      const blob = await res.blob();
+      if (controller.signal.aborted) return;
+      objectURL = URL.createObjectURL(blob);
+      const image = node('img');
+      image.alt = '放大出击证明';
+      image.src = objectURL;
+      await image.decode();
+      if (controller.signal.aborted) return;
+      preview.replaceChildren(image);
+      preview.setAttribute('aria-haspopup', 'dialog');
+    } catch {
+      if (objectURL) URL.revokeObjectURL(objectURL);
+      objectURL = undefined;
+      preview.textContent = '图片加载失败 · 点按重试';
+    } finally {
+      preview.disabled = !path;
+    }
+  }
+
+  proofCards.set(preview, {
+    load,
+    dispose() {
+      proofObserver.unobserve(preview);
+      controller.abort();
+      if (objectURL) URL.revokeObjectURL(objectURL);
+    },
+  });
+  proofObserver.observe(preview);
+  return preview;
+}
+
+function clearCards(id) {
+  const target = $(id);
+  if (viewer.open && target.contains(proofTrigger)) viewer.close();
+  for (const preview of target.querySelectorAll('.proof-preview')) proofCards.get(preview).dispose();
+  target.replaceChildren();
 }
 
 function card(review, showTeacher) {
@@ -89,6 +168,7 @@ function card(review, showTeacher) {
     foot.append(expand);
     requestAnimationFrame(() => { expand.hidden = text.scrollHeight <= text.clientHeight + 1; });
   }
+  if (review.hasProof) item.append(proofPreview(review));
   if (review.link) {
     const link = node('a', '', 'Telegram 原帖 ↗');
     link.href = review.link;
@@ -119,7 +199,7 @@ function showScreen() {
   $('results').hidden = !searching;
   $('profile').hidden = !profile;
   $('clear-search').hidden = !search.value;
-  if (profile) tg?.BackButton?.show();
+  if (profile || viewer.open) tg?.BackButton?.show();
   else tg?.BackButton?.hide();
 }
 
@@ -130,7 +210,7 @@ function showFeed(page) {
   feed.first = JSON.stringify(page);
   feed.loaded = true;
   $('new-reviews').hidden = true;
-  $('feed').replaceChildren();
+  clearCards('feed');
   appendCards('feed', feed.items, true);
   $('more-feed').hidden = !feed.next;
   setStatus('feed-status', feed.items.length ? '' : '还没有可查看的车评。');
@@ -157,7 +237,7 @@ async function loadFeed(mode = 'initial') {
       lastRefresh = Date.now();
       if (mode !== 'auto') showFeed(page);
       else if (JSON.stringify(page) !== feed.first) {
-        if (window.scrollY < 36 && !$('home').hidden && !$('feed').contains(document.activeElement)) showFeed(page);
+        if (window.scrollY < 36 && !$('home').hidden && !viewer.open && !$('feed').contains(document.activeElement)) showFeed(page);
         else {
           feed.pending = page;
           $('new-reviews').hidden = false;
@@ -261,7 +341,7 @@ async function loadTeacher(more = false) {
   if (more) query.set('cursor', next);
   if (!more) {
     current.next = '';
-    $('teacher-reviews').replaceChildren();
+    clearCards('teacher-reviews');
     $('more-teacher').hidden = true;
     setStatus('profile-status', '正在加载车评…');
   }
@@ -320,19 +400,31 @@ form.addEventListener('submit', e => {
 });
 
 function back() {
-  if (dialog.open) dialog.close();
+  if (viewer.open) viewer.close();
+  else if (dialog.open) dialog.close();
   else if (profile) history.back();
 }
 window.addEventListener('popstate', e => {
+  if (viewer.open) viewer.close();
   if (dialog.open) dialog.close();
   if (e.state?.teacher) { enterTeacher(e.state.teacher); return; }
   profile?.request?.abort();
+  clearCards('teacher-reviews');
   profile = null;
   showScreen();
   window.scrollTo(0, $('home').hidden ? searchScroll : homeScroll);
   if (!$('home').hidden && !feed.loaded) loadFeed();
 });
 
+$('close-proof').addEventListener('click', () => viewer.close());
+viewer.addEventListener('click', e => {
+  if (e.target === viewer) viewer.close();
+});
+viewer.addEventListener('close', () => {
+  viewerImage.removeAttribute('src');
+  proofTrigger = null;
+  if (!profile) tg?.BackButton?.hide();
+});
 $('back').addEventListener('click', back);
 $('order').addEventListener('change', e => {
   profile.order = e.target.value;

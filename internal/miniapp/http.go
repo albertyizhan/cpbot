@@ -38,6 +38,7 @@ type accessEntry struct {
 type server struct {
 	db     *pgxpool.Pool
 	access accessPolicy
+	source string
 	key    []byte
 	mu     sync.Mutex
 	cache  map[int64]accessEntry
@@ -45,10 +46,10 @@ type server struct {
 	slots  chan struct{}
 }
 
-func Handler(db *pgxpool.Pool, access accessPolicy, token string) http.Handler {
+func Handler(db *pgxpool.Pool, access accessPolicy, token, source string) http.Handler {
 	key := hmac.New(sha256.New, []byte("WebAppData"))
 	key.Write([]byte(token))
-	s := &server{db: db, access: access, key: key.Sum(nil), cache: make(map[int64]accessEntry), slots: make(chan struct{}, 16)}
+	s := &server{db: db, access: access, source: source, key: key.Sum(nil), cache: make(map[int64]accessEntry), slots: make(chan struct{}, 16)}
 	web, err := fs.Sub(assets, "web")
 	if err != nil {
 		panic(err)
@@ -70,11 +71,12 @@ func Handler(db *pgxpool.Pool, access accessPolicy, token string) http.Handler {
 	mux.Handle("GET /api/feed", s.authorize(s.feed))
 	mux.Handle("GET /api/teachers", s.authorize(s.teachers))
 	mux.Handle("GET /api/teachers/{cluster}/{teacher}", s.authorize(s.teacherReviews))
+	mux.Handle("GET /api/reviews/{cluster}/{review}/proof", s.authorize(s.proof))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self' https://web.telegram.org https://*.web.telegram.org")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self' https://web.telegram.org https://*.web.telegram.org")
 		mux.ServeHTTP(w, r)
 	})
 }

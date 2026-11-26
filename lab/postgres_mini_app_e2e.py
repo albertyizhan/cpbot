@@ -7,15 +7,19 @@ import json
 import os
 from pathlib import Path
 import signal
+import struct
 import subprocess
 import tempfile
 import time
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = str(99) + chr(58) + "cpbot-mini-app-test"
+PROOF_NAME = '1' * 32 + '.jpg'
+MISSING_NAME = '2' * 32 + '.jpg'
 
 FIXTURE = """
 INSERT INTO cpbot.clusters(id,name) VALUES (1,'海湾评组'),(2,'私密评组');
@@ -48,6 +52,16 @@ INSERT INTO cpbot.publications(cluster_id,binding,review,generation,message,chat
 LIVE = """INSERT INTO cpbot.reviews(id,cluster_id,teacher,author,identity,data,anonymous,status,created,submission) VALUES
     (40,1,2,11,'{}','{"时间":"2026-11-20","综合":9.1,"过程":"这条车评来自一次使用真实数据库的实时更新。"}',1,'accepted',600,'new');
 INSERT INTO cpbot.publications(cluster_id,binding,review,generation,message,chat_id) VALUES (1,1,40,1,140,-100123);"""
+
+
+def proof_image(colors):
+    """Encode a synthetic 640 by 400 PNG using only the standard library."""
+    def chunk(kind, data):
+        return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
+
+    rows = b''.join(b'\0' + colors[y // 100] * 640 for y in range(400))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!IIBBBBB', 640, 400, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
 
 
 def init_data(uid=42, age=0):
@@ -85,8 +99,27 @@ def main():
     app = None
     checks = {}
     try:
-        sql('BEGIN;\n' + (ROOT / 'internal/pgstore/schema.sql').read_text() + '\n' + FIXTURE + '\nCOMMIT;')
-        config = {**env, 'BOT_TOKEN': TOKEN, 'SUPERADMIN_IDS': '42', 'ENV_FILE': str(out / 'no-production-env'),
+        schema = ROOT / 'internal/pgstore'
+        sql('BEGIN;\n' + (schema / 'schema.sql').read_text() + '\n' +
+            (schema / 'photo_publications.sql').read_text() + '\n' + FIXTURE + '\nCOMMIT;')
+        sql(f"""
+            UPDATE cpbot.reviews SET data=data||'{{"出击证明":"{PROOF_NAME}"}}'
+                WHERE (cluster_id=1 AND id IN(1,3,5,6,7,20)) OR cluster_id=2;
+            UPDATE cpbot.reviews SET data=data||'{{"出击证明":"{MISSING_NAME}"}}' WHERE (cluster_id,id)=(1,2);
+            UPDATE cpbot.publications SET photo=true WHERE (cluster_id,review) IN ((1,2),(1,3),(1,20),(2,1));
+            INSERT INTO cpbot.publications(cluster_id,binding,review,generation,message,chat_id,photo) VALUES
+                (1,1,6,1,106,-100123,true),(1,1,7,1,107,-100123,true);
+            INSERT INTO cpbot.proof_publications(cluster_id,binding,review,generation,message,chat_id)
+                VALUES (1,1,1,1,201,-100123);
+        """)
+        source = out / 'media' / 'bot.sqlite3'
+        image = proof_image([b'\x19\x36\x52', b'\x3c\x71\x8a', b'\xa5\xc7\xba', b'\xe7\xb0\x70'])
+        private_image = proof_image([b'\x5b\x30\x4f'] * 4)
+        for directory, content in [(source.parent, image), (Path(str(source) + '.clusters') / '2', private_image)]:
+            (directory / 'proofs').mkdir(parents=True)
+            (directory / 'proofs' / PROOF_NAME).write_bytes(content)
+        config = {**env, 'BOT_TOKEN': TOKEN, 'SUPERADMIN_IDS': '42,44', 'ENV_FILE': str(out / 'no-production-env'),
+                  'DATABASE_PATH': str(source),
                   'CPBOT_MINI_APP_LISTEN': '127.0.0.1:0', 'DATABASE_URL': f'host={out} user=fixture dbname=postgres sslmode=disable'}
         with (out / 'app.log').open('w') as log:
             app = subprocess.Popen([binary, 'serve-mini-app'], env=config, cwd=out, stdout=log, stderr=log)
@@ -108,9 +141,14 @@ def main():
             except HTTPError as error:
                 response = error
             with response:
-                body = response.read().decode()
-                assert response.status == code, (path, response.status, body)
-                return json.loads(body) if 'application/json' in response.headers.get('Content-Type', '') else body
+                body = response.read()
+                content_type = response.headers.get('Content-Type', '')
+                assert response.status == code, (path, response.status, body[:512])
+                if content_type.startswith('image/'):
+                    assert response.headers.get('Cache-Control') == 'no-store'
+                    assert content_type == 'image/png'
+                    return body
+                return json.loads(body) if 'application/json' in content_type else body.decode()
 
         signed = init_data()
         assert '<h1 id="home-title">最新车评</h1>' in get('/')
@@ -126,6 +164,8 @@ def main():
         assert [item['id'] for item in feed['items'][:5]] == ['3','2','4','1','5'], feed
         assert len(feed['items']) == 20 and feed['items'][0]['link'].endswith('/123/103'), feed
         assert 'text' not in feed['items'][4] and 'link' not in feed['items'][4], feed
+        assert {i['id'] for i in feed['items'] if i.get('hasProof')} == {'1','2','3','20'}, feed
+        assert PROOF_NAME not in json.dumps(feed)
         assert all('author' not in i and i['clusterId'] == '1' for i in feed['items']), feed
         more = get('/api/feed?' + urlencode({'cursor': feed['next']}), signed)
         assert len(more['items']) == 6
@@ -137,6 +177,7 @@ def main():
         assert not get('/api/teachers?q=gone', signed)['items']
         teacher = '/api/teachers/1/1'
         assert [item['id'] for item in get(teacher, signed)['items'][:4]] == ['3','1','5','2']
+        assert get(teacher, signed)['items'][1]['hasProof']
         first_old = get(teacher+'?order=asc', signed)
         assert [item['id'] for item in first_old['items'][:2]] == ['10','11']
         old_more = get(teacher+'?'+urlencode({'order': 'asc', 'cursor': first_old['next']}), signed)
@@ -146,6 +187,22 @@ def main():
         get(teacher+'?from=2026-11-25&to=2026-11-24', signed, code=400)
         assert not get(teacher+'?from=2026-11-26', signed)['items']
         checks['teacher_search_dates_and_both_orders'] = 'passed'
+        proof = '/api/reviews/1/3/proof'
+        get(proof, code=401)
+        assert get(proof, signed) == image
+        assert get('/api/reviews/1/1/proof', signed) == image
+        for hidden in (2, 4, 5, 6, 7):
+            get(f'/api/reviews/1/{hidden}/proof', signed, code=404)
+        sql("UPDATE cpbot.reviews SET status='withdrawn' WHERE (cluster_id,id)=(1,3);")
+        get(proof, signed, code=404)
+        sql("UPDATE cpbot.reviews SET status='accepted' WHERE (cluster_id,id)=(1,3);")
+        sql('INSERT INTO cpbot.cluster_authorizations VALUES (2);')
+        get('/api/reviews/2/1/proof', signed, code=404)
+        assert get('/api/reviews/2/1/proof', init_data(uid=44)) == private_image
+        sql('DELETE FROM cpbot.cluster_authorizations WHERE cluster_id=2;')
+        get('/api/reviews/2/1/proof', init_data(uid=44), code=404)
+        checks['local_proofs_inline_and_legacy_without_telegram'] = 'passed'
+        checks['proof_auth_cluster_withdrawal_and_missing_file'] = 'passed'
         (out / 'live.sql').write_text(LIVE)
         def publish_live(*_):
             if 'new_review_visible_without_restart' in checks:

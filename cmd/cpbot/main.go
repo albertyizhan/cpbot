@@ -55,7 +55,7 @@ func run(ctx context.Context, args []string) error {
 		if len(args) != 1 {
 			return errors.New(usage)
 		}
-		return serveMiniApp(ctx, dsn, strings.TrimSpace(os.Getenv("BOT_TOKEN")))
+		return serveMiniApp(ctx, dsn, strings.TrimSpace(os.Getenv("BOT_TOKEN")), source)
 	case "run-lab":
 		flags := flag.NewFlagSet("run-lab", flag.ContinueOnError)
 		source := flags.String("source", source, "SQLite 路径，用于运行锁和证明图布局")

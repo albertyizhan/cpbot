@@ -30,7 +30,7 @@ func miniAppURL() (string, error) {
 	return u.String(), nil
 }
 
-func serveMiniApp(ctx context.Context, dsn, token string) error {
+func serveMiniApp(ctx context.Context, dsn, token, source string) error {
 	if !tokenPattern.MatchString(token) {
 		return errors.New("请设置有效的 BOT_TOKEN")
 	}
@@ -79,7 +79,7 @@ func serveMiniApp(ctx context.Context, dsn, token string) error {
 	}
 	access := bot.NewLookupAccess(db, telegram.New(token), id, admins)
 	svc := &http.Server{
-		Handler: miniapp.Handler(db, access, token), ReadHeaderTimeout: 4 * time.Second,
+		Handler: miniapp.Handler(db, access, token, source), ReadHeaderTimeout: 4 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 12 * time.Second, IdleTimeout: 45 * time.Second,
 		MaxHeaderBytes: 16 << 10,
 	}
