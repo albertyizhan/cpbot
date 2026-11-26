@@ -114,6 +114,7 @@ func (b *Bot) adminPanel(ctx context.Context, uid int64, state panel, notice str
 		{{"📥 批量导入老师", "admin.teacherbatch"}, {"🗑 老师回收站", "admin.trash:0"}},
 		{{"📣 频道 / 群绑定", "admin.bindings:0"}, {"成员资格来源", "admin.sources:0"}},
 		{{"🎯 在群判定目标", "admin.target"}, {"评论按钮", "admin.buttons"}},
+		{{"🔐 管理权限", "admin.permissions:0"}},
 		{{"📤 发布任务", "admin.jobs:0"}, {"🛠 车评处理", "admin.review"}},
 		{{"💾 导出数据备份", "admin.export"}}, {{"返回主菜单", "home"}},
 	}
@@ -137,6 +138,9 @@ func (b *Bot) adminAction(ctx context.Context, uid int64, state panel, kind, arg
 		state.cluster = id
 	}
 	if err := b.requireAdmin(ctx, state.cluster, uid); err != nil {
+		return err
+	}
+	if handled, err := b.permissionAction(ctx, uid, state, kind, id); handled {
 		return err
 	}
 	switch kind {

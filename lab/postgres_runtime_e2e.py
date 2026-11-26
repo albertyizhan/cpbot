@@ -88,6 +88,15 @@ def exercise_runtime(base, source, sql, dsn, image):
                     cid = params['chat_id']
                     linked = {-1000001: -1000101, -1000101: -1000001, -1000002: -1000102, -1000102: -1000002}
                     result = {'id': cid, 'title': f'验收 {cid}', 'type': 'channel' if cid in (-1000001, -1000002, -1004001) else 'supergroup', 'linked_chat_id': linked.get(cid, 0)}
+                elif method == 'getChatAdministrators':
+                    result = [
+                        {'user': {'id': 710, 'first_name': '普通管理员'}, 'status': 'administrator'},
+                        {'user': {'id': 711, 'first_name': '群主'}, 'status': 'creator'},
+                        {'user': {'id': 712, 'first_name': '授权管理员'}, 'status': 'administrator', 'can_promote_members': True},
+                    ]
+                elif method == 'getChatMember' and params['user_id'] in (710, 711, 712) and params['chat_id'] in (-1000001, -1000101, -1003001, -1004001):
+                    result = {'status': 'creator' if params['user_id'] == 711 else 'administrator',
+                              'can_promote_members': params['user_id'] == 712}
                 elif method == 'getChatMember':
                     result = {'status': 'administrator' if params['user_id'] == 99 or (params['user_id'] == 777 and params['chat_id'] == -1005001)
                               else 'member' if params['user_id'] == 2 and params['chat_id'] == -1000101 else 'left',
@@ -156,6 +165,32 @@ def exercise_runtime(base, source, sql, dsn, image):
         try:
             poll = wait_for(lambda e: e['method'] == 'getUpdates')
             assert poll['params']['offset'] == 890001
+            ordinary = panel_for(private('/admin', user=710), '管理后台', user=710)
+            owner = panel_for(private('/admin', user=711), '管理后台', user=711)
+            start, _ = click(owner, '🔐 管理权限', user=711)
+            permissions = panel_for(start, '管理权限 · 黑名单', user=711)
+            buttons = [button['text'] for row in permissions['params']['reply_markup']['inline_keyboard'] for button in row]
+            assert sum('普通管理员' in text for text in buttons) == 1
+            assert sum('🔒' in text for text in buttons) == 2
+            start, _ = click(permissions, next(text for text in buttons if '普通管理员' in text), user=711)
+            permissions = panel_for(start, '管理权限 · 黑名单', user=711)
+            start, _ = click(ordinary, '修改集群名称', user=710)
+            panel_for(start, '仅当前集群管理员', user=710)
+            panel_for(private('/admin', user=710), '当前没有可管理的集群', user=710)
+            panel_for(private('/admin', user=712), '管理后台', user=712)
+            start, _ = click(permissions, '切换黑名单 / 白名单', user=711)
+            permissions = panel_for(start, '管理权限 · 白名单', user=711)
+            panel_for(private('/admin', user=710), '当前没有可管理的集群', user=710)
+            buttons = [button['text'] for row in permissions['params']['reply_markup']['inline_keyboard'] for button in row]
+            start, _ = click(permissions, next(text for text in buttons if '普通管理员' in text), user=711)
+            permissions = panel_for(start, '管理权限 · 白名单', user=711)
+            ordinary = panel_for(private('/admin', user=710), '管理后台', user=710)
+            start, _ = click(ordinary, '🔐 管理权限', user=710)
+            panel_for(start, '仅群主', user=710)
+            start, _ = click(permissions, '切换黑名单 / 白名单', user=711)
+            panel_for(start, '管理权限 · 黑名单', user=711)
+            panel_for(private('/admin', user=710), '当前没有可管理的集群', user=710)
+            sql('runtime', "DELETE FROM cpbot.settings WHERE cluster_id=1 AND key='admin_policy'")
             start = private('/start c1_review_1', user=555)
             panel_for(start, '请先加入', user=555)
             panel = panel_for(private('/start review_1'), '已填写 1/9 项')

@@ -67,8 +67,9 @@ func (b LookupAccess) availableClusters(ctx context.Context, publishing bool) ([
 }
 
 type member struct {
-	Status   string `json:"status"`
-	IsMember *bool  `json:"is_member"`
+	Status     string `json:"status"`
+	CanPromote bool   `json:"can_promote_members"`
+	IsMember   *bool  `json:"is_member"`
 }
 
 func (m member) admin() bool { return m.Status == "administrator" || m.Status == "creator" }
@@ -99,25 +100,35 @@ func (b LookupAccess) isAdmin(ctx context.Context, cid, uid int64) (bool, error)
 	if b.admins[uid] {
 		return true, nil
 	}
-	rows, err := b.db.Query(ctx, `SELECT chat_id FROM cpbot.cluster_management_groups JOIN cpbot.cluster_authorizations USING(cluster_id) WHERE cluster_id=$1
-		UNION SELECT chat_id FROM cpbot.bindings JOIN cpbot.cluster_authorizations USING(cluster_id) WHERE cluster_id=$1 AND active=1
-		UNION SELECT discussion FROM cpbot.bindings JOIN cpbot.cluster_authorizations USING(cluster_id) WHERE cluster_id=$1 AND active=1 AND discussion IS NOT NULL`, cid)
+	chats, err := b.adminChats(ctx, cid)
 	if err != nil {
 		return false, err
 	}
-	chats, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return false, err
-	}
+	ordinary := false
 	for _, chat := range chats {
 		person, err := b.chatMember(ctx, chat, uid)
 		if err != nil || !person.admin() {
 			continue
 		}
 		bot, err := b.chatMember(ctx, chat, b.botID)
-		if err == nil && bot.admin() {
+		if err != nil || !bot.admin() {
+			continue
+		}
+		if person.Status == "creator" || person.CanPromote {
 			return true, nil
 		}
+		ordinary = true
+	}
+	if ordinary {
+		policy, err := b.adminPolicy(ctx, cid)
+		if err != nil {
+			return false, err
+		}
+		listed := false
+		for _, id := range policy.selected() {
+			listed = listed || id == uid
+		}
+		return listed == (policy.Mode == "whitelist"), nil
 	}
 	return false, nil
 }
